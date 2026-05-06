@@ -48,6 +48,15 @@ parser.add_argument(
 )
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+parser.add_argument("--command_x", type=float, default=None, help="Fixed forward velocity command in m/s.")
+parser.add_argument("--command_y", type=float, default=None, help="Fixed lateral velocity command in m/s.")
+parser.add_argument("--command_yaw", type=float, default=None, help="Fixed yaw velocity command in rad/s.")
+parser.add_argument(
+    "--wander",
+    action="store_true",
+    default=False,
+    help="Sample nonzero walking commands instead of the default heading-command mix.",
+)
 # parser.add_argument(
 #     "--use_pretrained_checkpoint",
 #     action="store_true",
@@ -136,6 +145,31 @@ else:
     algorithm = agent_cfg_entry_point.split("_cfg")[0].split("skrl_")[-1].lower()
 
 
+def apply_velocity_command_overrides(env_cfg: object) -> None:
+    if not args_cli.wander and args_cli.command_x is None and args_cli.command_y is None and args_cli.command_yaw is None:
+        return
+
+    commands = getattr(env_cfg, "commands", None)
+    command_cfg = getattr(commands, "base_velocity", None)
+    if command_cfg is None:
+        raise AttributeError("This task config does not expose commands.base_velocity")
+
+    if args_cli.wander:
+        command_cfg.ranges.lin_vel_x = (-0.8, 0.8)
+        command_cfg.ranges.lin_vel_y = (-0.4, 0.4)
+        command_cfg.ranges.ang_vel_z = (-0.8, 0.8)
+        command_cfg.resampling_time_range = (3.0, 5.0)
+    else:
+        command_cfg.ranges.lin_vel_x = (args_cli.command_x or 0.0, args_cli.command_x or 0.0)
+        command_cfg.ranges.lin_vel_y = (args_cli.command_y or 0.0, args_cli.command_y or 0.0)
+        command_cfg.ranges.ang_vel_z = (args_cli.command_yaw or 0.0, args_cli.command_yaw or 0.0)
+
+    command_cfg.heading_command = False
+    command_cfg.rel_heading_envs = 0.0
+    command_cfg.rel_standing_envs = 0.0
+    command_cfg.debug_vis = True
+
+
 @hydra_task_config(args_cli.task, agent_cfg_entry_point)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, experiment_cfg: dict):
     """Play with skrl agent."""
@@ -146,6 +180,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     # override configurations with non-hydra CLI arguments
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    apply_velocity_command_overrides(env_cfg)
 
     # configure the ML framework into the global skrl variable
     if args_cli.ml_framework.startswith("jax"):

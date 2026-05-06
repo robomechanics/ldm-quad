@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
 from .models import DynamicsEnsemble
@@ -18,6 +20,9 @@ class TrajectoryPlanner:
         discount: float = 0.99,
         temperature: float = 0.5,
         action_spline_knots: int = 0,
+        action_prior: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        prior_residual_scale: float = 0.25,
+        prior_residual_penalty: float = 0.0,
     ):
         self.model = model
         self.action_low = action_low
@@ -28,6 +33,9 @@ class TrajectoryPlanner:
         self.temperature = temperature
         self.action_dim = action_low.numel()
         self.action_spline_knots = action_spline_knots if 1 < action_spline_knots < horizon else 0
+        self.action_prior = action_prior
+        self.prior_residual_scale = prior_residual_scale
+        self.prior_residual_penalty = prior_residual_penalty
         self._prev_mean: torch.Tensor | None = None
 
     @property
@@ -86,24 +94,51 @@ class TrajectoryPlanner:
             return controls
         return self._interpolate_action_spline(controls)
 
+    def _clip_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        return torch.max(torch.min(actions, self.action_high.view(1, -1)), self.action_low.view(1, -1))
+
     def _clip_action_sequences(self, action_sequences: torch.Tensor) -> torch.Tensor:
         return torch.max(
             torch.min(action_sequences, self.action_high.view(1, 1, 1, -1)),
             self.action_low.view(1, 1, 1, -1),
         )
 
+    def _clip_controls(self, controls: torch.Tensor) -> torch.Tensor:
+        if self.action_prior is None:
+            return self._clip_action_sequences(controls)
+
+        residual_scale = max(float(self.prior_residual_scale), 1e-6)
+        return controls.clamp(-residual_scale, residual_scale)
+
+    def _actions_from_controls(self, states: torch.Tensor, controls_t: torch.Tensor) -> torch.Tensor:
+        if self.action_prior is None:
+            return controls_t
+
+        prior_actions = self.action_prior(states)
+        return self._clip_actions(prior_actions + controls_t)
+
+    def _first_action_from_controls(self, obs: torch.Tensor, mean: torch.Tensor) -> torch.Tensor:
+        controls = self._expand_controls(mean)
+        controls_t = controls[:, 0, :]
+        if self.action_prior is None:
+            return self._clip_actions(controls_t)
+        return self._actions_from_controls(obs, controls_t)
+
     @torch.no_grad()
-    def evaluate_sequences(self, obs: torch.Tensor, action_sequences: torch.Tensor) -> torch.Tensor:
-        batch_size, candidates, _, action_dim = action_sequences.shape
+    def evaluate_sequences(self, obs: torch.Tensor, control_sequences: torch.Tensor) -> torch.Tensor:
+        batch_size, candidates, _, action_dim = control_sequences.shape
         states = obs.unsqueeze(1).expand(-1, candidates, -1).reshape(batch_size * candidates, -1)
         returns = torch.zeros(batch_size * candidates, device=obs.device, dtype=obs.dtype)
         discounts = torch.ones_like(returns)
         alive = torch.ones_like(returns)
 
         for t in range(self.horizon):
-            actions_t = action_sequences[:, :, t, :].reshape(batch_size * candidates, action_dim)
+            controls_t = control_sequences[:, :, t, :].reshape(batch_size * candidates, action_dim)
+            actions_t = self._actions_from_controls(states, controls_t)
             preds = self.model.predict(states, actions_t)
             reward = preds.rewards.squeeze(-1)
+            if self.action_prior is not None and self.prior_residual_penalty > 0.0:
+                reward = reward - self.prior_residual_penalty * controls_t.square().sum(dim=-1)
             continue_prob = preds.continue_logits.sigmoid().squeeze(-1)
             returns = returns + discounts * alive * reward
             alive = alive * continue_prob
@@ -128,6 +163,9 @@ class CEMPlanner(TrajectoryPlanner):
         discount: float = 0.99,
         temperature: float = 0.5,
         action_spline_knots: int = 0,
+        action_prior: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        prior_residual_scale: float = 0.25,
+        prior_residual_penalty: float = 0.0,
     ):
         super().__init__(
             model=model,
@@ -138,6 +176,9 @@ class CEMPlanner(TrajectoryPlanner):
             discount=discount,
             temperature=temperature,
             action_spline_knots=action_spline_knots,
+            action_prior=action_prior,
+            prior_residual_scale=prior_residual_scale,
+            prior_residual_penalty=prior_residual_penalty,
         )
         self.elites = elites
         self.iterations = iterations
@@ -153,7 +194,8 @@ class CEMPlanner(TrajectoryPlanner):
                 dtype=obs.dtype,
             )
             controls = mean.unsqueeze(1) + std.unsqueeze(1) * noise
-            action_sequences = self._clip_action_sequences(self._expand_controls(controls))
+            controls = self._clip_controls(controls)
+            action_sequences = self._expand_controls(controls)
 
             returns = self.evaluate_sequences(obs, action_sequences)
             elite_indices = returns.topk(self.elites, dim=1).indices
@@ -164,8 +206,7 @@ class CEMPlanner(TrajectoryPlanner):
             std = elite_controls.std(dim=1).clamp_min(1e-3)
 
         self._prev_mean = mean.detach()
-        actions = self._clip_action_sequences(self._expand_controls(mean).unsqueeze(1)).squeeze(1)
-        return actions[:, 0, :]
+        return self._first_action_from_controls(obs, mean)
 
 
 class MPPIPlanner(TrajectoryPlanner):
@@ -183,6 +224,9 @@ class MPPIPlanner(TrajectoryPlanner):
         temperature: float = 0.5,
         lambda_: float = 1.0,
         action_spline_knots: int = 0,
+        action_prior: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        prior_residual_scale: float = 0.25,
+        prior_residual_penalty: float = 0.0,
     ):
         super().__init__(
             model=model,
@@ -193,6 +237,9 @@ class MPPIPlanner(TrajectoryPlanner):
             discount=discount,
             temperature=temperature,
             action_spline_knots=action_spline_knots,
+            action_prior=action_prior,
+            prior_residual_scale=prior_residual_scale,
+            prior_residual_penalty=prior_residual_penalty,
         )
         self.iterations = iterations
         self.lambda_ = lambda_
@@ -208,7 +255,8 @@ class MPPIPlanner(TrajectoryPlanner):
                 dtype=obs.dtype,
             )
             controls = mean.unsqueeze(1) + std.unsqueeze(1) * noise
-            action_sequences = self._clip_action_sequences(self._expand_controls(controls))
+            controls = self._clip_controls(controls)
+            action_sequences = self._expand_controls(controls)
             returns = self.evaluate_sequences(obs, action_sequences)
 
             shifted_returns = returns - returns.max(dim=1, keepdim=True).values
@@ -219,8 +267,7 @@ class MPPIPlanner(TrajectoryPlanner):
             std = variance.sqrt().clamp_min(1e-3)
 
         self._prev_mean = mean.detach()
-        actions = self._clip_action_sequences(self._expand_controls(mean).unsqueeze(1)).squeeze(1)
-        return actions[:, 0, :]
+        return self._first_action_from_controls(obs, mean)
 
 
 def build_planner(
@@ -236,6 +283,9 @@ def build_planner(
     temperature: float,
     lambda_: float,
     action_spline_knots: int = 0,
+    action_prior: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    prior_residual_scale: float = 0.25,
+    prior_residual_penalty: float = 0.0,
 ) -> TrajectoryPlanner:
     if planner_name == "mppi":
         return MPPIPlanner(
@@ -249,6 +299,9 @@ def build_planner(
             temperature=temperature,
             lambda_=lambda_,
             action_spline_knots=action_spline_knots,
+            action_prior=action_prior,
+            prior_residual_scale=prior_residual_scale,
+            prior_residual_penalty=prior_residual_penalty,
         )
     if planner_name == "cem":
         return CEMPlanner(
@@ -262,5 +315,8 @@ def build_planner(
             discount=discount,
             temperature=temperature,
             action_spline_knots=action_spline_knots,
+            action_prior=action_prior,
+            prior_residual_scale=prior_residual_scale,
+            prior_residual_penalty=prior_residual_penalty,
         )
     raise ValueError(f"Unsupported planner: {planner_name}")

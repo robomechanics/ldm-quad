@@ -48,9 +48,45 @@ parser.add_argument(
     default=0,
     help="Sample this many cubic action-spline knots instead of one action per horizon step. Disabled when <=1.",
 )
+parser.add_argument("--prior_checkpoint", type=str, default=None, help="skrl policy checkpoint used as locomotion prior.")
+parser.add_argument("--prior_task", type=str, default=None, help="Task used to load the prior policy config.")
+parser.add_argument("--prior_algorithm", type=str, default="PPO", help="skrl algorithm for the prior policy.")
+parser.add_argument("--prior_agent", type=str, default=None, help="Optional skrl prior agent config entry point.")
+parser.add_argument(
+    "--seed_with_prior",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Use the prior policy plus noise during seed collection when --prior_checkpoint is set.",
+)
+parser.add_argument("--seed_policy_noise", type=float, default=0.05, help="Gaussian action noise added to prior seed actions.")
+parser.add_argument("--prior_residual_scale", type=float, default=0.25, help="Max residual action magnitude around the prior.")
+parser.add_argument("--prior_residual_penalty", type=float, default=0.0, help="Planning penalty on squared residual actions.")
 parser.add_argument("--lr", type=float, default=3e-4, help="Dynamics model learning rate.")
 parser.add_argument("--eval_interval", type=int, default=10, help="Steps between console/log summaries.")
 parser.add_argument("--save_interval", type=int, default=50, help="Steps between checkpoints.")
+parser.add_argument("--early_stop", action="store_true", default=False, help="Stop training once performance has plateaued.")
+parser.add_argument("--early_stop_min_steps", type=int, default=3000, help="Minimum environment steps before early stopping.")
+parser.add_argument("--early_stop_patience", type=int, default=1500, help="Steps without metric improvement before stopping.")
+parser.add_argument("--early_stop_min_delta", type=float, default=0.05, help="Minimum metric gain counted as improvement.")
+parser.add_argument(
+    "--early_stop_metric",
+    type=str,
+    default="mean_return",
+    choices=["mean_return", "estimated_return"],
+    help="Metric used for early-stop plateau detection.",
+)
+parser.add_argument(
+    "--early_stop_return",
+    type=float,
+    default=None,
+    help="Optional return threshold considered good enough once full-length episodes are reached.",
+)
+parser.add_argument(
+    "--early_stop_length_fraction",
+    type=float,
+    default=0.98,
+    help="Required fraction of max episode length before early stopping can trigger.",
+)
 parser.add_argument("--command_x", type=float, default=None, help="Fixed forward velocity command in m/s.")
 parser.add_argument("--command_y", type=float, default=None, help="Fixed lateral velocity command in m/s.")
 parser.add_argument("--command_yaw", type=float, default=None, help="Fixed yaw velocity command in rad/s.")
@@ -75,7 +111,7 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
 import thomas_MBRL.tasks  # noqa: F401
-from thomas_MBRL.mbrl import DynamicsEnsemble, ReplayBuffer, build_planner
+from thomas_MBRL.mbrl import DynamicsEnsemble, ReplayBuffer, SkrlPolicyPrior, build_planner
 
 
 @dataclass
@@ -134,6 +170,10 @@ def get_action_bounds(action_space: gym.Space, device: torch.device, action_dim:
 
 def random_actions(batch_size: int, action_low: torch.Tensor, action_high: torch.Tensor) -> torch.Tensor:
     return action_low + torch.rand((batch_size, action_low.numel()), device=action_low.device) * (action_high - action_low)
+
+
+def clip_actions(actions: torch.Tensor, action_low: torch.Tensor, action_high: torch.Tensor) -> torch.Tensor:
+    return torch.max(torch.min(actions, action_high.view(1, -1)), action_low.view(1, -1))
 
 
 def make_log_dir() -> str:
@@ -197,6 +237,24 @@ def infer_episode_horizon_steps(env: gym.Env, env_cfg: object) -> float:
     return 1.0
 
 
+def save_checkpoint(
+    path: str,
+    model: DynamicsEnsemble,
+    optimizer: torch.optim.Optimizer,
+    train_state: TrainState,
+    args: argparse.Namespace,
+) -> None:
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "train_state": asdict(train_state),
+            "args": vars(args),
+        },
+        path,
+    )
+
+
 def main() -> None:
     set_seed(args_cli.seed)
     env_cfg = parse_env_cfg(
@@ -221,6 +279,16 @@ def main() -> None:
     obs_dim = obs.shape[-1]
 
     action_low, action_high = get_action_bounds(env.action_space, device, action_dim)
+    action_prior = None
+    if args_cli.prior_checkpoint:
+        action_prior = SkrlPolicyPrior(
+            env=env,
+            checkpoint_path=args_cli.prior_checkpoint,
+            task_name=args_cli.prior_task or args_cli.task,
+            algorithm=args_cli.prior_algorithm,
+            agent_cfg_entry_point=args_cli.prior_agent,
+        )
+        print(f"[MBRL] Loaded locomotion prior: {os.path.abspath(args_cli.prior_checkpoint)}")
 
     replay = ReplayBuffer(args_cli.buffer_capacity, obs_dim=obs_dim, action_dim=action_dim)
     model = DynamicsEnsemble(
@@ -245,6 +313,9 @@ def main() -> None:
         temperature=args_cli.planner_temperature,
         lambda_=args_cli.mppi_lambda,
         action_spline_knots=args_cli.action_spline_knots,
+        action_prior=action_prior,
+        prior_residual_scale=args_cli.prior_residual_scale,
+        prior_residual_penalty=args_cli.prior_residual_penalty,
     )
 
     train_state = TrainState()
@@ -255,6 +326,9 @@ def main() -> None:
     recent_step_rewards: list[float] = []
     latest_losses = {"loss": 0.0, "delta_loss": 0.0, "reward_loss": 0.0, "continue_loss": 0.0}
     train_start_time = time.monotonic()
+    early_stop_best_metric = float("-inf")
+    early_stop_best_step = 0
+    early_stop_reason: str | None = None
 
     with open(os.path.join(log_dir, "config.txt"), "w", encoding="utf-8") as f:
         for key, value in sorted(vars(args_cli).items()):
@@ -266,7 +340,13 @@ def main() -> None:
     while app_is_running() and train_state.env_steps < args_cli.train_steps:
         with torch.inference_mode():
             if train_state.env_steps < args_cli.seed_steps or len(replay) < args_cli.batch_size:
-                actions = random_actions(obs.shape[0], action_low, action_high)
+                if action_prior is not None and args_cli.seed_with_prior:
+                    actions = action_prior(obs)
+                    if args_cli.seed_policy_noise > 0.0:
+                        actions = actions + args_cli.seed_policy_noise * torch.randn_like(actions)
+                    actions = clip_actions(actions, action_low, action_high)
+                else:
+                    actions = random_actions(obs.shape[0], action_low, action_high)
             else:
                 actions = planner.plan(obs)
 
@@ -366,28 +446,46 @@ def main() -> None:
                 f"eta={format_duration(eta_s)}"
             )
 
+            if args_cli.early_stop:
+                stop_metric = mean_return if args_cli.early_stop_metric == "mean_return" else estimated_return_100
+                full_length_ready = mean_length >= args_cli.early_stop_length_fraction * episode_horizon_steps
+                min_steps_ready = train_state.env_steps >= args_cli.early_stop_min_steps
+                has_completed_episodes = train_state.episodes_finished > 0
+
+                if stop_metric > early_stop_best_metric + args_cli.early_stop_min_delta:
+                    early_stop_best_metric = stop_metric
+                    early_stop_best_step = train_state.env_steps
+
+                no_improvement_steps = train_state.env_steps - early_stop_best_step
+                target_ready = args_cli.early_stop_return is not None and stop_metric >= args_cli.early_stop_return
+                plateau_ready = no_improvement_steps >= args_cli.early_stop_patience
+
+                if min_steps_ready and has_completed_episodes and full_length_ready and (target_ready or plateau_ready):
+                    if target_ready:
+                        early_stop_reason = (
+                            f"{args_cli.early_stop_metric}={stop_metric:.3f} reached target "
+                            f"{args_cli.early_stop_return:.3f}"
+                        )
+                    else:
+                        early_stop_reason = (
+                            f"{args_cli.early_stop_metric} plateaued for {no_improvement_steps} steps "
+                            f"(best={early_stop_best_metric:.3f} at step {early_stop_best_step})"
+                        )
+                    print(f"[MBRL] Early stopping: {early_stop_reason}")
+                    break
+
         if train_state.env_steps % args_cli.save_interval == 0:
             checkpoint_path = os.path.join(log_dir, "checkpoints", f"model_{train_state.env_steps:05d}.pt")
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "train_state": asdict(train_state),
-                    "args": vars(args_cli),
-                },
-                checkpoint_path,
-            )
+            save_checkpoint(checkpoint_path, model, optimizer, train_state, args_cli)
 
     final_path = os.path.join(log_dir, "checkpoints", "model_final.pt")
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "train_state": asdict(train_state),
-            "args": vars(args_cli),
-        },
-        final_path,
-    )
+    save_checkpoint(final_path, model, optimizer, train_state, args_cli)
+    if early_stop_reason is not None:
+        early_stop_path = os.path.join(log_dir, "early_stop.txt")
+        with open(early_stop_path, "w", encoding="utf-8") as f:
+            f.write(f"step: {train_state.env_steps}\n")
+            f.write(f"reason: {early_stop_reason}\n")
+            f.write(f"checkpoint: {final_path}\n")
     writer.close()
     env.close()
 

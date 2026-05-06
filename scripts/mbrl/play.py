@@ -36,6 +36,14 @@ parser.add_argument("--real-time", action="store_true", default=False, help="Run
 parser.add_argument("--command_x", type=float, default=None, help="Fixed forward velocity command in m/s.")
 parser.add_argument("--command_y", type=float, default=None, help="Fixed lateral velocity command in m/s.")
 parser.add_argument("--command_yaw", type=float, default=None, help="Fixed yaw velocity command in rad/s.")
+parser.add_argument("--prior_checkpoint", type=str, default=None, help="Override skrl policy prior checkpoint.")
+parser.add_argument("--prior_task", type=str, default=None, help="Override task used to load the prior policy config.")
+parser.add_argument("--prior_algorithm", type=str, default=None, help="Override skrl algorithm for the prior policy.")
+parser.add_argument("--prior_agent", type=str, default=None, help="Override skrl prior agent config entry point.")
+parser.add_argument("--prior_only", action="store_true", default=False, help="Run the locomotion prior without MBRL/MPPI.")
+parser.add_argument("--prior_residual_scale", type=float, default=None, help="Override residual scale around the prior.")
+parser.add_argument("--prior_residual_penalty", type=float, default=None, help="Override residual penalty around the prior.")
+parser.add_argument("--debug_actions", action="store_true", default=False, help="Print action and velocity-command stats.")
 parser.add_argument(
     "--wander",
     action="store_true",
@@ -59,7 +67,7 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
 import thomas_MBRL.tasks  # noqa: F401
-from thomas_MBRL.mbrl import DynamicsEnsemble, build_planner
+from thomas_MBRL.mbrl import DynamicsEnsemble, SkrlPolicyPrior, build_planner
 
 
 def set_seed(seed: int) -> None:
@@ -114,9 +122,21 @@ def infer_play_task(train_task: str | None) -> str:
     return train_task or "Random-Agent-Unitree-Go2-Play-v0"
 
 
-def apply_fixed_velocity_command(env_cfg: object) -> None:
-    if not args_cli.wander and args_cli.command_x is None and args_cli.command_y is None and args_cli.command_yaw is None:
-        return
+def resolve_velocity_command(checkpoint_args: dict) -> tuple[float | None, float | None, float | None]:
+    command_x = args_cli.command_x if args_cli.command_x is not None else checkpoint_args.get("command_x")
+    command_y = args_cli.command_y if args_cli.command_y is not None else checkpoint_args.get("command_y")
+    command_yaw = args_cli.command_yaw if args_cli.command_yaw is not None else checkpoint_args.get("command_yaw")
+    return command_x, command_y, command_yaw
+
+
+def apply_fixed_velocity_command(env_cfg: object, checkpoint_args: dict) -> tuple[float | None, float | None, float | None]:
+    command_x, command_y, command_yaw = resolve_velocity_command(checkpoint_args)
+    if not args_cli.wander and command_x is None and command_y is None and command_yaw is None:
+        return None, None, None
+
+    command_x = command_x or 0.0
+    command_y = command_y or 0.0
+    command_yaw = command_yaw or 0.0
 
     command_cfg = env_cfg.commands.base_velocity
     if args_cli.wander:
@@ -125,13 +145,14 @@ def apply_fixed_velocity_command(env_cfg: object) -> None:
         command_cfg.ranges.ang_vel_z = (-0.8, 0.8)
         command_cfg.resampling_time_range = (3.0, 5.0)
     else:
-        command_cfg.ranges.lin_vel_x = (args_cli.command_x or 0.0, args_cli.command_x or 0.0)
-        command_cfg.ranges.lin_vel_y = (args_cli.command_y or 0.0, args_cli.command_y or 0.0)
-        command_cfg.ranges.ang_vel_z = (args_cli.command_yaw or 0.0, args_cli.command_yaw or 0.0)
+        command_cfg.ranges.lin_vel_x = (command_x, command_x)
+        command_cfg.ranges.lin_vel_y = (command_y, command_y)
+        command_cfg.ranges.ang_vel_z = (command_yaw, command_yaw)
     command_cfg.heading_command = False
     command_cfg.rel_heading_envs = 0.0
     command_cfg.rel_standing_envs = 0.0
     command_cfg.debug_vis = True
+    return command_x, command_y, command_yaw
 
 
 def main() -> None:
@@ -152,7 +173,7 @@ def main() -> None:
         use_fabric=use_fabric,
     )
     env_cfg.seed = seed
-    apply_fixed_velocity_command(env_cfg)
+    command_x, command_y, command_yaw = apply_fixed_velocity_command(env_cfg, checkpoint_args)
 
     render_mode = "rgb_array" if args_cli.video else None
     env = gym.make(task_name, cfg=env_cfg, render_mode=render_mode)
@@ -175,6 +196,17 @@ def main() -> None:
     action_shape = env.action_space.shape
     action_dim = int(action_shape[-1]) if len(action_shape) > 0 else int(np.prod(action_shape))
     action_low, action_high = get_action_bounds(env.action_space, device, action_dim)
+    prior_checkpoint = args_cli.prior_checkpoint or checkpoint_args.get("prior_checkpoint")
+    action_prior = None
+    if prior_checkpoint:
+        action_prior = SkrlPolicyPrior(
+            env=env,
+            checkpoint_path=prior_checkpoint,
+            task_name=args_cli.prior_task or checkpoint_args.get("prior_task") or checkpoint_args.get("task", task_name),
+            algorithm=args_cli.prior_algorithm or checkpoint_args.get("prior_algorithm", "PPO"),
+            agent_cfg_entry_point=args_cli.prior_agent or checkpoint_args.get("prior_agent"),
+        )
+        print(f"[INFO] Loaded locomotion prior: {os.path.abspath(prior_checkpoint)}")
 
     model = DynamicsEnsemble(
         obs_dim=obs.shape[-1],
@@ -200,6 +232,17 @@ def main() -> None:
         temperature=checkpoint_args.get("planner_temperature", 0.5),
         lambda_=checkpoint_args.get("mppi_lambda", 1.0),
         action_spline_knots=checkpoint_args.get("action_spline_knots", 0),
+        action_prior=action_prior,
+        prior_residual_scale=(
+            args_cli.prior_residual_scale
+            if args_cli.prior_residual_scale is not None
+            else checkpoint_args.get("prior_residual_scale", 0.25)
+        ),
+        prior_residual_penalty=(
+            args_cli.prior_residual_penalty
+            if args_cli.prior_residual_penalty is not None
+            else checkpoint_args.get("prior_residual_penalty", 0.0)
+        ),
     )
 
     try:
@@ -214,7 +257,11 @@ def main() -> None:
 
     print(f"[INFO] Loaded checkpoint: {checkpoint_path}")
     print(f"[INFO] Evaluating task={task_name} num_envs={args_cli.num_envs} num_episodes={args_cli.num_episodes}")
-    print(f"[INFO] Planner={planner_name}")
+    print(f"[INFO] Planner={'prior_only' if args_cli.prior_only else planner_name}")
+    if args_cli.wander:
+        print("[INFO] Velocity command=wander")
+    elif command_x is not None:
+        print(f"[INFO] Velocity command=({command_x:.3f}, {command_y:.3f}, {command_yaw:.3f})")
 
     steps = 0
     while (
@@ -226,7 +273,21 @@ def main() -> None:
         start_time = time.time()
 
         with torch.inference_mode():
-            actions = planner.plan(obs)
+            if args_cli.prior_only:
+                if action_prior is None:
+                    raise RuntimeError("--prior_only requires a prior checkpoint in the MBRL checkpoint or --prior_checkpoint.")
+                actions = action_prior(obs)
+            else:
+                actions = planner.plan(obs)
+            if args_cli.debug_actions and steps % 100 == 0:
+                command_obs = obs[:, 9:12] if obs.shape[-1] >= 12 else None
+                print(
+                    "[DEBUG] "
+                    f"step={steps} "
+                    f"action_abs_mean={actions.abs().mean().item():.4f} "
+                    f"action_abs_max={actions.abs().max().item():.4f} "
+                    f"command_obs={command_obs[0].detach().cpu().tolist() if command_obs is not None else None}"
+                )
             next_obs_raw, rewards, terminated, truncated, _ = env.step(actions)
             next_obs = flatten_obs(next_obs_raw, device)
             rewards = to_tensor(rewards, device).float().view(-1)
