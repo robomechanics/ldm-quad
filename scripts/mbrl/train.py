@@ -366,6 +366,22 @@ def main() -> None:
     recent_lengths: list[float] = []
     recent_step_rewards: list[float] = []
     latest_losses = {"loss": 0.0, "delta_loss": 0.0, "reward_loss": 0.0, "continue_loss": 0.0}
+    latest_planner_diagnostics = {
+        "planner_candidate_return_mean": 0.0,
+        "planner_candidate_return_best": 0.0,
+        "planner_candidate_return_std": 0.0,
+        "planner_prior_action_norm_mean": 0.0,
+        "planner_residual_norm_mean": 0.0,
+        "planner_residual_abs_mean": 0.0,
+        "planner_final_action_norm_mean": 0.0,
+        "planner_residual_to_prior_norm": 0.0,
+        "planner_selected_prior_fraction": 0.0,
+        "planner_predicted_plan_return_mean": 0.0,
+        "planner_predicted_prior_return_mean": 0.0,
+        "planner_predicted_return_margin_mean": 0.0,
+        "planner_predicted_return_margin_min": 0.0,
+        "planner_prior_fallback_fraction": 0.0,
+    }
     train_start_time = time.monotonic()
     early_stop_best_metric = float("-inf")
     early_stop_best_step = 0
@@ -396,6 +412,7 @@ def main() -> None:
             planner_active = planner_ready
 
             if not planner_ready:
+                latest_planner_diagnostics = dict.fromkeys(latest_planner_diagnostics, 0.0)
                 if action_prior is not None and args_cli.seed_with_prior:
                     actions = action_prior(obs)
                     if args_cli.seed_policy_noise > 0.0:
@@ -406,6 +423,7 @@ def main() -> None:
                     actions = random_actions(obs.shape[0], action_low, action_high)
             else:
                 actions = planner.plan(obs)
+                latest_planner_diagnostics.update(planner.last_diagnostics)
 
             next_obs_raw, rewards, terminated, truncated, _ = env.step(actions)
             next_obs = flatten_obs(next_obs_raw, device)
@@ -487,6 +505,10 @@ def main() -> None:
                 "planner_active": int(planner_active),
                 "planner_disabled_until": planner_disabled_until,
                 "action_bounds_finite": int(action_bounds_finite),
+                "wall_time_s": elapsed_s,
+                "steps_per_second": steps_per_second,
+                "eta_s": eta_s,
+                **latest_planner_diagnostics,
                 **latest_losses,
             }
             append_metrics(metrics_path, row)
@@ -502,6 +524,11 @@ def main() -> None:
             writer.add_scalar("Train / planner_active", int(planner_active), train_state.env_steps)
             writer.add_scalar("Train / planner_disabled_until", planner_disabled_until, train_state.env_steps)
             writer.add_scalar("Train / action_bounds_finite", int(action_bounds_finite), train_state.env_steps)
+            writer.add_scalar("Time / wall_time_s", elapsed_s, train_state.env_steps)
+            writer.add_scalar("Time / steps_per_second", steps_per_second, train_state.env_steps)
+            writer.add_scalar("Time / eta_s", eta_s, train_state.env_steps)
+            for diagnostic_name, diagnostic_value in latest_planner_diagnostics.items():
+                writer.add_scalar(f"Planner / {diagnostic_name}", diagnostic_value, train_state.env_steps)
             for loss_name, loss_value in latest_losses.items():
                 writer.add_scalar(f"Loss / {loss_name}", loss_value, train_state.env_steps)
             writer.flush()
@@ -515,6 +542,9 @@ def main() -> None:
                 f"step_reward100={mean_step_reward_100:.3f} "
                 f"len100={mean_length:.2f} "
                 f"planner={'on' if planner_active else 'prior'} "
+                f"residual_norm={latest_planner_diagnostics['planner_residual_norm_mean']:.3f} "
+                f"fallback={latest_planner_diagnostics['planner_prior_fallback_fraction']:.2f} "
+                f"model_margin={latest_planner_diagnostics['planner_predicted_return_margin_mean']:.3f} "
                 f"loss={latest_losses['loss']:.4f} "
                 f"elapsed={format_duration(elapsed_s)} "
                 f"eta={format_duration(eta_s)}"

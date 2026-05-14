@@ -43,6 +43,7 @@ class TrajectoryPlanner:
         self.prior_fallback = prior_fallback
         self.action_bounds_finite = action_bounds_finite
         self._prev_mean: torch.Tensor | None = None
+        self.last_diagnostics: dict[str, float] = {}
 
     def reset(self, done: torch.Tensor | None = None) -> None:
         if self._prev_mean is None:
@@ -148,6 +149,7 @@ class TrajectoryPlanner:
         return self._actions_from_controls(obs, controls_t)
 
     def _maybe_fallback_to_prior(self, obs: torch.Tensor, mean: torch.Tensor) -> torch.Tensor:
+        self._record_solution_diagnostics(obs, mean)
         if self.action_prior is None or not self.prior_fallback:
             return mean
 
@@ -155,7 +157,87 @@ class TrajectoryPlanner:
         zero_mean = self._zero_controls(obs)
         prior_return = self.evaluate_sequences(obs, self._expand_controls(zero_mean).unsqueeze(1)).squeeze(1)
         accept = candidate_return >= prior_return + self.prior_acceptance_margin
-        return torch.where(accept.view(-1, 1, 1), mean, zero_mean)
+        selected_mean = torch.where(accept.view(-1, 1, 1), mean, zero_mean)
+        self._record_solution_diagnostics(
+            obs,
+            selected_mean,
+            candidate_return=candidate_return,
+            prior_return=prior_return,
+            accept=accept,
+        )
+        return selected_mean
+
+    def _record_candidate_diagnostics(self, returns: torch.Tensor) -> None:
+        returns = returns.detach()
+        self.last_diagnostics.update(
+            {
+                "planner_candidate_return_mean": float(returns.mean().item()),
+                "planner_candidate_return_best": float(returns.max(dim=1).values.mean().item()),
+                "planner_candidate_return_std": float(returns.std(unbiased=False).item()),
+            }
+        )
+
+    def _record_solution_diagnostics(
+        self,
+        obs: torch.Tensor,
+        mean: torch.Tensor,
+        candidate_return: torch.Tensor | None = None,
+        prior_return: torch.Tensor | None = None,
+        accept: torch.Tensor | None = None,
+    ) -> None:
+        controls = self._expand_controls(mean)
+        first_residual = controls[:, 0, :].detach()
+        residual_norm = first_residual.norm(dim=-1)
+        diagnostics = {
+            "planner_residual_norm_mean": float(residual_norm.mean().item()),
+            "planner_residual_abs_mean": float(first_residual.abs().mean().item()),
+            "planner_selected_prior_fraction": float((residual_norm <= 1e-6).float().mean().item()),
+        }
+
+        if self.action_prior is None:
+            first_action = self._clip_actions(first_residual)
+            diagnostics.update(
+                {
+                    "planner_prior_action_norm_mean": 0.0,
+                    "planner_final_action_norm_mean": float(first_action.detach().norm(dim=-1).mean().item()),
+                    "planner_residual_to_prior_norm": 0.0,
+                }
+            )
+        else:
+            prior_actions = self.action_prior(obs).detach()
+            final_actions = self._clip_actions(prior_actions + first_residual).detach()
+            prior_norm = prior_actions.norm(dim=-1)
+            diagnostics.update(
+                {
+                    "planner_prior_action_norm_mean": float(prior_norm.mean().item()),
+                    "planner_final_action_norm_mean": float(final_actions.norm(dim=-1).mean().item()),
+                    "planner_residual_to_prior_norm": float((residual_norm / prior_norm.clamp_min(1e-6)).mean().item()),
+                }
+            )
+
+        if candidate_return is not None and prior_return is not None and accept is not None:
+            margin = (candidate_return - prior_return).detach()
+            diagnostics.update(
+                {
+                    "planner_predicted_plan_return_mean": float(candidate_return.detach().mean().item()),
+                    "planner_predicted_prior_return_mean": float(prior_return.detach().mean().item()),
+                    "planner_predicted_return_margin_mean": float(margin.mean().item()),
+                    "planner_predicted_return_margin_min": float(margin.min().item()),
+                    "planner_prior_fallback_fraction": float((~accept).float().mean().item()),
+                }
+            )
+        else:
+            diagnostics.update(
+                {
+                    "planner_predicted_plan_return_mean": 0.0,
+                    "planner_predicted_prior_return_mean": 0.0,
+                    "planner_predicted_return_margin_mean": 0.0,
+                    "planner_predicted_return_margin_min": 0.0,
+                    "planner_prior_fallback_fraction": 0.0,
+                }
+            )
+
+        self.last_diagnostics.update(diagnostics)
 
     @torch.no_grad()
     def evaluate_sequences(self, obs: torch.Tensor, control_sequences: torch.Tensor) -> torch.Tensor:
@@ -239,6 +321,7 @@ class CEMPlanner(TrajectoryPlanner):
             action_sequences = self._expand_controls(controls)
 
             returns = self.evaluate_sequences(obs, action_sequences)
+            self._record_candidate_diagnostics(returns)
             elite_indices = returns.topk(self.elites, dim=1).indices
             elite_controls = controls.gather(
                 1, elite_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.control_horizon, self.action_dim)
@@ -308,6 +391,7 @@ class MPPIPlanner(TrajectoryPlanner):
                 controls[:, 0, :, :] = 0.0
             action_sequences = self._expand_controls(controls)
             returns = self.evaluate_sequences(obs, action_sequences)
+            self._record_candidate_diagnostics(returns)
 
             shifted_returns = returns - returns.max(dim=1, keepdim=True).values
             weights = torch.softmax(shifted_returns / max(self.lambda_, 1e-6), dim=1)
