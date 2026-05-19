@@ -1,4 +1,4 @@
-"""Utilities for model-based RL experiments in thomas_MBRL."""
+"""Utilities for model-based RL experiments in ldm_quad."""
 
 from .models import DynamicsEnsemble
 from .planner import CEMPlanner, MPPIPlanner, build_planner

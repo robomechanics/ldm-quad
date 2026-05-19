@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SOURCE_ROOT = PROJECT_ROOT / "source" / "thomas_MBRL"
+SOURCE_ROOT = PROJECT_ROOT / "source" / "ldm_quad"
 DEFAULT_METHODS = ("ppo", "sac", "mbrl")
 PPO_ROLLOUTS = 24
 PRESETS = {

@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-SOURCE_ROOT = os.path.join(PROJECT_ROOT, "source", "thomas_MBRL")
+SOURCE_ROOT = os.path.join(PROJECT_ROOT, "source", "ldm_quad")
 if SOURCE_ROOT not in sys.path:
     sys.path.insert(0, SOURCE_ROOT)
 
@@ -173,8 +173,8 @@ from torch.utils.tensorboard import SummaryWriter
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
-import thomas_MBRL.tasks  # noqa: F401
-from thomas_MBRL.mbrl import DynamicsEnsemble, ReplayBuffer, build_planner, load_policy_prior
+import ldm_quad.tasks  # noqa: F401
+from ldm_quad.mbrl import DynamicsEnsemble, ReplayBuffer, build_planner, load_policy_prior
 
 
 @dataclass

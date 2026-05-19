@@ -9,7 +9,7 @@ Script to print all the available environments in Isaac Lab.
 The script iterates over all registered environments and stores the details in a table.
 It prints the name of the environment, the entry point and the config file.
 
-All the environments are registered in the `thomas_MBRL` extension. They start
+All the environments are registered in the `ldm_quad` extension. They start
 with `Isaac` in their name.
 """
 
@@ -20,7 +20,7 @@ import os
 import sys
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-SOURCE_ROOT = os.path.join(PROJECT_ROOT, "source", "thomas_MBRL")
+SOURCE_ROOT = os.path.join(PROJECT_ROOT, "source", "ldm_quad")
 if SOURCE_ROOT not in sys.path:
     sys.path.insert(0, SOURCE_ROOT)
 
@@ -42,11 +42,11 @@ simulation_app = app_launcher.app
 import gymnasium as gym
 from prettytable import PrettyTable
 
-import thomas_MBRL.tasks  # noqa: F401
+import ldm_quad.tasks  # noqa: F401
 
 
 def main():
-    """Print all environments registered in `thomas_MBRL` extension."""
+    """Print all environments registered in `ldm_quad` extension."""
     # print all the available environments
     table = PrettyTable(["S. No.", "Task Name", "Entry Point", "Config"])
     table.title = "Available Environments in Isaac Lab"

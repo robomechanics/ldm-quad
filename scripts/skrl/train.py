@@ -23,7 +23,7 @@ import os
 import sys
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-SOURCE_ROOT = os.path.join(PROJECT_ROOT, "source", "thomas_MBRL")
+SOURCE_ROOT = os.path.join(PROJECT_ROOT, "source", "ldm_quad")
 if SOURCE_ROOT not in sys.path:
     sys.path.insert(0, SOURCE_ROOT)
 
@@ -87,7 +87,7 @@ import omni
 import skrl
 from packaging import version
 
-import thomas_MBRL # noqa: F401
+import ldm_quad # noqa: F401
 
 # check for minimum supported skrl version
 SKRL_VERSION = "1.4.3"

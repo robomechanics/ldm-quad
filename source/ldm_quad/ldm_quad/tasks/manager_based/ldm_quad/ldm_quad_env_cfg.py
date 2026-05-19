@@ -32,7 +32,7 @@ from isaaclab_assets.robots.cartpole import CARTPOLE_CFG  # isort:skip
 
 
 @configclass
-class ThomasMbrlSceneCfg(InteractiveSceneCfg):
+class LdmQuadSceneCfg(InteractiveSceneCfg):
     """Configuration for a cart-pole scene."""
 
     # ground plane
@@ -156,9 +156,9 @@ class TerminationsCfg:
 
 
 @configclass
-class ThomasMbrlEnvCfg(ManagerBasedRLEnvCfg):
+class LdmQuadEnvCfg(ManagerBasedRLEnvCfg):
     # Scene settings
-    scene: ThomasMbrlSceneCfg = ThomasMbrlSceneCfg(num_envs=4096, env_spacing=4.0)
+    scene: LdmQuadSceneCfg = LdmQuadSceneCfg(num_envs=4096, env_spacing=4.0)
     # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()

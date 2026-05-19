@@ -7,7 +7,7 @@ from isaaclab.utils import configclass
 import sys
 import os
 
-from thomas_MBRL.config.velocity_env_cfg import LocomotionVelocityRoughEnvCfg
+from ldm_quad.config.velocity_env_cfg import LocomotionVelocityRoughEnvCfg
 ##
 # Pre-defined configs
 ##

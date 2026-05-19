@@ -12,7 +12,7 @@ import os
 import sys
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-SOURCE_ROOT = os.path.join(PROJECT_ROOT, "source", "thomas_MBRL")
+SOURCE_ROOT = os.path.join(PROJECT_ROOT, "source", "ldm_quad")
 if SOURCE_ROOT not in sys.path:
     sys.path.insert(0, SOURCE_ROOT)
 
@@ -109,7 +109,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 # import logger
 logger = logging.getLogger(__name__)
 
-import thomas_MBRL.tasks  # noqa: F401
+import ldm_quad.tasks  # noqa: F401
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
