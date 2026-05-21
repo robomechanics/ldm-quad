@@ -102,7 +102,7 @@ parser.add_argument(
     help="Use the prior policy plus noise during seed collection when --prior_checkpoint is set.",
 )
 parser.add_argument("--seed_policy_noise", type=float, default=0.05, help="Gaussian action noise added to prior seed actions.")
-parser.add_argument("--prior_residual_scale", type=float, default=0.25, help="Max residual action magnitude around the prior.")
+parser.add_argument("--prior_residual_scale", type=float, default=0.3, help="Max residual action magnitude around the prior.")
 parser.add_argument("--prior_residual_penalty", type=float, default=0.0, help="Planning penalty on squared residual actions.")
 parser.add_argument(
     "--prior_fallback",
@@ -119,6 +119,18 @@ parser.add_argument(
 parser.add_argument("--lr", type=float, default=3e-4, help="Dynamics model learning rate.")
 parser.add_argument("--eval_interval", type=int, default=10, help="Steps between console/log summaries.")
 parser.add_argument("--save_interval", type=int, default=50, help="Steps between checkpoints.")
+parser.add_argument("--wandb", action="store_true", default=False, help="Log this run to Weights & Biases via TensorBoard sync.")
+parser.add_argument("--wandb_project", type=str, default="ldm-quad-mbrl", help="Weights & Biases project name.")
+parser.add_argument("--wandb_entity", type=str, default=None, help="Optional Weights & Biases entity or team.")
+parser.add_argument("--wandb_name", type=str, default=None, help="Optional Weights & Biases run name. Defaults to the log directory name.")
+parser.add_argument(
+    "--wandb_mode",
+    type=str,
+    default="online",
+    choices=["online", "offline", "disabled"],
+    help="Weights & Biases logging mode.",
+)
+parser.add_argument("--wandb_alert", action="store_true", default=False, help="Send a W&B alert when training completes.")
 parser.add_argument("--early_stop", action="store_true", default=False, help="Stop training once performance has plateaued.")
 parser.add_argument("--early_stop_min_steps", type=int, default=3000, help="Minimum environment steps before early stopping.")
 parser.add_argument("--early_stop_patience", type=int, default=1500, help="Steps without metric improvement before stopping.")
@@ -301,6 +313,30 @@ def infer_episode_horizon_steps(env: gym.Env, env_cfg: object) -> float:
     return 1.0
 
 
+def init_wandb(log_dir: str) -> object | None:
+    if not args_cli.wandb:
+        return None
+    try:
+        import wandb
+    except ImportError:
+        print("[MBRL] W&B logging requested but wandb is not installed. Install with: pip install wandb")
+        return None
+
+    try:
+        return wandb.init(
+            project=args_cli.wandb_project,
+            entity=args_cli.wandb_entity,
+            name=args_cli.wandb_name or os.path.basename(log_dir),
+            config=vars(args_cli),
+            sync_tensorboard=True,
+            dir=log_dir,
+            mode=args_cli.wandb_mode,
+        )
+    except Exception as exc:
+        print(f"[MBRL] Failed to initialize W&B logging: {exc}")
+        return None
+
+
 def save_checkpoint(
     path: str,
     model: DynamicsEnsemble,
@@ -333,6 +369,7 @@ def main() -> None:
     log_dir = make_log_dir()
     metrics_path = os.path.join(log_dir, "metrics.csv")
     writer = SummaryWriter(log_dir=log_dir)
+    wandb_run = init_wandb(log_dir)
     episode_horizon_steps = infer_episode_horizon_steps(env, env_cfg)
 
     obs, _ = env.reset()
@@ -622,6 +659,20 @@ def main() -> None:
             f.write(f"checkpoint: {final_path}\n")
     writer.close()
     env.close()
+    if wandb_run is not None:
+        if args_cli.wandb_alert:
+            try:
+                wandb_run.alert(
+                    title="MBRL training completed",
+                    text=(
+                        f"Run {os.path.basename(log_dir)} finished at step {train_state.env_steps}. "
+                        f"best_mean_return={train_state.best_mean_return:.3f}. "
+                        f"checkpoint={final_path}"
+                    ),
+                )
+            except Exception as exc:
+                print(f"[MBRL] Failed to send W&B completion alert: {exc}")
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

@@ -282,7 +282,7 @@ def main() -> None:
             prior_residual_scale=(
                 args_cli.prior_residual_scale
                 if args_cli.prior_residual_scale is not None
-                else checkpoint_args.get("prior_residual_scale", 0.25)
+                else checkpoint_args.get("prior_residual_scale", 0.3)
             ),
             prior_residual_penalty=(
                 args_cli.prior_residual_penalty
