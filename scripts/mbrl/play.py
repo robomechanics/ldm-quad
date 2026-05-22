@@ -60,6 +60,13 @@ parser.add_argument("--prior_task", type=str, default=None, help="Override task 
 parser.add_argument("--prior_algorithm", type=str, default=None, help="Override skrl algorithm for the prior policy.")
 parser.add_argument("--prior_agent", type=str, default=None, help="Override skrl prior agent config entry point.")
 parser.add_argument("--prior_only", action="store_true", default=False, help="Run the locomotion prior without MBRL/MPPI.")
+parser.add_argument(
+    "--prior_control_mode",
+    type=str,
+    default=None,
+    choices=["residual", "full_action"],
+    help="Override how the planner uses the prior: residual actions around it, or full-action MPPI warm-started by it.",
+)
 parser.add_argument("--prior_residual_scale", type=float, default=None, help="Override residual scale around the prior.")
 parser.add_argument("--prior_residual_penalty", type=float, default=None, help="Override residual penalty around the prior.")
 parser.add_argument(
@@ -324,6 +331,11 @@ def main() -> None:
                 args_cli.prior_candidate_noise
                 if args_cli.prior_candidate_noise is not None
                 else checkpoint_args.get("prior_candidate_noise", 0.02)
+            ),
+            prior_control_mode=(
+                args_cli.prior_control_mode
+                if args_cli.prior_control_mode is not None
+                else checkpoint_args.get("prior_control_mode", "residual")
             ),
             action_bounds_finite=checkpoint_args.get("action_bounds_finite", action_bounds_finite),
             planner_velocity_objective_weight=(

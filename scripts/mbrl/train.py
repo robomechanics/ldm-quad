@@ -106,6 +106,13 @@ parser.add_argument(
     help="Use the prior policy plus noise during seed collection when --prior_checkpoint is set.",
 )
 parser.add_argument("--seed_policy_noise", type=float, default=0.05, help="Gaussian action noise added to prior seed actions.")
+parser.add_argument(
+    "--prior_control_mode",
+    type=str,
+    default="residual",
+    choices=["residual", "full_action"],
+    help="How the planner uses the prior: residual actions around it, or full-action MPPI warm-started by it.",
+)
 parser.add_argument("--prior_residual_scale", type=float, default=0.3, help="Max residual action magnitude around the prior.")
 parser.add_argument("--prior_residual_penalty", type=float, default=0.0, help="Planning penalty on squared residual actions.")
 parser.add_argument(
@@ -441,6 +448,7 @@ def main() -> None:
         prior_fallback=args_cli.prior_fallback,
         prior_candidate_fraction=args_cli.prior_candidate_fraction,
         prior_candidate_noise=args_cli.prior_candidate_noise,
+        prior_control_mode=args_cli.prior_control_mode,
         action_bounds_finite=action_bounds_finite,
         planner_velocity_objective_weight=args_cli.planner_velocity_objective_weight,
         planner_velocity_target_x=args_cli.planner_velocity_target_x,
@@ -460,6 +468,7 @@ def main() -> None:
         "planner_candidate_return_best": 0.0,
         "planner_candidate_return_std": 0.0,
         "planner_prior_candidate_fraction": 0.0,
+        "planner_full_action_mode": 0.0,
         "planner_prior_action_norm_mean": 0.0,
         "planner_residual_norm_mean": 0.0,
         "planner_residual_abs_mean": 0.0,

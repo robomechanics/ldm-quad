@@ -27,6 +27,7 @@ class TrajectoryPlanner:
         prior_fallback: bool = True,
         prior_candidate_fraction: float = 0.1,
         prior_candidate_noise: float = 0.02,
+        prior_control_mode: str = "residual",
         action_bounds_finite: bool = True,
         planner_velocity_objective_weight: float = 0.0,
         planner_velocity_target_x: float = 0.0,
@@ -49,6 +50,9 @@ class TrajectoryPlanner:
         self.prior_fallback = prior_fallback
         self.prior_candidate_fraction = prior_candidate_fraction
         self.prior_candidate_noise = prior_candidate_noise
+        if prior_control_mode not in {"residual", "full_action"}:
+            raise ValueError(f"Unsupported prior_control_mode: {prior_control_mode}")
+        self.prior_control_mode = prior_control_mode
         self.action_bounds_finite = action_bounds_finite
         self.planner_velocity_objective_weight = planner_velocity_objective_weight
         self.planner_velocity_target_x = planner_velocity_target_x
@@ -73,10 +77,16 @@ class TrajectoryPlanner:
     def control_horizon(self) -> int:
         return self.action_spline_knots or self.horizon
 
+    @property
+    def _uses_full_action_prior(self) -> bool:
+        return self.action_prior is not None and self.prior_control_mode == "full_action"
+
     def _warm_start_mean(self, obs: torch.Tensor) -> torch.Tensor:
         batch_size = obs.shape[0]
         shape = (batch_size, self.control_horizon, self.action_dim)
         if self._prev_mean is None or self._prev_mean.shape != shape or self._prev_mean.device != obs.device:
+            if self._uses_full_action_prior:
+                return self._prior_control_mean(obs)
             return torch.zeros(shape, device=obs.device, dtype=obs.dtype)
 
         if not self.action_spline_knots:
@@ -140,7 +150,7 @@ class TrajectoryPlanner:
         )
 
     def _clip_controls(self, controls: torch.Tensor) -> torch.Tensor:
-        if self.action_prior is None:
+        if self.action_prior is None or self._uses_full_action_prior:
             return self._clip_action_sequences(controls)
 
         residual_scale = max(float(self.prior_residual_scale), 1e-6)
@@ -152,22 +162,55 @@ class TrajectoryPlanner:
         fraction = min(max(float(self.prior_candidate_fraction), 0.0), 1.0)
         return min(num_candidates, max(1, int(round(fraction * num_candidates))))
 
-    def _inject_prior_candidates(self, controls: torch.Tensor) -> torch.Tensor:
+    def _rollout_prior_actions(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.action_prior is None:
+            return self._expand_controls(self._zero_controls(obs))
+
+        batch_size = obs.shape[0]
+        states = obs
+        actions = []
+        for _ in range(self.horizon):
+            action = self._clip_actions(self.action_prior(states))
+            actions.append(action)
+            preds = self.model.predict(states, action)
+            states = states + preds.delta_obs
+        return torch.stack(actions, dim=1).view(batch_size, self.horizon, self.action_dim)
+
+    def _prior_control_mean(self, obs: torch.Tensor) -> torch.Tensor:
+        prior_actions = self._rollout_prior_actions(obs)
+        if self.action_spline_knots:
+            return self._sample_actions_at_knots(prior_actions)
+        return prior_actions
+
+    def _prior_baseline_controls(self, obs: torch.Tensor) -> torch.Tensor:
+        if self._uses_full_action_prior:
+            return self._prior_control_mean(obs)
+        return self._zero_controls(obs)
+
+    def _inject_prior_candidates(self, obs: torch.Tensor, controls: torch.Tensor) -> torch.Tensor:
         """Reserve initial candidates for pure or near-prior closed-loop rollouts."""
         count = self._prior_candidate_count(controls.shape[1])
         if count == 0:
             return controls
 
-        controls[:, :count, :, :] = 0.0
+        if self._uses_full_action_prior:
+            prior_controls = self._prior_control_mean(obs)
+            controls[:, :count, :, :] = prior_controls.unsqueeze(1)
+        else:
+            controls[:, :count, :, :] = 0.0
+
         noise_scale = max(float(self.prior_candidate_noise), 0.0)
         if count > 1 and noise_scale > 0.0:
             prior_noise = noise_scale * torch.randn_like(controls[:, 1:count, :, :])
-            controls[:, 1:count, :, :] = self._clip_controls(prior_noise)
+            if self._uses_full_action_prior:
+                controls[:, 1:count, :, :] = self._clip_controls(controls[:, 1:count, :, :] + prior_noise)
+            else:
+                controls[:, 1:count, :, :] = self._clip_controls(prior_noise)
         return controls
 
     def _actions_from_controls(self, states: torch.Tensor, controls_t: torch.Tensor) -> torch.Tensor:
-        if self.action_prior is None:
-            return controls_t
+        if self.action_prior is None or self._uses_full_action_prior:
+            return self._clip_actions(controls_t)
 
         prior_actions = self.action_prior(states)
         return self._clip_actions(prior_actions + controls_t)
@@ -175,7 +218,7 @@ class TrajectoryPlanner:
     def _first_action_from_controls(self, obs: torch.Tensor, mean: torch.Tensor) -> torch.Tensor:
         controls = self._expand_controls(mean)
         controls_t = controls[:, 0, :]
-        if self.action_prior is None:
+        if self.action_prior is None or self._uses_full_action_prior:
             return self._clip_actions(controls_t)
         return self._actions_from_controls(obs, controls_t)
 
@@ -185,10 +228,10 @@ class TrajectoryPlanner:
             return mean
 
         candidate_return = self.evaluate_sequences(obs, self._expand_controls(mean).unsqueeze(1)).squeeze(1)
-        zero_mean = self._zero_controls(obs)
-        prior_return = self.evaluate_sequences(obs, self._expand_controls(zero_mean).unsqueeze(1)).squeeze(1)
+        prior_mean = self._prior_baseline_controls(obs)
+        prior_return = self.evaluate_sequences(obs, self._expand_controls(prior_mean).unsqueeze(1)).squeeze(1)
         accept = candidate_return >= prior_return + self.prior_acceptance_margin
-        selected_mean = torch.where(accept.view(-1, 1, 1), mean, zero_mean)
+        selected_mean = torch.where(accept.view(-1, 1, 1), mean, prior_mean)
         self._record_solution_diagnostics(
             obs,
             selected_mean,
@@ -217,17 +260,24 @@ class TrajectoryPlanner:
         accept: torch.Tensor | None = None,
     ) -> None:
         controls = self._expand_controls(mean)
-        first_residual = controls[:, 0, :].detach()
-        residual_norm = first_residual.norm(dim=-1)
+        first_control = controls[:, 0, :].detach()
+        first_delta = first_control
+        prior_actions = None
+        if self.action_prior is not None:
+            prior_actions = self.action_prior(obs).detach()
+            if self._uses_full_action_prior:
+                first_delta = first_control - prior_actions
+        residual_norm = first_delta.norm(dim=-1)
         diagnostics = {
             "planner_residual_norm_mean": float(residual_norm.mean().item()),
-            "planner_residual_abs_mean": float(first_residual.abs().mean().item()),
+            "planner_residual_abs_mean": float(first_delta.abs().mean().item()),
             "planner_selected_prior_fraction": float((residual_norm <= 1e-6).float().mean().item()),
             "planner_prior_candidate_fraction": float(self._prior_candidate_count(self.candidates) / max(self.candidates, 1)),
+            "planner_full_action_mode": float(self._uses_full_action_prior),
         }
 
         if self.action_prior is None:
-            first_action = self._clip_actions(first_residual)
+            first_action = self._clip_actions(first_control)
             diagnostics.update(
                 {
                     "planner_prior_action_norm_mean": 0.0,
@@ -236,8 +286,11 @@ class TrajectoryPlanner:
                 }
             )
         else:
-            prior_actions = self.action_prior(obs).detach()
-            final_actions = self._clip_actions(prior_actions + first_residual).detach()
+            assert prior_actions is not None
+            if self._uses_full_action_prior:
+                final_actions = self._clip_actions(first_control).detach()
+            else:
+                final_actions = self._clip_actions(prior_actions + first_delta).detach()
             prior_norm = prior_actions.norm(dim=-1)
             diagnostics.update(
                 {
@@ -298,7 +351,12 @@ class TrajectoryPlanner:
             reward = preds.rewards.squeeze(-1)
             reward = reward + self._planner_velocity_objective_reward(states)
             if self.action_prior is not None and self.prior_residual_penalty > 0.0:
-                reward = reward - self.prior_residual_penalty * controls_t.square().sum(dim=-1)
+                if self._uses_full_action_prior:
+                    prior_actions = self._clip_actions(self.action_prior(states))
+                    residual = actions_t - prior_actions
+                else:
+                    residual = controls_t
+                reward = reward - self.prior_residual_penalty * residual.square().sum(dim=-1)
             continue_prob = preds.continue_logits.sigmoid().squeeze(-1)
             returns = returns + discounts * alive * reward
             alive = alive * continue_prob
@@ -330,6 +388,7 @@ class CEMPlanner(TrajectoryPlanner):
         prior_fallback: bool = True,
         prior_candidate_fraction: float = 0.1,
         prior_candidate_noise: float = 0.02,
+        prior_control_mode: str = "residual",
         action_bounds_finite: bool = True,
         planner_velocity_objective_weight: float = 0.0,
         planner_velocity_target_x: float = 0.0,
@@ -352,6 +411,7 @@ class CEMPlanner(TrajectoryPlanner):
             prior_fallback=prior_fallback,
             prior_candidate_fraction=prior_candidate_fraction,
             prior_candidate_noise=prior_candidate_noise,
+            prior_control_mode=prior_control_mode,
             action_bounds_finite=action_bounds_finite,
             planner_velocity_objective_weight=planner_velocity_objective_weight,
             planner_velocity_target_x=planner_velocity_target_x,
@@ -373,7 +433,7 @@ class CEMPlanner(TrajectoryPlanner):
             )
             controls = mean.unsqueeze(1) + std.unsqueeze(1) * noise
             controls = self._clip_controls(controls)
-            controls = self._inject_prior_candidates(controls)
+            controls = self._inject_prior_candidates(obs, controls)
             action_sequences = self._expand_controls(controls)
 
             returns = self.evaluate_sequences(obs, action_sequences)
@@ -412,6 +472,7 @@ class MPPIPlanner(TrajectoryPlanner):
         prior_fallback: bool = True,
         prior_candidate_fraction: float = 0.1,
         prior_candidate_noise: float = 0.02,
+        prior_control_mode: str = "residual",
         action_bounds_finite: bool = True,
         planner_velocity_objective_weight: float = 0.0,
         planner_velocity_target_x: float = 0.0,
@@ -434,6 +495,7 @@ class MPPIPlanner(TrajectoryPlanner):
             prior_fallback=prior_fallback,
             prior_candidate_fraction=prior_candidate_fraction,
             prior_candidate_noise=prior_candidate_noise,
+            prior_control_mode=prior_control_mode,
             action_bounds_finite=action_bounds_finite,
             planner_velocity_objective_weight=planner_velocity_objective_weight,
             planner_velocity_target_x=planner_velocity_target_x,
@@ -455,7 +517,7 @@ class MPPIPlanner(TrajectoryPlanner):
             )
             controls = mean.unsqueeze(1) + std.unsqueeze(1) * noise
             controls = self._clip_controls(controls)
-            controls = self._inject_prior_candidates(controls)
+            controls = self._inject_prior_candidates(obs, controls)
             action_sequences = self._expand_controls(controls)
             returns = self.evaluate_sequences(obs, action_sequences)
             self._record_candidate_diagnostics(returns)
@@ -492,6 +554,7 @@ def build_planner(
     prior_fallback: bool = True,
     prior_candidate_fraction: float = 0.1,
     prior_candidate_noise: float = 0.02,
+    prior_control_mode: str = "residual",
     action_bounds_finite: bool = True,
     planner_velocity_objective_weight: float = 0.0,
     planner_velocity_target_x: float = 0.0,
@@ -517,6 +580,7 @@ def build_planner(
             prior_fallback=prior_fallback,
             prior_candidate_fraction=prior_candidate_fraction,
             prior_candidate_noise=prior_candidate_noise,
+            prior_control_mode=prior_control_mode,
             action_bounds_finite=action_bounds_finite,
             planner_velocity_objective_weight=planner_velocity_objective_weight,
             planner_velocity_target_x=planner_velocity_target_x,
@@ -542,6 +606,7 @@ def build_planner(
             prior_fallback=prior_fallback,
             prior_candidate_fraction=prior_candidate_fraction,
             prior_candidate_noise=prior_candidate_noise,
+            prior_control_mode=prior_control_mode,
             action_bounds_finite=action_bounds_finite,
             planner_velocity_objective_weight=planner_velocity_objective_weight,
             planner_velocity_target_x=planner_velocity_target_x,
