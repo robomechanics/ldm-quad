@@ -74,6 +74,10 @@ parser.add_argument(
     default=None,
     help="Override required predicted-return improvement before using residual actions.",
 )
+parser.add_argument("--planner_velocity_objective_weight", type=float, default=None, help="Override planner-only velocity objective weight.")
+parser.add_argument("--planner_velocity_target_x", type=float, default=None, help="Override planner-only target body x velocity.")
+parser.add_argument("--planner_velocity_target_y", type=float, default=None, help="Override planner-only target body y velocity.")
+parser.add_argument("--planner_velocity_target_yaw", type=float, default=None, help="Override planner-only target yaw rate.")
 parser.add_argument("--debug_actions", action="store_true", default=False, help="Print action and velocity-command stats.")
 parser.add_argument(
     "--wander",
@@ -300,6 +304,26 @@ def main() -> None:
                 else checkpoint_args.get("prior_fallback", True)
             ),
             action_bounds_finite=checkpoint_args.get("action_bounds_finite", action_bounds_finite),
+            planner_velocity_objective_weight=(
+                args_cli.planner_velocity_objective_weight
+                if args_cli.planner_velocity_objective_weight is not None
+                else checkpoint_args.get("planner_velocity_objective_weight", 0.0)
+            ),
+            planner_velocity_target_x=(
+                args_cli.planner_velocity_target_x
+                if args_cli.planner_velocity_target_x is not None
+                else checkpoint_args.get("planner_velocity_target_x", 0.0)
+            ),
+            planner_velocity_target_y=(
+                args_cli.planner_velocity_target_y
+                if args_cli.planner_velocity_target_y is not None
+                else checkpoint_args.get("planner_velocity_target_y", 0.0)
+            ),
+            planner_velocity_target_yaw=(
+                args_cli.planner_velocity_target_yaw
+                if args_cli.planner_velocity_target_yaw is not None
+                else checkpoint_args.get("planner_velocity_target_yaw", 0.0)
+            ),
         )
 
     try:

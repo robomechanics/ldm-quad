@@ -26,6 +26,10 @@ class TrajectoryPlanner:
         prior_acceptance_margin: float = 0.0,
         prior_fallback: bool = True,
         action_bounds_finite: bool = True,
+        planner_velocity_objective_weight: float = 0.0,
+        planner_velocity_target_x: float = 0.0,
+        planner_velocity_target_y: float = 0.0,
+        planner_velocity_target_yaw: float = 0.0,
     ):
         self.model = model
         self.action_low = action_low
@@ -42,6 +46,10 @@ class TrajectoryPlanner:
         self.prior_acceptance_margin = prior_acceptance_margin
         self.prior_fallback = prior_fallback
         self.action_bounds_finite = action_bounds_finite
+        self.planner_velocity_objective_weight = planner_velocity_objective_weight
+        self.planner_velocity_target_x = planner_velocity_target_x
+        self.planner_velocity_target_y = planner_velocity_target_y
+        self.planner_velocity_target_yaw = planner_velocity_target_yaw
         self._prev_mean: torch.Tensor | None = None
         self.last_diagnostics: dict[str, float] = {}
 
@@ -239,6 +247,18 @@ class TrajectoryPlanner:
 
         self.last_diagnostics.update(diagnostics)
 
+    def _planner_velocity_objective_reward(self, states: torch.Tensor) -> torch.Tensor:
+        if self.planner_velocity_objective_weight <= 0.0 or states.shape[-1] < 6:
+            return torch.zeros(states.shape[0], device=states.device, dtype=states.dtype)
+
+        target_x = torch.as_tensor(self.planner_velocity_target_x, device=states.device, dtype=states.dtype)
+        target_y = torch.as_tensor(self.planner_velocity_target_y, device=states.device, dtype=states.dtype)
+        target_yaw = torch.as_tensor(self.planner_velocity_target_yaw, device=states.device, dtype=states.dtype)
+        error = (states[:, 0] - target_x).square()
+        error = error + (states[:, 1] - target_y).square()
+        error = error + (states[:, 5] - target_yaw).square()
+        return -float(self.planner_velocity_objective_weight) * error
+
     @torch.no_grad()
     def evaluate_sequences(self, obs: torch.Tensor, control_sequences: torch.Tensor) -> torch.Tensor:
         batch_size, candidates, _, action_dim = control_sequences.shape
@@ -252,6 +272,7 @@ class TrajectoryPlanner:
             actions_t = self._actions_from_controls(states, controls_t)
             preds = self.model.predict(states, actions_t)
             reward = preds.rewards.squeeze(-1)
+            reward = reward + self._planner_velocity_objective_reward(states)
             if self.action_prior is not None and self.prior_residual_penalty > 0.0:
                 reward = reward - self.prior_residual_penalty * controls_t.square().sum(dim=-1)
             continue_prob = preds.continue_logits.sigmoid().squeeze(-1)
@@ -284,6 +305,10 @@ class CEMPlanner(TrajectoryPlanner):
         prior_acceptance_margin: float = 0.0,
         prior_fallback: bool = True,
         action_bounds_finite: bool = True,
+        planner_velocity_objective_weight: float = 0.0,
+        planner_velocity_target_x: float = 0.0,
+        planner_velocity_target_y: float = 0.0,
+        planner_velocity_target_yaw: float = 0.0,
     ):
         super().__init__(
             model=model,
@@ -300,6 +325,10 @@ class CEMPlanner(TrajectoryPlanner):
             prior_acceptance_margin=prior_acceptance_margin,
             prior_fallback=prior_fallback,
             action_bounds_finite=action_bounds_finite,
+            planner_velocity_objective_weight=planner_velocity_objective_weight,
+            planner_velocity_target_x=planner_velocity_target_x,
+            planner_velocity_target_y=planner_velocity_target_y,
+            planner_velocity_target_yaw=planner_velocity_target_yaw,
         )
         self.elites = elites
         self.iterations = iterations
@@ -355,6 +384,10 @@ class MPPIPlanner(TrajectoryPlanner):
         prior_acceptance_margin: float = 0.0,
         prior_fallback: bool = True,
         action_bounds_finite: bool = True,
+        planner_velocity_objective_weight: float = 0.0,
+        planner_velocity_target_x: float = 0.0,
+        planner_velocity_target_y: float = 0.0,
+        planner_velocity_target_yaw: float = 0.0,
     ):
         super().__init__(
             model=model,
@@ -371,6 +404,10 @@ class MPPIPlanner(TrajectoryPlanner):
             prior_acceptance_margin=prior_acceptance_margin,
             prior_fallback=prior_fallback,
             action_bounds_finite=action_bounds_finite,
+            planner_velocity_objective_weight=planner_velocity_objective_weight,
+            planner_velocity_target_x=planner_velocity_target_x,
+            planner_velocity_target_y=planner_velocity_target_y,
+            planner_velocity_target_yaw=planner_velocity_target_yaw,
         )
         self.iterations = iterations
         self.lambda_ = lambda_
@@ -424,6 +461,10 @@ def build_planner(
     prior_acceptance_margin: float = 0.0,
     prior_fallback: bool = True,
     action_bounds_finite: bool = True,
+        planner_velocity_objective_weight: float = 0.0,
+        planner_velocity_target_x: float = 0.0,
+        planner_velocity_target_y: float = 0.0,
+        planner_velocity_target_yaw: float = 0.0,
 ) -> TrajectoryPlanner:
     if planner_name == "mppi":
         return MPPIPlanner(
@@ -443,6 +484,10 @@ def build_planner(
             prior_acceptance_margin=prior_acceptance_margin,
             prior_fallback=prior_fallback,
             action_bounds_finite=action_bounds_finite,
+            planner_velocity_objective_weight=planner_velocity_objective_weight,
+            planner_velocity_target_x=planner_velocity_target_x,
+            planner_velocity_target_y=planner_velocity_target_y,
+            planner_velocity_target_yaw=planner_velocity_target_yaw,
         )
     if planner_name == "cem":
         return CEMPlanner(
@@ -462,5 +507,9 @@ def build_planner(
             prior_acceptance_margin=prior_acceptance_margin,
             prior_fallback=prior_fallback,
             action_bounds_finite=action_bounds_finite,
+            planner_velocity_objective_weight=planner_velocity_objective_weight,
+            planner_velocity_target_x=planner_velocity_target_x,
+            planner_velocity_target_y=planner_velocity_target_y,
+            planner_velocity_target_yaw=planner_velocity_target_yaw,
         )
     raise ValueError(f"Unsupported planner: {planner_name}")

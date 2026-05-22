@@ -66,6 +66,10 @@ parser.add_argument("--planner_iterations", type=int, default=5, help="Planner r
 parser.add_argument("--discount", type=float, default=0.99, help="Planning discount factor.")
 parser.add_argument("--planner_temperature", type=float, default=0.35, help="Initial planner exploration scale.")
 parser.add_argument("--mppi_lambda", type=float, default=1.0, help="MPPI reward temperature.")
+parser.add_argument("--planner_velocity_objective_weight", type=float, default=0.0, help="Planner-only velocity objective weight. Disabled when 0.")
+parser.add_argument("--planner_velocity_target_x", type=float, default=0.0, help="Planner-only target body x velocity.")
+parser.add_argument("--planner_velocity_target_y", type=float, default=0.0, help="Planner-only target body y velocity.")
+parser.add_argument("--planner_velocity_target_yaw", type=float, default=0.0, help="Planner-only target yaw rate.")
 parser.add_argument(
     "--action_spline_knots",
     type=int,
@@ -424,6 +428,10 @@ def main() -> None:
         prior_acceptance_margin=args_cli.prior_acceptance_margin,
         prior_fallback=args_cli.prior_fallback,
         action_bounds_finite=action_bounds_finite,
+        planner_velocity_objective_weight=args_cli.planner_velocity_objective_weight,
+        planner_velocity_target_x=args_cli.planner_velocity_target_x,
+        planner_velocity_target_y=args_cli.planner_velocity_target_y,
+        planner_velocity_target_yaw=args_cli.planner_velocity_target_yaw,
     )
 
     train_state = TrainState()
