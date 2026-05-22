@@ -25,6 +25,8 @@ class TrajectoryPlanner:
         prior_residual_penalty: float = 0.0,
         prior_acceptance_margin: float = 0.0,
         prior_fallback: bool = True,
+        prior_candidate_fraction: float = 0.1,
+        prior_candidate_noise: float = 0.02,
         action_bounds_finite: bool = True,
         planner_velocity_objective_weight: float = 0.0,
         planner_velocity_target_x: float = 0.0,
@@ -45,6 +47,8 @@ class TrajectoryPlanner:
         self.prior_residual_penalty = prior_residual_penalty
         self.prior_acceptance_margin = prior_acceptance_margin
         self.prior_fallback = prior_fallback
+        self.prior_candidate_fraction = prior_candidate_fraction
+        self.prior_candidate_noise = prior_candidate_noise
         self.action_bounds_finite = action_bounds_finite
         self.planner_velocity_objective_weight = planner_velocity_objective_weight
         self.planner_velocity_target_x = planner_velocity_target_x
@@ -142,6 +146,25 @@ class TrajectoryPlanner:
         residual_scale = max(float(self.prior_residual_scale), 1e-6)
         return controls.clamp(-residual_scale, residual_scale)
 
+    def _prior_candidate_count(self, num_candidates: int) -> int:
+        if self.action_prior is None or num_candidates <= 0:
+            return 0
+        fraction = min(max(float(self.prior_candidate_fraction), 0.0), 1.0)
+        return min(num_candidates, max(1, int(round(fraction * num_candidates))))
+
+    def _inject_prior_candidates(self, controls: torch.Tensor) -> torch.Tensor:
+        """Reserve initial candidates for pure or near-prior closed-loop rollouts."""
+        count = self._prior_candidate_count(controls.shape[1])
+        if count == 0:
+            return controls
+
+        controls[:, :count, :, :] = 0.0
+        noise_scale = max(float(self.prior_candidate_noise), 0.0)
+        if count > 1 and noise_scale > 0.0:
+            prior_noise = noise_scale * torch.randn_like(controls[:, 1:count, :, :])
+            controls[:, 1:count, :, :] = self._clip_controls(prior_noise)
+        return controls
+
     def _actions_from_controls(self, states: torch.Tensor, controls_t: torch.Tensor) -> torch.Tensor:
         if self.action_prior is None:
             return controls_t
@@ -200,6 +223,7 @@ class TrajectoryPlanner:
             "planner_residual_norm_mean": float(residual_norm.mean().item()),
             "planner_residual_abs_mean": float(first_residual.abs().mean().item()),
             "planner_selected_prior_fraction": float((residual_norm <= 1e-6).float().mean().item()),
+            "planner_prior_candidate_fraction": float(self._prior_candidate_count(self.candidates) / max(self.candidates, 1)),
         }
 
         if self.action_prior is None:
@@ -304,6 +328,8 @@ class CEMPlanner(TrajectoryPlanner):
         prior_residual_penalty: float = 0.0,
         prior_acceptance_margin: float = 0.0,
         prior_fallback: bool = True,
+        prior_candidate_fraction: float = 0.1,
+        prior_candidate_noise: float = 0.02,
         action_bounds_finite: bool = True,
         planner_velocity_objective_weight: float = 0.0,
         planner_velocity_target_x: float = 0.0,
@@ -324,6 +350,8 @@ class CEMPlanner(TrajectoryPlanner):
             prior_residual_penalty=prior_residual_penalty,
             prior_acceptance_margin=prior_acceptance_margin,
             prior_fallback=prior_fallback,
+            prior_candidate_fraction=prior_candidate_fraction,
+            prior_candidate_noise=prior_candidate_noise,
             action_bounds_finite=action_bounds_finite,
             planner_velocity_objective_weight=planner_velocity_objective_weight,
             planner_velocity_target_x=planner_velocity_target_x,
@@ -345,8 +373,7 @@ class CEMPlanner(TrajectoryPlanner):
             )
             controls = mean.unsqueeze(1) + std.unsqueeze(1) * noise
             controls = self._clip_controls(controls)
-            if self.action_prior is not None and controls.shape[1] > 0:
-                controls[:, 0, :, :] = 0.0
+            controls = self._inject_prior_candidates(controls)
             action_sequences = self._expand_controls(controls)
 
             returns = self.evaluate_sequences(obs, action_sequences)
@@ -383,6 +410,8 @@ class MPPIPlanner(TrajectoryPlanner):
         prior_residual_penalty: float = 0.0,
         prior_acceptance_margin: float = 0.0,
         prior_fallback: bool = True,
+        prior_candidate_fraction: float = 0.1,
+        prior_candidate_noise: float = 0.02,
         action_bounds_finite: bool = True,
         planner_velocity_objective_weight: float = 0.0,
         planner_velocity_target_x: float = 0.0,
@@ -403,6 +432,8 @@ class MPPIPlanner(TrajectoryPlanner):
             prior_residual_penalty=prior_residual_penalty,
             prior_acceptance_margin=prior_acceptance_margin,
             prior_fallback=prior_fallback,
+            prior_candidate_fraction=prior_candidate_fraction,
+            prior_candidate_noise=prior_candidate_noise,
             action_bounds_finite=action_bounds_finite,
             planner_velocity_objective_weight=planner_velocity_objective_weight,
             planner_velocity_target_x=planner_velocity_target_x,
@@ -424,8 +455,7 @@ class MPPIPlanner(TrajectoryPlanner):
             )
             controls = mean.unsqueeze(1) + std.unsqueeze(1) * noise
             controls = self._clip_controls(controls)
-            if self.action_prior is not None and controls.shape[1] > 0:
-                controls[:, 0, :, :] = 0.0
+            controls = self._inject_prior_candidates(controls)
             action_sequences = self._expand_controls(controls)
             returns = self.evaluate_sequences(obs, action_sequences)
             self._record_candidate_diagnostics(returns)
@@ -460,11 +490,13 @@ def build_planner(
     prior_residual_penalty: float = 0.0,
     prior_acceptance_margin: float = 0.0,
     prior_fallback: bool = True,
+    prior_candidate_fraction: float = 0.1,
+    prior_candidate_noise: float = 0.02,
     action_bounds_finite: bool = True,
-        planner_velocity_objective_weight: float = 0.0,
-        planner_velocity_target_x: float = 0.0,
-        planner_velocity_target_y: float = 0.0,
-        planner_velocity_target_yaw: float = 0.0,
+    planner_velocity_objective_weight: float = 0.0,
+    planner_velocity_target_x: float = 0.0,
+    planner_velocity_target_y: float = 0.0,
+    planner_velocity_target_yaw: float = 0.0,
 ) -> TrajectoryPlanner:
     if planner_name == "mppi":
         return MPPIPlanner(
@@ -483,6 +515,8 @@ def build_planner(
             prior_residual_penalty=prior_residual_penalty,
             prior_acceptance_margin=prior_acceptance_margin,
             prior_fallback=prior_fallback,
+            prior_candidate_fraction=prior_candidate_fraction,
+            prior_candidate_noise=prior_candidate_noise,
             action_bounds_finite=action_bounds_finite,
             planner_velocity_objective_weight=planner_velocity_objective_weight,
             planner_velocity_target_x=planner_velocity_target_x,
@@ -506,6 +540,8 @@ def build_planner(
             prior_residual_penalty=prior_residual_penalty,
             prior_acceptance_margin=prior_acceptance_margin,
             prior_fallback=prior_fallback,
+            prior_candidate_fraction=prior_candidate_fraction,
+            prior_candidate_noise=prior_candidate_noise,
             action_bounds_finite=action_bounds_finite,
             planner_velocity_objective_weight=planner_velocity_objective_weight,
             planner_velocity_target_x=planner_velocity_target_x,

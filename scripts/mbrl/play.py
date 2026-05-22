@@ -63,6 +63,18 @@ parser.add_argument("--prior_only", action="store_true", default=False, help="Ru
 parser.add_argument("--prior_residual_scale", type=float, default=None, help="Override residual scale around the prior.")
 parser.add_argument("--prior_residual_penalty", type=float, default=None, help="Override residual penalty around the prior.")
 parser.add_argument(
+    "--prior_candidate_fraction",
+    type=float,
+    default=None,
+    help="Override fraction of planner candidates reserved for pure or near-prior residual rollouts.",
+)
+parser.add_argument(
+    "--prior_candidate_noise",
+    type=float,
+    default=None,
+    help="Override residual noise std for extra prior-centered candidates.",
+)
+parser.add_argument(
     "--prior_fallback",
     action=argparse.BooleanOptionalAction,
     default=None,
@@ -302,6 +314,16 @@ def main() -> None:
                 args_cli.prior_fallback
                 if args_cli.prior_fallback is not None
                 else checkpoint_args.get("prior_fallback", True)
+            ),
+            prior_candidate_fraction=(
+                args_cli.prior_candidate_fraction
+                if args_cli.prior_candidate_fraction is not None
+                else checkpoint_args.get("prior_candidate_fraction", 0.1)
+            ),
+            prior_candidate_noise=(
+                args_cli.prior_candidate_noise
+                if args_cli.prior_candidate_noise is not None
+                else checkpoint_args.get("prior_candidate_noise", 0.02)
             ),
             action_bounds_finite=checkpoint_args.get("action_bounds_finite", action_bounds_finite),
             planner_velocity_objective_weight=(

@@ -109,6 +109,18 @@ parser.add_argument("--seed_policy_noise", type=float, default=0.05, help="Gauss
 parser.add_argument("--prior_residual_scale", type=float, default=0.3, help="Max residual action magnitude around the prior.")
 parser.add_argument("--prior_residual_penalty", type=float, default=0.0, help="Planning penalty on squared residual actions.")
 parser.add_argument(
+    "--prior_candidate_fraction",
+    type=float,
+    default=0.1,
+    help="Fraction of planner candidates reserved for pure or near-prior residual rollouts.",
+)
+parser.add_argument(
+    "--prior_candidate_noise",
+    type=float,
+    default=0.02,
+    help="Residual noise std for extra prior-centered candidates. Candidate 0 is always the exact prior.",
+)
+parser.add_argument(
     "--prior_fallback",
     action=argparse.BooleanOptionalAction,
     default=True,
@@ -427,6 +439,8 @@ def main() -> None:
         prior_residual_penalty=args_cli.prior_residual_penalty,
         prior_acceptance_margin=args_cli.prior_acceptance_margin,
         prior_fallback=args_cli.prior_fallback,
+        prior_candidate_fraction=args_cli.prior_candidate_fraction,
+        prior_candidate_noise=args_cli.prior_candidate_noise,
         action_bounds_finite=action_bounds_finite,
         planner_velocity_objective_weight=args_cli.planner_velocity_objective_weight,
         planner_velocity_target_x=args_cli.planner_velocity_target_x,
@@ -445,6 +459,7 @@ def main() -> None:
         "planner_candidate_return_mean": 0.0,
         "planner_candidate_return_best": 0.0,
         "planner_candidate_return_std": 0.0,
+        "planner_prior_candidate_fraction": 0.0,
         "planner_prior_action_norm_mean": 0.0,
         "planner_residual_norm_mean": 0.0,
         "planner_residual_abs_mean": 0.0,
