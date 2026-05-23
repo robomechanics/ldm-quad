@@ -33,6 +33,7 @@ class TrajectoryPlanner:
         planner_velocity_target_x: float = 0.0,
         planner_velocity_target_y: float = 0.0,
         planner_velocity_target_yaw: float = 0.0,
+        use_best_candidate: bool = False,
     ):
         self.model = model
         self.action_low = action_low
@@ -58,6 +59,7 @@ class TrajectoryPlanner:
         self.planner_velocity_target_x = planner_velocity_target_x
         self.planner_velocity_target_y = planner_velocity_target_y
         self.planner_velocity_target_yaw = planner_velocity_target_yaw
+        self.use_best_candidate = use_best_candidate
         self._prev_mean: torch.Tensor | None = None
         self.last_diagnostics: dict[str, float] = {}
 
@@ -274,6 +276,7 @@ class TrajectoryPlanner:
             "planner_selected_prior_fraction": float((residual_norm <= 1e-6).float().mean().item()),
             "planner_prior_candidate_fraction": float(self._prior_candidate_count(self.candidates) / max(self.candidates, 1)),
             "planner_full_action_mode": float(self._uses_full_action_prior),
+            "planner_best_candidate_mode": float(self.use_best_candidate),
         }
 
         if self.action_prior is None:
@@ -394,6 +397,7 @@ class CEMPlanner(TrajectoryPlanner):
         planner_velocity_target_x: float = 0.0,
         planner_velocity_target_y: float = 0.0,
         planner_velocity_target_yaw: float = 0.0,
+        use_best_candidate: bool = False,
     ):
         super().__init__(
             model=model,
@@ -417,6 +421,7 @@ class CEMPlanner(TrajectoryPlanner):
             planner_velocity_target_x=planner_velocity_target_x,
             planner_velocity_target_y=planner_velocity_target_y,
             planner_velocity_target_yaw=planner_velocity_target_yaw,
+            use_best_candidate=use_best_candidate,
         )
         self.elites = elites
         self.iterations = iterations
@@ -478,6 +483,7 @@ class MPPIPlanner(TrajectoryPlanner):
         planner_velocity_target_x: float = 0.0,
         planner_velocity_target_y: float = 0.0,
         planner_velocity_target_yaw: float = 0.0,
+        use_best_candidate: bool = False,
     ):
         super().__init__(
             model=model,
@@ -501,6 +507,7 @@ class MPPIPlanner(TrajectoryPlanner):
             planner_velocity_target_x=planner_velocity_target_x,
             planner_velocity_target_y=planner_velocity_target_y,
             planner_velocity_target_yaw=planner_velocity_target_yaw,
+            use_best_candidate=use_best_candidate,
         )
         self.iterations = iterations
         self.lambda_ = lambda_
@@ -508,6 +515,7 @@ class MPPIPlanner(TrajectoryPlanner):
     def plan(self, obs: torch.Tensor) -> torch.Tensor:
         mean = self._warm_start_mean(obs)
         std = torch.full_like(mean, self.temperature)
+        best_controls = mean
 
         for _ in range(self.iterations):
             noise = torch.randn(
@@ -521,6 +529,11 @@ class MPPIPlanner(TrajectoryPlanner):
             action_sequences = self._expand_controls(controls)
             returns = self.evaluate_sequences(obs, action_sequences)
             self._record_candidate_diagnostics(returns)
+            best_indices = returns.argmax(dim=1)
+            best_controls = controls.gather(
+                1,
+                best_indices.view(-1, 1, 1, 1).expand(-1, 1, self.control_horizon, self.action_dim),
+            ).squeeze(1)
 
             shifted_returns = returns - returns.max(dim=1, keepdim=True).values
             weights = torch.softmax(shifted_returns / max(self.lambda_, 1e-6), dim=1)
@@ -529,6 +542,8 @@ class MPPIPlanner(TrajectoryPlanner):
             variance = (weights.unsqueeze(-1).unsqueeze(-1) * centered.square()).sum(dim=1)
             std = variance.sqrt().clamp_min(1e-3)
 
+        if self.use_best_candidate:
+            mean = best_controls
         mean = self._maybe_fallback_to_prior(obs, mean)
         self._prev_mean = mean.detach()
         return self._first_action_from_controls(obs, mean)
@@ -560,6 +575,7 @@ def build_planner(
     planner_velocity_target_x: float = 0.0,
     planner_velocity_target_y: float = 0.0,
     planner_velocity_target_yaw: float = 0.0,
+    use_best_candidate: bool = False,
 ) -> TrajectoryPlanner:
     if planner_name == "mppi":
         return MPPIPlanner(
@@ -586,6 +602,7 @@ def build_planner(
             planner_velocity_target_x=planner_velocity_target_x,
             planner_velocity_target_y=planner_velocity_target_y,
             planner_velocity_target_yaw=planner_velocity_target_yaw,
+            use_best_candidate=use_best_candidate,
         )
     if planner_name == "cem":
         return CEMPlanner(
@@ -612,5 +629,6 @@ def build_planner(
             planner_velocity_target_x=planner_velocity_target_x,
             planner_velocity_target_y=planner_velocity_target_y,
             planner_velocity_target_yaw=planner_velocity_target_yaw,
+            use_best_candidate=use_best_candidate,
         )
     raise ValueError(f"Unsupported planner: {planner_name}")

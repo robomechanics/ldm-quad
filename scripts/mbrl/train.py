@@ -66,6 +66,12 @@ parser.add_argument("--planner_iterations", type=int, default=5, help="Planner r
 parser.add_argument("--discount", type=float, default=0.99, help="Planning discount factor.")
 parser.add_argument("--planner_temperature", type=float, default=0.35, help="Initial planner exploration scale.")
 parser.add_argument("--mppi_lambda", type=float, default=1.0, help="MPPI reward temperature.")
+parser.add_argument(
+    "--planner_use_best_candidate",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Use the best evaluated candidate as the final MPPI plan instead of the weighted candidate mean.",
+)
 parser.add_argument("--planner_velocity_objective_weight", type=float, default=0.0, help="Planner-only velocity objective weight. Disabled when 0.")
 parser.add_argument("--planner_velocity_target_x", type=float, default=0.0, help="Planner-only target body x velocity.")
 parser.add_argument("--planner_velocity_target_y", type=float, default=0.0, help="Planner-only target body y velocity.")
@@ -454,6 +460,7 @@ def main() -> None:
         planner_velocity_target_x=args_cli.planner_velocity_target_x,
         planner_velocity_target_y=args_cli.planner_velocity_target_y,
         planner_velocity_target_yaw=args_cli.planner_velocity_target_yaw,
+        use_best_candidate=args_cli.planner_use_best_candidate,
     )
 
     train_state = TrainState()
@@ -469,6 +476,7 @@ def main() -> None:
         "planner_candidate_return_std": 0.0,
         "planner_prior_candidate_fraction": 0.0,
         "planner_full_action_mode": 0.0,
+        "planner_best_candidate_mode": 0.0,
         "planner_prior_action_norm_mean": 0.0,
         "planner_residual_norm_mean": 0.0,
         "planner_residual_abs_mean": 0.0,

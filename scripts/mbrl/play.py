@@ -93,6 +93,12 @@ parser.add_argument(
     default=None,
     help="Override required predicted-return improvement before using residual actions.",
 )
+parser.add_argument(
+    "--planner_use_best_candidate",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="Override using the best evaluated candidate as the final MPPI plan.",
+)
 parser.add_argument("--planner_velocity_objective_weight", type=float, default=None, help="Override planner-only velocity objective weight.")
 parser.add_argument("--planner_velocity_target_x", type=float, default=None, help="Override planner-only target body x velocity.")
 parser.add_argument("--planner_velocity_target_y", type=float, default=None, help="Override planner-only target body y velocity.")
@@ -357,6 +363,11 @@ def main() -> None:
                 args_cli.planner_velocity_target_yaw
                 if args_cli.planner_velocity_target_yaw is not None
                 else checkpoint_args.get("planner_velocity_target_yaw", 0.0)
+            ),
+            use_best_candidate=(
+                args_cli.planner_use_best_candidate
+                if args_cli.planner_use_best_candidate is not None
+                else checkpoint_args.get("planner_use_best_candidate", False)
             ),
         )
 
