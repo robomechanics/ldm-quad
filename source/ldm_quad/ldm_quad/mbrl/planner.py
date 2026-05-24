@@ -27,6 +27,10 @@ class TrajectoryPlanner:
         prior_fallback: bool = True,
         prior_candidate_fraction: float = 0.1,
         prior_candidate_noise: float = 0.02,
+        prior_command_candidate_fraction: float = 0.0,
+        prior_command_noise: float = 0.1,
+        prior_command_start: int = -1,
+        prior_command_dim: int = 3,
         prior_control_mode: str = "residual",
         action_bounds_finite: bool = True,
         planner_velocity_objective_weight: float = 0.0,
@@ -51,6 +55,10 @@ class TrajectoryPlanner:
         self.prior_fallback = prior_fallback
         self.prior_candidate_fraction = prior_candidate_fraction
         self.prior_candidate_noise = prior_candidate_noise
+        self.prior_command_candidate_fraction = prior_command_candidate_fraction
+        self.prior_command_noise = prior_command_noise
+        self.prior_command_start = prior_command_start
+        self.prior_command_dim = prior_command_dim
         if prior_control_mode not in {"residual", "full_action"}:
             raise ValueError(f"Unsupported prior_control_mode: {prior_control_mode}")
         self.prior_control_mode = prior_control_mode
@@ -104,7 +112,7 @@ class TrajectoryPlanner:
     def _sample_actions_at_knots(self, action_sequences: torch.Tensor) -> torch.Tensor:
         knot_positions = torch.linspace(0, self.horizon - 1, self.control_horizon, device=action_sequences.device)
         knot_indices = knot_positions.round().long().clamp_(0, self.horizon - 1)
-        return action_sequences[:, knot_indices, :]
+        return action_sequences[..., knot_indices, :]
 
     def _interpolate_action_spline(self, action_knots: torch.Tensor) -> torch.Tensor:
         """Expand uniformly spaced action knots with cubic Catmull-Rom interpolation."""
@@ -164,19 +172,57 @@ class TrajectoryPlanner:
         fraction = min(max(float(self.prior_candidate_fraction), 0.0), 1.0)
         return min(num_candidates, max(1, int(round(fraction * num_candidates))))
 
+    def _prior_command_candidate_count(self, num_candidates: int) -> int:
+        if not self._uses_full_action_prior or num_candidates <= 1:
+            return 0
+        prior_count = self._prior_candidate_count(num_candidates)
+        if prior_count <= 1:
+            return 0
+        fraction = min(max(float(self.prior_command_candidate_fraction), 0.0), 1.0)
+        return min(prior_count - 1, int(round(fraction * num_candidates)))
+
+    def _command_slice(self, obs_dim: int) -> slice | None:
+        command_dim = int(self.prior_command_dim)
+        if command_dim <= 0:
+            return None
+        if self.prior_command_start >= 0:
+            start = int(self.prior_command_start)
+        elif obs_dim == 45:
+            start = 6
+        else:
+            start = 9
+        end = start + command_dim
+        if start < 0 or end > obs_dim:
+            return None
+        return slice(start, end)
+
+    def _perturb_prior_commands(self, obs: torch.Tensor, candidate_count: int) -> torch.Tensor:
+        obs_candidates = obs.unsqueeze(1).expand(-1, candidate_count, -1).clone()
+        command_slice = self._command_slice(obs.shape[-1])
+        if command_slice is None or candidate_count <= 0:
+            return obs_candidates
+
+        noise_scale = max(float(self.prior_command_noise), 0.0)
+        if noise_scale <= 0.0:
+            return obs_candidates
+
+        command_noise = noise_scale * torch.randn_like(obs_candidates[..., command_slice])
+        obs_candidates[..., command_slice] = obs_candidates[..., command_slice] + command_noise
+        return obs_candidates
+
     def _rollout_prior_actions(self, obs: torch.Tensor) -> torch.Tensor:
         if self.action_prior is None:
             return self._expand_controls(self._zero_controls(obs))
 
-        batch_size = obs.shape[0]
-        states = obs
+        leading_shape = obs.shape[:-1]
+        states = obs.reshape(-1, obs.shape[-1])
         actions = []
         for _ in range(self.horizon):
             action = self._clip_actions(self.action_prior(states))
             actions.append(action)
             preds = self.model.predict(states, action)
             states = states + preds.delta_obs
-        return torch.stack(actions, dim=1).view(batch_size, self.horizon, self.action_dim)
+        return torch.stack(actions, dim=1).view(*leading_shape, self.horizon, self.action_dim)
 
     def _prior_control_mean(self, obs: torch.Tensor) -> torch.Tensor:
         prior_actions = self._rollout_prior_actions(obs)
@@ -198,16 +244,29 @@ class TrajectoryPlanner:
         if self._uses_full_action_prior:
             prior_controls = self._prior_control_mean(obs)
             controls[:, :count, :, :] = prior_controls.unsqueeze(1)
+            command_count = self._prior_command_candidate_count(controls.shape[1])
+            if command_count > 0:
+                command_obs = self._perturb_prior_commands(obs, command_count)
+                command_prior_actions = self._rollout_prior_actions(command_obs)
+                if self.action_spline_knots:
+                    command_prior_controls = self._sample_actions_at_knots(command_prior_actions)
+                else:
+                    command_prior_controls = command_prior_actions
+                controls[:, 1 : 1 + command_count, :, :] = command_prior_controls
         else:
             controls[:, :count, :, :] = 0.0
 
         noise_scale = max(float(self.prior_candidate_noise), 0.0)
         if count > 1 and noise_scale > 0.0:
-            prior_noise = noise_scale * torch.randn_like(controls[:, 1:count, :, :])
+            noise_start = 1 + self._prior_command_candidate_count(controls.shape[1]) if self._uses_full_action_prior else 1
+            noise_start = min(max(noise_start, 1), count)
+            prior_noise = noise_scale * torch.randn_like(controls[:, noise_start:count, :, :])
             if self._uses_full_action_prior:
-                controls[:, 1:count, :, :] = self._clip_controls(controls[:, 1:count, :, :] + prior_noise)
+                controls[:, noise_start:count, :, :] = self._clip_controls(
+                    controls[:, noise_start:count, :, :] + prior_noise
+                )
             else:
-                controls[:, 1:count, :, :] = self._clip_controls(prior_noise)
+                controls[:, noise_start:count, :, :] = self._clip_controls(prior_noise)
         return controls
 
     def _actions_from_controls(self, states: torch.Tensor, controls_t: torch.Tensor) -> torch.Tensor:
@@ -275,6 +334,9 @@ class TrajectoryPlanner:
             "planner_residual_abs_mean": float(first_delta.abs().mean().item()),
             "planner_selected_prior_fraction": float((residual_norm <= 1e-6).float().mean().item()),
             "planner_prior_candidate_fraction": float(self._prior_candidate_count(self.candidates) / max(self.candidates, 1)),
+            "planner_prior_command_candidate_fraction": float(
+                self._prior_command_candidate_count(self.candidates) / max(self.candidates, 1)
+            ),
             "planner_full_action_mode": float(self._uses_full_action_prior),
             "planner_best_candidate_mode": float(self.use_best_candidate),
         }
@@ -391,6 +453,10 @@ class CEMPlanner(TrajectoryPlanner):
         prior_fallback: bool = True,
         prior_candidate_fraction: float = 0.1,
         prior_candidate_noise: float = 0.02,
+        prior_command_candidate_fraction: float = 0.0,
+        prior_command_noise: float = 0.1,
+        prior_command_start: int = -1,
+        prior_command_dim: int = 3,
         prior_control_mode: str = "residual",
         action_bounds_finite: bool = True,
         planner_velocity_objective_weight: float = 0.0,
@@ -415,6 +481,10 @@ class CEMPlanner(TrajectoryPlanner):
             prior_fallback=prior_fallback,
             prior_candidate_fraction=prior_candidate_fraction,
             prior_candidate_noise=prior_candidate_noise,
+            prior_command_candidate_fraction=prior_command_candidate_fraction,
+            prior_command_noise=prior_command_noise,
+            prior_command_start=prior_command_start,
+            prior_command_dim=prior_command_dim,
             prior_control_mode=prior_control_mode,
             action_bounds_finite=action_bounds_finite,
             planner_velocity_objective_weight=planner_velocity_objective_weight,
@@ -477,6 +547,10 @@ class MPPIPlanner(TrajectoryPlanner):
         prior_fallback: bool = True,
         prior_candidate_fraction: float = 0.1,
         prior_candidate_noise: float = 0.02,
+        prior_command_candidate_fraction: float = 0.0,
+        prior_command_noise: float = 0.1,
+        prior_command_start: int = -1,
+        prior_command_dim: int = 3,
         prior_control_mode: str = "residual",
         action_bounds_finite: bool = True,
         planner_velocity_objective_weight: float = 0.0,
@@ -501,6 +575,10 @@ class MPPIPlanner(TrajectoryPlanner):
             prior_fallback=prior_fallback,
             prior_candidate_fraction=prior_candidate_fraction,
             prior_candidate_noise=prior_candidate_noise,
+            prior_command_candidate_fraction=prior_command_candidate_fraction,
+            prior_command_noise=prior_command_noise,
+            prior_command_start=prior_command_start,
+            prior_command_dim=prior_command_dim,
             prior_control_mode=prior_control_mode,
             action_bounds_finite=action_bounds_finite,
             planner_velocity_objective_weight=planner_velocity_objective_weight,
@@ -569,6 +647,10 @@ def build_planner(
     prior_fallback: bool = True,
     prior_candidate_fraction: float = 0.1,
     prior_candidate_noise: float = 0.02,
+    prior_command_candidate_fraction: float = 0.0,
+    prior_command_noise: float = 0.1,
+    prior_command_start: int = -1,
+    prior_command_dim: int = 3,
     prior_control_mode: str = "residual",
     action_bounds_finite: bool = True,
     planner_velocity_objective_weight: float = 0.0,
@@ -596,6 +678,10 @@ def build_planner(
             prior_fallback=prior_fallback,
             prior_candidate_fraction=prior_candidate_fraction,
             prior_candidate_noise=prior_candidate_noise,
+            prior_command_candidate_fraction=prior_command_candidate_fraction,
+            prior_command_noise=prior_command_noise,
+            prior_command_start=prior_command_start,
+            prior_command_dim=prior_command_dim,
             prior_control_mode=prior_control_mode,
             action_bounds_finite=action_bounds_finite,
             planner_velocity_objective_weight=planner_velocity_objective_weight,
@@ -623,6 +709,10 @@ def build_planner(
             prior_fallback=prior_fallback,
             prior_candidate_fraction=prior_candidate_fraction,
             prior_candidate_noise=prior_candidate_noise,
+            prior_command_candidate_fraction=prior_command_candidate_fraction,
+            prior_command_noise=prior_command_noise,
+            prior_command_start=prior_command_start,
+            prior_command_dim=prior_command_dim,
             prior_control_mode=prior_control_mode,
             action_bounds_finite=action_bounds_finite,
             planner_velocity_objective_weight=planner_velocity_objective_weight,
