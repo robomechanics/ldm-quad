@@ -5,6 +5,7 @@ from collections.abc import Callable
 import torch
 
 from .models import DynamicsEnsemble
+from .world_model import LatentWorldModel
 
 
 class TrajectoryPlanner:
@@ -627,9 +628,183 @@ class MPPIPlanner(TrajectoryPlanner):
         return self._first_action_from_controls(obs, mean)
 
 
+class LatentMPPIPlanner:
+    """MPPI planner that evaluates trajectories in a TD-MPC-style latent world model."""
+
+    def __init__(
+        self,
+        model: LatentWorldModel,
+        action_low: torch.Tensor,
+        action_high: torch.Tensor,
+        horizon: int = 30,
+        candidates: int = 512,
+        iterations: int = 5,
+        discount: float = 0.99,
+        temperature: float = 0.5,
+        lambda_: float = 1.0,
+        action_prior: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        prior_candidate_fraction: float = 0.1,
+        prior_candidate_noise: float = 0.02,
+        action_bounds_finite: bool = True,
+        use_best_candidate: bool = False,
+        **_: object,
+    ):
+        self.model = model
+        self.action_low = action_low
+        self.action_high = action_high
+        self.horizon = horizon
+        self.candidates = candidates
+        self.iterations = iterations
+        self.discount = discount
+        self.temperature = temperature
+        self.lambda_ = lambda_
+        self.action_dim = action_low.numel()
+        self.action_prior = action_prior
+        self.prior_candidate_fraction = prior_candidate_fraction
+        self.prior_candidate_noise = prior_candidate_noise
+        self.action_bounds_finite = action_bounds_finite
+        self.use_best_candidate = use_best_candidate
+        self._prev_mean: torch.Tensor | None = None
+        self.last_diagnostics: dict[str, float] = {}
+
+    def reset(self, done: torch.Tensor | None = None) -> None:
+        if self._prev_mean is None:
+            return
+        if done is None:
+            self._prev_mean = None
+            return
+        done = done.to(device=self._prev_mean.device, dtype=torch.bool).view(-1)
+        if done.numel() != self._prev_mean.shape[0]:
+            self._prev_mean = None
+            return
+        self._prev_mean[done] = 0.0
+
+    def _clip_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        if not self.action_bounds_finite:
+            return actions.clamp(-1.0, 1.0)
+        return torch.max(
+            torch.min(actions, self.action_high.view(*([1] * (actions.ndim - 1)), -1)),
+            self.action_low.view(*([1] * (actions.ndim - 1)), -1),
+        )
+
+    def _warm_start_mean(self, obs: torch.Tensor) -> torch.Tensor:
+        shape = (obs.shape[0], self.horizon, self.action_dim)
+        if self._prev_mean is None or self._prev_mean.shape != shape or self._prev_mean.device != obs.device:
+            with torch.no_grad():
+                z = self.model.encode(obs)
+                action = self.model.pi(z)
+            return action.unsqueeze(1).expand(-1, self.horizon, -1).clone()
+        shifted = torch.zeros_like(self._prev_mean)
+        shifted[:, :-1] = self._prev_mean[:, 1:]
+        with torch.no_grad():
+            z = self.model.encode(obs)
+            shifted[:, -1] = self.model.pi(z)
+        return shifted
+
+    def _inject_prior_candidates(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        prior_count = max(1, int(round(self.prior_candidate_fraction * self.candidates)))
+        prior_count = min(prior_count, self.candidates)
+        with torch.no_grad():
+            z = self.model.encode(obs)
+            learned_prior = self.model.pi(z)
+        actions[:, 0, :, :] = learned_prior.unsqueeze(1).expand(-1, self.horizon, -1)
+
+        if self.action_prior is not None and prior_count > 1:
+            external_prior = self._clip_actions(self.action_prior(obs))
+            actions[:, 1, :, :] = external_prior.unsqueeze(1).expand(-1, self.horizon, -1)
+            noise_start = 2
+        else:
+            noise_start = 1
+
+        if prior_count > noise_start and self.prior_candidate_noise > 0.0:
+            base = actions[:, :1, :, :]
+            noise = self.prior_candidate_noise * torch.randn_like(actions[:, noise_start:prior_count])
+            actions[:, noise_start:prior_count] = self._clip_actions(base + noise)
+        return actions
+
+    @torch.no_grad()
+    def evaluate_sequences(self, obs: torch.Tensor, action_sequences: torch.Tensor) -> torch.Tensor:
+        batch_size, candidates, _, action_dim = action_sequences.shape
+        z = self.model.encode(obs).unsqueeze(1).expand(-1, candidates, -1).reshape(batch_size * candidates, -1)
+        returns = torch.zeros(batch_size * candidates, device=obs.device, dtype=obs.dtype)
+        discounts = torch.ones_like(returns)
+        alive = torch.ones_like(returns)
+
+        for t in range(self.horizon):
+            actions_t = action_sequences[:, :, t, :].reshape(batch_size * candidates, action_dim)
+            reward = self.model.reward(z, actions_t).squeeze(-1)
+            z = self.model.next(z, actions_t)
+            continue_prob = self.model.continue_logits(z).sigmoid().squeeze(-1)
+            returns = returns + discounts * alive * reward
+            alive = alive * continue_prob
+            discounts = discounts * self.discount
+
+        terminal_action = self.model.pi(z)
+        terminal_value = self.model.Q(z, terminal_action).squeeze(-1)
+        returns = returns + discounts * alive * terminal_value
+        return returns.view(batch_size, candidates)
+
+    def _record_diagnostics(self, returns: torch.Tensor, action: torch.Tensor) -> None:
+        returns = returns.detach()
+        self.last_diagnostics = {
+            "planner_candidate_return_mean": float(returns.mean().item()),
+            "planner_candidate_return_best": float(returns.max(dim=1).values.mean().item()),
+            "planner_candidate_return_std": float(returns.std(unbiased=False).item()),
+            "planner_prior_candidate_fraction": float(max(1, int(round(self.prior_candidate_fraction * self.candidates))) / self.candidates),
+            "planner_prior_command_candidate_fraction": 0.0,
+            "planner_full_action_mode": 1.0,
+            "planner_best_candidate_mode": float(self.use_best_candidate),
+            "planner_prior_action_norm_mean": 0.0,
+            "planner_residual_norm_mean": 0.0,
+            "planner_residual_abs_mean": 0.0,
+            "planner_final_action_norm_mean": float(action.detach().norm(dim=-1).mean().item()),
+            "planner_residual_to_prior_norm": 0.0,
+            "planner_selected_prior_fraction": 0.0,
+            "planner_predicted_plan_return_mean": 0.0,
+            "planner_predicted_prior_return_mean": 0.0,
+            "planner_predicted_return_margin_mean": 0.0,
+            "planner_predicted_return_margin_min": 0.0,
+            "planner_prior_fallback_fraction": 0.0,
+        }
+
+    def plan(self, obs: torch.Tensor) -> torch.Tensor:
+        mean = self._warm_start_mean(obs)
+        std = torch.full_like(mean, self.temperature)
+        best_actions = mean
+        last_returns = torch.zeros((obs.shape[0], self.candidates), device=obs.device, dtype=obs.dtype)
+
+        for _ in range(self.iterations):
+            noise = torch.randn(
+                (obs.shape[0], self.candidates, self.horizon, self.action_dim),
+                device=obs.device,
+                dtype=obs.dtype,
+            )
+            actions = self._clip_actions(mean.unsqueeze(1) + std.unsqueeze(1) * noise)
+            actions = self._inject_prior_candidates(obs, actions)
+            returns = self.evaluate_sequences(obs, actions)
+            last_returns = returns
+
+            best_indices = returns.argmax(dim=1)
+            best_actions = actions.gather(
+                1,
+                best_indices.view(-1, 1, 1, 1).expand(-1, 1, self.horizon, self.action_dim),
+            ).squeeze(1)
+            weights = torch.softmax((returns - returns.max(dim=1, keepdim=True).values) / max(self.lambda_, 1e-6), dim=1)
+            mean = (weights.unsqueeze(-1).unsqueeze(-1) * actions).sum(dim=1)
+            variance = (weights.unsqueeze(-1).unsqueeze(-1) * (actions - mean.unsqueeze(1)).square()).sum(dim=1)
+            std = variance.sqrt().clamp_min(1e-3)
+
+        if self.use_best_candidate:
+            mean = best_actions
+        self._prev_mean = mean.detach()
+        action = self._clip_actions(mean[:, 0])
+        self._record_diagnostics(last_returns, action)
+        return action
+
+
 def build_planner(
     planner_name: str,
-    model: DynamicsEnsemble,
+    model: DynamicsEnsemble | LatentWorldModel,
     action_low: torch.Tensor,
     action_high: torch.Tensor,
     horizon: int,
@@ -658,7 +833,26 @@ def build_planner(
     planner_velocity_target_y: float = 0.0,
     planner_velocity_target_yaw: float = 0.0,
     use_best_candidate: bool = False,
-) -> TrajectoryPlanner:
+) -> TrajectoryPlanner | LatentMPPIPlanner:
+    if getattr(model, "is_latent_world_model", False):
+        if planner_name != "mppi":
+            raise ValueError("LatentWorldModel currently supports only the mppi planner.")
+        return LatentMPPIPlanner(
+            model=model,
+            action_low=action_low,
+            action_high=action_high,
+            horizon=horizon,
+            candidates=candidates,
+            iterations=iterations,
+            discount=discount,
+            temperature=temperature,
+            lambda_=lambda_,
+            action_prior=action_prior,
+            prior_candidate_fraction=prior_candidate_fraction,
+            prior_candidate_noise=prior_candidate_noise,
+            action_bounds_finite=action_bounds_finite,
+            use_best_candidate=use_best_candidate,
+        )
     if planner_name == "mppi":
         return MPPIPlanner(
             model=model,

@@ -55,7 +55,18 @@ parser.add_argument(
 parser.add_argument("--train_steps", type=int, default=400, help="Number of environment interaction steps.")
 parser.add_argument("--updates_per_step", type=int, default=8, help="Model updates after each environment step.")
 parser.add_argument("--batch_size", type=int, default=4096, help="Replay batch size.")
-parser.add_argument("--hidden_dim", type=int, default=512, help="Dynamics ensemble hidden dimension.")
+parser.add_argument(
+    "--model_type",
+    type=str,
+    default="latent",
+    choices=["latent", "dynamics"],
+    help="Use a TD-MPC-style latent world model or the legacy observation-delta dynamics ensemble.",
+)
+parser.add_argument("--latent_dim", type=int, default=128, help="Latent dimension for --model_type latent.")
+parser.add_argument("--num_q", type=int, default=2, help="Number of Q heads for --model_type latent.")
+parser.add_argument("--target_tau", type=float, default=0.01, help="Soft-update rate for latent target encoder/Q heads.")
+parser.add_argument("--rho", type=float, default=0.5, help="Temporal loss discount for latent rollout losses.")
+parser.add_argument("--hidden_dim", type=int, default=512, help="Model hidden dimension.")
 parser.add_argument("--model_depth", type=int, default=3, help="Number of hidden layers per ensemble member.")
 parser.add_argument("--ensemble_size", type=int, default=5, help="Number of dynamics models in the ensemble.")
 parser.add_argument("--planner", type=str, default="mppi", choices=["cem", "mppi"], help="Sampling-based planner.")
@@ -229,7 +240,7 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
 import ldm_quad.tasks  # noqa: F401
-from ldm_quad.mbrl import DynamicsEnsemble, ReplayBuffer, build_planner, load_policy_prior
+from ldm_quad.mbrl import DynamicsEnsemble, LatentWorldModel, ReplayBuffer, build_planner, load_policy_prior
 
 
 @dataclass
@@ -382,7 +393,7 @@ def init_wandb(log_dir: str) -> object | None:
 
 def save_checkpoint(
     path: str,
-    model: DynamicsEnsemble,
+    model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     train_state: TrainState,
     args: argparse.Namespace,
@@ -439,13 +450,26 @@ def main() -> None:
         print(f"[MBRL] Loaded locomotion prior ({args_cli.prior_type}): {os.path.abspath(args_cli.prior_checkpoint)}")
 
     replay = ReplayBuffer(args_cli.buffer_capacity, obs_dim=obs_dim, action_dim=action_dim)
-    model = DynamicsEnsemble(
-        obs_dim=obs_dim,
-        action_dim=action_dim,
-        ensemble_size=args_cli.ensemble_size,
-        hidden_dim=args_cli.hidden_dim,
-        depth=args_cli.model_depth,
-    ).to(device)
+    if args_cli.model_type == "latent":
+        model = LatentWorldModel(
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            latent_dim=args_cli.latent_dim,
+            hidden_dim=args_cli.hidden_dim,
+            depth=args_cli.model_depth,
+            num_q=args_cli.num_q,
+            discount=args_cli.discount,
+            tau=args_cli.target_tau,
+            rho=args_cli.rho,
+        ).to(device)
+    else:
+        model = DynamicsEnsemble(
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            ensemble_size=args_cli.ensemble_size,
+            hidden_dim=args_cli.hidden_dim,
+            depth=args_cli.model_depth,
+        ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args_cli.lr)
     model.eval()
     planner = build_planner(
@@ -529,9 +553,14 @@ def main() -> None:
             recent_length_window = recent_lengths[-args_cli.planner_recent_episodes :]
             recent_mean_length = float(np.mean(recent_length_window)) if recent_length_window else 0.0
             prior_policy_available = action_prior is not None and args_cli.seed_with_prior
+            replay_ready = (
+                replay.can_sample_sequences(args_cli.batch_size, args_cli.horizon)
+                if args_cli.model_type == "latent"
+                else len(replay) >= args_cli.batch_size
+            )
             planner_ready = (
                 train_state.env_steps >= planner_start_steps
-                and len(replay) >= args_cli.batch_size
+                and replay_ready
                 and (not prior_policy_available or recent_mean_length >= planner_min_length)
                 and train_state.env_steps >= planner_disabled_until
             )
@@ -591,15 +620,25 @@ def main() -> None:
             obs = next_obs
             train_state.env_steps += 1
 
-        if len(replay) >= args_cli.batch_size:
+        train_ready = (
+            replay.can_sample_sequences(args_cli.batch_size, args_cli.horizon)
+            if args_cli.model_type == "latent"
+            else len(replay) >= args_cli.batch_size
+        )
+        if train_ready:
             model.train()
             for _ in range(args_cli.updates_per_step):
-                batch = replay.sample(args_cli.batch_size, device=device)
+                if args_cli.model_type == "latent":
+                    batch = replay.sample_sequences(args_cli.batch_size, args_cli.horizon, device=device)
+                else:
+                    batch = replay.sample(args_cli.batch_size, device=device)
                 loss, metrics = model.loss(batch)
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
                 optimizer.step()
+                if hasattr(model, "soft_update_targets"):
+                    model.soft_update_targets()
                 latest_losses = metrics
                 train_state.gradient_updates += 1
             model.eval()

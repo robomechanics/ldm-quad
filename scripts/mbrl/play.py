@@ -149,7 +149,7 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
 import ldm_quad.tasks  # noqa: F401
-from ldm_quad.mbrl import DynamicsEnsemble, build_planner, load_policy_prior
+from ldm_quad.mbrl import DynamicsEnsemble, LatentWorldModel, build_planner, load_policy_prior
 
 
 def set_seed(seed: int) -> None:
@@ -298,13 +298,26 @@ def main() -> None:
     planner_name = checkpoint_args.get("planner", "mppi")
     planner = None
     if not args_cli.prior_only:
-        model = DynamicsEnsemble(
-            obs_dim=obs.shape[-1],
-            action_dim=action_dim,
-            ensemble_size=checkpoint_args["ensemble_size"],
-            hidden_dim=checkpoint_args["hidden_dim"],
-            depth=checkpoint_args["model_depth"],
-        ).to(device)
+        if checkpoint_args.get("model_type", "dynamics") == "latent":
+            model = LatentWorldModel(
+                obs_dim=obs.shape[-1],
+                action_dim=action_dim,
+                latent_dim=checkpoint_args.get("latent_dim", 128),
+                hidden_dim=checkpoint_args["hidden_dim"],
+                depth=checkpoint_args["model_depth"],
+                num_q=checkpoint_args.get("num_q", 2),
+                discount=checkpoint_args["discount"],
+                tau=checkpoint_args.get("target_tau", 0.01),
+                rho=checkpoint_args.get("rho", 0.5),
+            ).to(device)
+        else:
+            model = DynamicsEnsemble(
+                obs_dim=obs.shape[-1],
+                action_dim=action_dim,
+                ensemble_size=checkpoint_args["ensemble_size"],
+                hidden_dim=checkpoint_args["hidden_dim"],
+                depth=checkpoint_args["model_depth"],
+            ).to(device)
         model.load_state_dict(checkpoint["model"])
         model.eval()
 
