@@ -26,7 +26,6 @@ class WorldModelLossWeights:
     reward: float = 1.0
     value: float = 0.5
     continue_: float = 0.1
-    policy: float = 0.05
 
 
 class LatentWorldModel(nn.Module):
@@ -45,6 +44,9 @@ class LatentWorldModel(nn.Module):
         discount: float = 0.99,
         tau: float = 0.01,
         rho: float = 0.5,
+        entropy_coef: float = 1e-4,
+        log_std_min: float = -10.0,
+        log_std_max: float = 2.0,
         loss_weights: WorldModelLossWeights | None = None,
     ):
         super().__init__()
@@ -55,13 +57,16 @@ class LatentWorldModel(nn.Module):
         self.discount = discount
         self.tau = tau
         self.rho = rho
+        self.entropy_coef = entropy_coef
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
         self.loss_weights = loss_weights or WorldModelLossWeights()
 
         self.encoder = mlp(obs_dim, hidden_dim, latent_dim, depth)
         self.dynamics = mlp(latent_dim + action_dim, hidden_dim, latent_dim, depth)
         self.reward_head = mlp(latent_dim + action_dim, hidden_dim, 1, depth)
         self.continue_head = mlp(latent_dim, hidden_dim, 1, depth)
-        self.policy_head = mlp(latent_dim, hidden_dim, action_dim, depth)
+        self.policy_head = mlp(latent_dim, hidden_dim, 2 * action_dim, depth)
         self.q_heads = nn.ModuleList(mlp(latent_dim + action_dim, hidden_dim, 1, depth) for _ in range(num_q))
 
         self.target_encoder = deepcopy(self.encoder)
@@ -93,8 +98,35 @@ class LatentWorldModel(nn.Module):
     def continue_logits(self, z: torch.Tensor) -> torch.Tensor:
         return self.continue_head(z)
 
-    def pi(self, z: torch.Tensor) -> torch.Tensor:
-        return torch.tanh(self.policy_head(z))
+    def _policy_stats(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mean, log_std = self.policy_head(z).chunk(2, dim=-1)
+        log_std = log_std.clamp(self.log_std_min, self.log_std_max)
+        return mean, log_std
+
+    def pi(self, z: torch.Tensor, deterministic: bool = True, return_info: bool = False):
+        mean, log_std = self._policy_stats(z)
+        if deterministic:
+            pre_tanh = mean
+        else:
+            pre_tanh = mean + log_std.exp() * torch.randn_like(mean)
+        action = torch.tanh(pre_tanh)
+        if not return_info:
+            return action
+
+        # Squashed Gaussian log-probability. The correction keeps entropy useful
+        # near action bounds while matching the tanh action used by the planner.
+        variance = (2.0 * log_std).exp()
+        log_prob = -0.5 * ((pre_tanh - mean).square() / variance + 2.0 * log_std + torch.log(torch.tensor(2.0 * torch.pi, device=z.device, dtype=z.dtype)))
+        log_prob = log_prob.sum(dim=-1, keepdim=True)
+        correction = torch.log(1.0 - action.square() + 1e-6).sum(dim=-1, keepdim=True)
+        log_prob = log_prob - correction
+        info = {
+            "mean": torch.tanh(mean),
+            "log_std": log_std,
+            "log_prob": log_prob,
+            "entropy": -log_prob,
+        }
+        return action, info
 
     def Q(self, z: torch.Tensor, actions: torch.Tensor, target: bool = False, return_all: bool = False) -> torch.Tensor:
         heads = self.target_q_heads if target else self.q_heads
@@ -104,18 +136,32 @@ class LatentWorldModel(nn.Module):
             return qs
         return qs.min(dim=0).values
 
-    def _policy_loss(self, zs: torch.Tensor) -> torch.Tensor:
+    def model_parameters(self):
+        modules = (self.encoder, self.dynamics, self.reward_head, self.continue_head, self.q_heads)
+        for module in modules:
+            yield from module.parameters()
+
+    def policy_parameters(self):
+        yield from self.policy_head.parameters()
+
+    def policy_loss(self, zs: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
         q_requires_grad = [param.requires_grad for head in self.q_heads for param in head.parameters()]
         q_params = [param for head in self.q_heads for param in head.parameters()]
         for param in q_params:
             param.requires_grad_(False)
-        actions = self.pi(zs.detach())
-        loss = -self.Q(zs.detach(), actions).mean()
+        actions, info = self.pi(zs.detach(), deterministic=False, return_info=True)
+        q = self.Q(zs.detach(), actions)
+        loss = -(q + self.entropy_coef * info["entropy"]).mean()
         for param, requires_grad in zip(q_params, q_requires_grad, strict=True):
             param.requires_grad_(requires_grad)
-        return loss
+        metrics = {
+            "policy_loss": float(loss.detach().item()),
+            "policy_q": float(q.detach().mean().item()),
+            "policy_entropy": float(info["entropy"].detach().mean().item()),
+        }
+        return loss, metrics
 
-    def loss(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, float]]:
+    def loss(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, float], torch.Tensor]:
         obs = batch["obs"]
         actions = batch["actions"]
         rewards = batch["rewards"]
@@ -147,7 +193,7 @@ class LatentWorldModel(nn.Module):
             continue_pred = self.continue_logits(z_next)
 
             with torch.no_grad():
-                target_action = self.pi(z_target)
+                target_action = self.pi(z_target, deterministic=True)
                 target_q = reward_t + self.discount * continue_t * self.Q(z_target, target_action, target=True)
 
             consistency_loss = consistency_loss + weight * F.mse_loss(z_next, z_target)
@@ -162,7 +208,6 @@ class LatentWorldModel(nn.Module):
         reward_loss = reward_loss / normalizer
         value_loss = value_loss / normalizer
         continue_loss = continue_loss / normalizer
-        policy_loss = self._policy_loss(torch.stack(rollout_zs, dim=0))
 
         weights = self.loss_weights
         total = (
@@ -170,7 +215,6 @@ class LatentWorldModel(nn.Module):
             + weights.reward * reward_loss
             + weights.value * value_loss
             + weights.continue_ * continue_loss
-            + weights.policy * policy_loss
         )
         metrics = {
             "loss": float(total.detach().item()),
@@ -178,6 +222,5 @@ class LatentWorldModel(nn.Module):
             "reward_loss": float(reward_loss.detach().item()),
             "value_loss": float(value_loss.detach().item()),
             "continue_loss": float(continue_loss.detach().item()),
-            "policy_loss": float(policy_loss.detach().item()),
         }
-        return total, metrics
+        return total, metrics, torch.stack(rollout_zs, dim=0).detach()

@@ -309,6 +309,7 @@ def main() -> None:
                 discount=checkpoint_args["discount"],
                 tau=checkpoint_args.get("target_tau", 0.01),
                 rho=checkpoint_args.get("rho", 0.5),
+                entropy_coef=checkpoint_args.get("entropy_coef", 1e-4),
             ).to(device)
         else:
             model = DynamicsEnsemble(

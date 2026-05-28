@@ -66,6 +66,7 @@ parser.add_argument("--latent_dim", type=int, default=128, help="Latent dimensio
 parser.add_argument("--num_q", type=int, default=2, help="Number of Q heads for --model_type latent.")
 parser.add_argument("--target_tau", type=float, default=0.01, help="Soft-update rate for latent target encoder/Q heads.")
 parser.add_argument("--rho", type=float, default=0.5, help="Temporal loss discount for latent rollout losses.")
+parser.add_argument("--entropy_coef", type=float, default=1e-4, help="Entropy coefficient for the latent stochastic actor.")
 parser.add_argument("--hidden_dim", type=int, default=512, help="Model hidden dimension.")
 parser.add_argument("--model_depth", type=int, default=3, help="Number of hidden layers per ensemble member.")
 parser.add_argument("--ensemble_size", type=int, default=5, help="Number of dynamics models in the ensemble.")
@@ -171,6 +172,7 @@ parser.add_argument(
     help="Required predicted-return improvement before using residual actions over the pure prior.",
 )
 parser.add_argument("--lr", type=float, default=3e-4, help="Dynamics model learning rate.")
+parser.add_argument("--policy_lr", type=float, default=3e-4, help="Latent actor learning rate.")
 parser.add_argument("--eval_interval", type=int, default=10, help="Steps between console/log summaries.")
 parser.add_argument("--save_interval", type=int, default=50, help="Steps between checkpoints.")
 parser.add_argument("--wandb", action="store_true", default=False, help="Log this run to Weights & Biases via TensorBoard sync.")
@@ -395,6 +397,7 @@ def save_checkpoint(
     path: str,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    policy_optimizer: torch.optim.Optimizer | None,
     train_state: TrainState,
     args: argparse.Namespace,
 ) -> None:
@@ -402,6 +405,7 @@ def save_checkpoint(
         {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "policy_optimizer": policy_optimizer.state_dict() if policy_optimizer is not None else None,
             "train_state": asdict(train_state),
             "args": vars(args),
         },
@@ -461,7 +465,10 @@ def main() -> None:
             discount=args_cli.discount,
             tau=args_cli.target_tau,
             rho=args_cli.rho,
+            entropy_coef=args_cli.entropy_coef,
         ).to(device)
+        optimizer = torch.optim.Adam(model.model_parameters(), lr=args_cli.lr)
+        policy_optimizer = torch.optim.Adam(model.policy_parameters(), lr=args_cli.policy_lr)
     else:
         model = DynamicsEnsemble(
             obs_dim=obs_dim,
@@ -470,7 +477,8 @@ def main() -> None:
             hidden_dim=args_cli.hidden_dim,
             depth=args_cli.model_depth,
         ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args_cli.lr)
+        optimizer = torch.optim.Adam(model.parameters(), lr=args_cli.lr)
+        policy_optimizer = None
     model.eval()
     planner = build_planner(
         planner_name=args_cli.planner,
@@ -511,7 +519,19 @@ def main() -> None:
     recent_returns: list[float] = []
     recent_lengths: list[float] = []
     recent_step_rewards: list[float] = []
-    latest_losses = {"loss": 0.0, "delta_loss": 0.0, "reward_loss": 0.0, "continue_loss": 0.0}
+    if args_cli.model_type == "latent":
+        latest_losses = {
+            "loss": 0.0,
+            "consistency_loss": 0.0,
+            "reward_loss": 0.0,
+            "value_loss": 0.0,
+            "continue_loss": 0.0,
+            "policy_loss": 0.0,
+            "policy_q": 0.0,
+            "policy_entropy": 0.0,
+        }
+    else:
+        latest_losses = {"loss": 0.0, "delta_loss": 0.0, "reward_loss": 0.0, "continue_loss": 0.0}
     latest_planner_diagnostics = {
         "planner_candidate_return_mean": 0.0,
         "planner_candidate_return_best": 0.0,
@@ -630,13 +650,25 @@ def main() -> None:
             for _ in range(args_cli.updates_per_step):
                 if args_cli.model_type == "latent":
                     batch = replay.sample_sequences(args_cli.batch_size, args_cli.horizon, device=device)
+                    loss, metrics, rollout_zs = model.loss(batch)
                 else:
                     batch = replay.sample(args_cli.batch_size, device=device)
-                loss, metrics = model.loss(batch)
+                    loss, metrics = model.loss(batch)
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+                torch.nn.utils.clip_grad_norm_(
+                    model.model_parameters() if args_cli.model_type == "latent" else model.parameters(),
+                    10.0,
+                )
                 optimizer.step()
+                if args_cli.model_type == "latent":
+                    assert policy_optimizer is not None
+                    policy_loss, policy_metrics = model.policy_loss(rollout_zs)
+                    policy_optimizer.zero_grad(set_to_none=True)
+                    policy_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.policy_parameters(), 10.0)
+                    policy_optimizer.step()
+                    metrics.update(policy_metrics)
                 if hasattr(model, "soft_update_targets"):
                     model.soft_update_targets()
                 latest_losses = metrics
@@ -745,10 +777,10 @@ def main() -> None:
 
         if train_state.env_steps % args_cli.save_interval == 0:
             checkpoint_path = os.path.join(log_dir, "checkpoints", f"model_{train_state.env_steps:05d}.pt")
-            save_checkpoint(checkpoint_path, model, optimizer, train_state, args_cli)
+            save_checkpoint(checkpoint_path, model, optimizer, policy_optimizer, train_state, args_cli)
 
     final_path = os.path.join(log_dir, "checkpoints", "model_final.pt")
-    save_checkpoint(final_path, model, optimizer, train_state, args_cli)
+    save_checkpoint(final_path, model, optimizer, policy_optimizer, train_state, args_cli)
     if early_stop_reason is not None:
         early_stop_path = os.path.join(log_dir, "early_stop.txt")
         with open(early_stop_path, "w", encoding="utf-8") as f:
