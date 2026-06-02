@@ -116,6 +116,12 @@ parser.add_argument(
 parser.add_argument("--num_pi_trajs", type=int, default=None, help="Override TD-MPC2-style policy trajectories in latent planning.")
 parser.add_argument("--min_std", type=float, default=None, help="Override minimum latent planner action std.")
 parser.add_argument("--max_std", type=float, default=None, help="Override maximum latent planner action std.")
+parser.add_argument(
+    "--planner_use_continue_model",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="Override using the learned continuation model during latent planning.",
+)
 parser.add_argument("--planner_velocity_objective_weight", type=float, default=None, help="Override planner-only velocity objective weight.")
 parser.add_argument("--planner_velocity_target_x", type=float, default=None, help="Override planner-only target body x velocity.")
 parser.add_argument("--planner_velocity_target_y", type=float, default=None, help="Override planner-only target body y velocity.")
@@ -308,7 +314,7 @@ def main() -> None:
                 latent_dim=checkpoint_args.get("latent_dim", 128),
                 hidden_dim=checkpoint_args["hidden_dim"],
                 depth=checkpoint_args["model_depth"],
-                num_q=checkpoint_args.get("num_q", 2),
+                num_q=checkpoint_args.get("num_q", 5),
                 discount=checkpoint_args["discount"],
                 tau=checkpoint_args.get("target_tau", 0.01),
                 rho=checkpoint_args.get("rho", 0.5),
@@ -317,6 +323,7 @@ def main() -> None:
                 vmin=checkpoint_args.get("vmin", -10.0),
                 vmax=checkpoint_args.get("vmax", 10.0),
                 simnorm_dim=checkpoint_args.get("simnorm_dim", 8),
+                q_dropout=checkpoint_args.get("q_dropout", 0.01),
             ).to(device)
         else:
             model = DynamicsEnsemble(
@@ -345,6 +352,12 @@ def main() -> None:
             max_std=args_cli.max_std if args_cli.max_std is not None else checkpoint_args.get("max_std", 2.0),
             num_pi_trajs=(
                 args_cli.num_pi_trajs if args_cli.num_pi_trajs is not None else checkpoint_args.get("num_pi_trajs", 24)
+            ),
+            action_noise=False,
+            use_continue_model=(
+                args_cli.planner_use_continue_model
+                if args_cli.planner_use_continue_model is not None
+                else checkpoint_args.get("planner_use_continue_model", False)
             ),
             action_spline_knots=checkpoint_args.get("action_spline_knots", 0),
             action_prior=action_prior,
@@ -469,7 +482,7 @@ def main() -> None:
                     raise RuntimeError("--prior_only requires a prior checkpoint in the MBRL checkpoint or --prior_checkpoint.")
                 actions = action_prior(obs)
             else:
-                actions = planner.plan(obs)
+                actions = planner.plan(obs, eval_mode=True)
             if args_cli.debug_actions and steps % 100 == 0:
                 if obs.shape[-1] == 45:
                     command_obs = obs[:, 6:9]

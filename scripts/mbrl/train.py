@@ -54,6 +54,12 @@ parser.add_argument(
 )
 parser.add_argument("--train_steps", type=int, default=400, help="Number of environment interaction steps.")
 parser.add_argument("--updates_per_step", type=int, default=8, help="Model updates after each environment step.")
+parser.add_argument(
+    "--utd",
+    type=float,
+    default=None,
+    help="Optional update-to-data ratio per individual transition. Overrides --updates_per_step with round(utd * num_envs).",
+)
 parser.add_argument("--batch_size", type=int, default=4096, help="Replay batch size.")
 parser.add_argument(
     "--model_type",
@@ -63,10 +69,11 @@ parser.add_argument(
     help="Use a TD-MPC-style latent world model or the legacy observation-delta dynamics ensemble.",
 )
 parser.add_argument("--latent_dim", type=int, default=128, help="Latent dimension for --model_type latent.")
-parser.add_argument("--num_q", type=int, default=2, help="Number of Q heads for --model_type latent.")
+parser.add_argument("--num_q", type=int, default=5, help="Number of Q heads for --model_type latent.")
 parser.add_argument("--target_tau", type=float, default=0.01, help="Soft-update rate for latent target encoder/Q heads.")
 parser.add_argument("--rho", type=float, default=0.5, help="Temporal loss discount for latent rollout losses.")
 parser.add_argument("--entropy_coef", type=float, default=1e-4, help="Entropy coefficient for the latent stochastic actor.")
+parser.add_argument("--q_dropout", type=float, default=0.01, help="Dropout probability used inside latent Q heads.")
 parser.add_argument("--num_bins", type=int, default=101, help="Number of symlog two-hot bins for latent reward/value heads.")
 parser.add_argument("--vmin", type=float, default=-10.0, help="Minimum symlog bin value for latent distributional regression.")
 parser.add_argument("--vmax", type=float, default=10.0, help="Maximum symlog bin value for latent distributional regression.")
@@ -79,16 +86,28 @@ parser.add_argument("--hidden_dim", type=int, default=512, help="Model hidden di
 parser.add_argument("--model_depth", type=int, default=3, help="Number of hidden layers per ensemble member.")
 parser.add_argument("--ensemble_size", type=int, default=5, help="Number of dynamics models in the ensemble.")
 parser.add_argument("--planner", type=str, default="mppi", choices=["cem", "mppi"], help="Sampling-based planner.")
-parser.add_argument("--horizon", type=int, default=30, help="Planning horizon in environment steps.")
+parser.add_argument("--horizon", type=int, default=3, help="Planning/model rollout horizon in environment steps.")
 parser.add_argument("--candidates", type=int, default=512, help="Candidate action sequences for planning.")
 parser.add_argument("--elites", type=int, default=64, help="Elite sequences kept each CEM iteration.")
 parser.add_argument("--num_pi_trajs", type=int, default=24, help="TD-MPC2-style learned-policy trajectories injected into latent planning.")
 parser.add_argument("--planner_iterations", type=int, default=5, help="Planner refinement iterations.")
 parser.add_argument("--discount", type=float, default=0.99, help="Planning discount factor.")
-parser.add_argument("--planner_temperature", type=float, default=0.35, help="Planner temperature for latent elite weighting / legacy exploration.")
+parser.add_argument("--planner_temperature", type=float, default=0.5, help="Planner temperature for latent elite weighting / legacy exploration.")
 parser.add_argument("--mppi_lambda", type=float, default=1.0, help="MPPI reward temperature.")
 parser.add_argument("--min_std", type=float, default=0.05, help="Minimum latent planner action distribution std.")
 parser.add_argument("--max_std", type=float, default=2.0, help="Maximum latent planner action distribution std.")
+parser.add_argument(
+    "--planner_action_noise",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Add TD-MPC2-style optimized final action noise while training.",
+)
+parser.add_argument(
+    "--planner_use_continue_model",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Use the learned continuation model inside latent planning. TD-MPC2-style default is disabled.",
+)
 parser.add_argument(
     "--planner_use_best_candidate",
     action=argparse.BooleanOptionalAction,
@@ -187,6 +206,13 @@ parser.add_argument("--policy_lr", type=float, default=3e-4, help="Latent actor 
 parser.add_argument("--grad_clip_norm", type=float, default=20.0, help="Gradient clipping norm.")
 parser.add_argument("--eval_interval", type=int, default=10, help="Steps between console/log summaries.")
 parser.add_argument("--save_interval", type=int, default=50, help="Steps between checkpoints.")
+parser.add_argument(
+    "--save_best_metric",
+    type=str,
+    default="mean_return",
+    choices=["mean_return", "estimated_return"],
+    help="Metric used to save checkpoints/model_best.pt.",
+)
 parser.add_argument("--wandb", action="store_true", default=False, help="Log this run to Weights & Biases via TensorBoard sync.")
 parser.add_argument("--wandb_project", type=str, default="ldm-quad-mbrl", help="Weights & Biases project name.")
 parser.add_argument("--wandb_entity", type=str, default=None, help="Optional Weights & Biases entity or team.")
@@ -433,6 +459,7 @@ def main() -> None:
         num_envs=args_cli.num_envs,
         use_fabric=not args_cli.disable_fabric,
     )
+    env_cfg.seed = args_cli.seed
     apply_fixed_velocity_command(env_cfg)
     env = gym.make(args_cli.task, cfg=env_cfg)
     device = torch.device(env.unwrapped.device)
@@ -445,6 +472,8 @@ def main() -> None:
     obs, _ = env.reset()
     obs = flatten_obs(obs, device)
     num_envs = obs.shape[0]
+    if args_cli.utd is not None:
+        args_cli.updates_per_step = max(1, int(round(args_cli.utd * num_envs)))
     action_shape = env.action_space.shape
     action_dim = int(action_shape[-1]) if len(action_shape) > 0 else int(np.prod(action_shape))
     obs_dim = obs.shape[-1]
@@ -482,6 +511,7 @@ def main() -> None:
             vmin=args_cli.vmin,
             vmax=args_cli.vmax,
             simnorm_dim=args_cli.simnorm_dim,
+            q_dropout=args_cli.q_dropout,
             loss_weights=WorldModelLossWeights(
                 consistency=args_cli.consistency_coef,
                 reward=args_cli.reward_coef,
@@ -531,6 +561,8 @@ def main() -> None:
         prior_command_dim=args_cli.prior_command_dim,
         prior_control_mode=args_cli.prior_control_mode,
         action_bounds_finite=action_bounds_finite,
+        action_noise=args_cli.planner_action_noise,
+        use_continue_model=args_cli.planner_use_continue_model,
         planner_velocity_objective_weight=args_cli.planner_velocity_objective_weight,
         planner_velocity_target_x=args_cli.planner_velocity_target_x,
         planner_velocity_target_y=args_cli.planner_velocity_target_y,
@@ -568,6 +600,8 @@ def main() -> None:
         "planner_prior_command_candidate_fraction": 0.0,
         "planner_full_action_mode": 0.0,
         "planner_best_candidate_mode": 0.0,
+        "planner_action_noise_mode": 0.0,
+        "planner_continue_model_mode": 0.0,
         "planner_prior_action_norm_mean": 0.0,
         "planner_residual_norm_mean": 0.0,
         "planner_residual_abs_mean": 0.0,
@@ -588,6 +622,7 @@ def main() -> None:
     planner_start_steps = args_cli.planner_start_steps if args_cli.planner_start_steps is not None else args_cli.seed_steps
     planner_min_length = args_cli.planner_min_length_fraction * episode_horizon_steps
     planner_active = False
+    best_checkpoint_metric = float("-inf")
 
     with open(os.path.join(log_dir, "config.txt"), "w", encoding="utf-8") as f:
         for key, value in sorted(vars(args_cli).items()):
@@ -634,7 +669,7 @@ def main() -> None:
             terminated = to_tensor(terminated, device).bool().view(-1, 1)
             truncated = to_tensor(truncated, device).bool().view(-1, 1)
             done = terminated | truncated
-            continues = (~done).float()
+            continues = (~terminated).float()
 
             replay.add_batch(
                 obs.detach().cpu(),
@@ -642,6 +677,7 @@ def main() -> None:
                 rewards.detach().cpu(),
                 next_obs.detach().cpu(),
                 continues.detach().cpu(),
+                done.detach().cpu(),
             )
 
             recent_step_rewards.append(float(rewards.mean().item()))
@@ -711,6 +747,7 @@ def main() -> None:
             current_length_mean = float(episode_lengths.mean().item())
             estimated_return_100 = mean_step_reward_100 * episode_horizon_steps
             train_state.best_mean_return = max(train_state.best_mean_return, mean_return)
+            save_best_value = mean_return if args_cli.save_best_metric == "mean_return" else estimated_return_100
             elapsed_s = time.monotonic() - train_start_time
             remaining_steps = max(args_cli.train_steps - train_state.env_steps, 0)
             steps_per_second = train_state.env_steps / max(elapsed_s, 1e-6)
@@ -774,6 +811,11 @@ def main() -> None:
                 f"elapsed={format_duration(elapsed_s)} "
                 f"eta={format_duration(eta_s)}"
             )
+
+            if save_best_value > best_checkpoint_metric and (recent_returns or args_cli.save_best_metric == "estimated_return"):
+                best_checkpoint_metric = save_best_value
+                best_path = os.path.join(log_dir, "checkpoints", "model_best.pt")
+                save_checkpoint(best_path, model, optimizer, policy_optimizer, train_state, args_cli)
 
             if args_cli.early_stop:
                 stop_metric = mean_return if args_cli.early_stop_metric == "mean_return" else estimated_return_100

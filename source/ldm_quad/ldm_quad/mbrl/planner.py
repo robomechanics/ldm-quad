@@ -652,6 +652,8 @@ class LatentMPPIPlanner:
         prior_candidate_noise: float = 0.02,
         action_bounds_finite: bool = True,
         use_best_candidate: bool = False,
+        action_noise: bool = True,
+        use_continue_model: bool = False,
         **_: object,
     ):
         self.model = model
@@ -674,6 +676,8 @@ class LatentMPPIPlanner:
         self.prior_candidate_noise = prior_candidate_noise
         self.action_bounds_finite = action_bounds_finite
         self.use_best_candidate = use_best_candidate
+        self.action_noise = action_noise
+        self.use_continue_model = use_continue_model
         self._prev_mean: torch.Tensor | None = None
         self.last_diagnostics: dict[str, float] = {}
 
@@ -744,21 +748,15 @@ class LatentMPPIPlanner:
     def _warm_start_mean(self, obs: torch.Tensor) -> torch.Tensor:
         shape = (obs.shape[0], self.control_horizon, self.action_dim)
         if self._prev_mean is None or self._prev_mean.shape != shape or self._prev_mean.device != obs.device:
-            return self._controls_from_actions(self._rollout_policy_actions(obs, deterministic=True))
+            return torch.zeros(shape, device=obs.device, dtype=obs.dtype)
         shifted = torch.zeros_like(self._prev_mean)
         if not self.action_spline_knots:
             shifted[:, :-1] = self._prev_mean[:, 1:]
-            with torch.no_grad():
-                z = self.model.encode(obs)
-                shifted[:, -1] = self.model.pi(z, deterministic=True)
             return shifted
 
         previous_actions = self._expand_controls(self._prev_mean)
         shifted_actions = torch.zeros((obs.shape[0], self.horizon, self.action_dim), device=obs.device, dtype=obs.dtype)
         shifted_actions[:, :-1] = previous_actions[:, 1:]
-        with torch.no_grad():
-            z = self.model.encode(obs)
-            shifted_actions[:, -1] = self.model.pi(z, deterministic=True)
         return self._controls_from_actions(shifted_actions)
 
     @torch.no_grad()
@@ -780,8 +778,7 @@ class LatentMPPIPlanner:
         if self.num_pi_trajs == 0:
             return controls
 
-        controls[:, 0] = self._controls_from_actions(self._rollout_policy_actions(obs, deterministic=True))
-        next_index = 1
+        next_index = 0
 
         if self.action_prior is not None and next_index < self.num_pi_trajs:
             external_prior = self._clip_actions(self.action_prior(obs))
@@ -810,13 +807,14 @@ class LatentMPPIPlanner:
             actions_t = action_sequences[:, :, t, :].reshape(batch_size * candidates, action_dim)
             reward = self.model.reward(z, actions_t).squeeze(-1)
             z = self.model.next(z, actions_t)
-            continue_prob = self.model.continue_logits(z).sigmoid().squeeze(-1)
             returns = returns + discounts * alive * reward
-            alive = alive * continue_prob
+            if self.use_continue_model:
+                continue_prob = self.model.continue_logits(z).sigmoid().squeeze(-1)
+                alive = alive * continue_prob
             discounts = discounts * self.discount
 
-        terminal_action = self.model.pi(z, deterministic=True)
-        terminal_value = self.model.Q(z, terminal_action).squeeze(-1)
+        terminal_action = self.model.pi(z, deterministic=False)
+        terminal_value = self.model.Q(z, terminal_action, return_type="avg").squeeze(-1)
         returns = returns + discounts * alive * terminal_value
         return returns.view(batch_size, candidates)
 
@@ -830,6 +828,8 @@ class LatentMPPIPlanner:
             "planner_prior_command_candidate_fraction": 0.0,
             "planner_full_action_mode": 1.0,
             "planner_best_candidate_mode": float(self.use_best_candidate),
+            "planner_action_noise_mode": float(self.action_noise),
+            "planner_continue_model_mode": float(self.use_continue_model),
             "planner_prior_action_norm_mean": 0.0,
             "planner_residual_norm_mean": 0.0,
             "planner_residual_abs_mean": 0.0,
@@ -843,7 +843,7 @@ class LatentMPPIPlanner:
             "planner_prior_fallback_fraction": 0.0,
         }
 
-    def plan(self, obs: torch.Tensor) -> torch.Tensor:
+    def plan(self, obs: torch.Tensor, eval_mode: bool = False) -> torch.Tensor:
         mean = self._warm_start_mean(obs)
         std = torch.full_like(mean, self.max_std).clamp_(self.min_std, self.max_std)
         policy_controls = self._policy_candidate_controls(obs)
@@ -889,6 +889,8 @@ class LatentMPPIPlanner:
         ).squeeze(1)
         self._prev_mean = mean.detach()
         action = self._clip_actions(self._expand_controls(selected_controls)[:, 0])
+        if self.action_noise and not eval_mode:
+            action = self._clip_actions(action + std[:, 0] * torch.randn_like(action))
         self._record_diagnostics(last_returns, action)
         return action
 
@@ -922,6 +924,8 @@ def build_planner(
     prior_command_dim: int = 3,
     prior_control_mode: str = "residual",
     action_bounds_finite: bool = True,
+    action_noise: bool = True,
+    use_continue_model: bool = False,
     planner_velocity_objective_weight: float = 0.0,
     planner_velocity_target_x: float = 0.0,
     planner_velocity_target_y: float = 0.0,
@@ -951,6 +955,8 @@ def build_planner(
             prior_candidate_noise=prior_candidate_noise,
             action_bounds_finite=action_bounds_finite,
             use_best_candidate=use_best_candidate,
+            action_noise=action_noise,
+            use_continue_model=use_continue_model,
         )
     if planner_name == "mppi":
         return MPPIPlanner(

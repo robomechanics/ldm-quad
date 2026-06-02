@@ -19,13 +19,15 @@ class DistributionalRegressionCfg:
         return (self.vmax - self.vmin) / max(self.num_bins - 1, 1)
 
 
-def mlp(input_dim: int, hidden_dim: int, output_dim: int, depth: int) -> nn.Sequential:
+def mlp(input_dim: int, hidden_dim: int, output_dim: int, depth: int, dropout: float = 0.0) -> nn.Sequential:
     layers: list[nn.Module] = []
     dim = input_dim
     for _ in range(depth):
         layers.append(nn.Linear(dim, hidden_dim))
         layers.append(nn.LayerNorm(hidden_dim))
         layers.append(nn.SiLU())
+        if dropout > 0.0:
+            layers.append(nn.Dropout(dropout))
         dim = hidden_dim
     layers.append(nn.Linear(dim, output_dim))
     return nn.Sequential(*layers)
@@ -165,6 +167,7 @@ class LatentWorldModel(nn.Module):
         vmin: float = -10.0,
         vmax: float = 10.0,
         simnorm_dim: int = 8,
+        q_dropout: float = 0.01,
         log_std_min: float = -10.0,
         log_std_max: float = 2.0,
         loss_weights: WorldModelLossWeights | None = None,
@@ -180,6 +183,7 @@ class LatentWorldModel(nn.Module):
         self.entropy_coef = entropy_coef
         self.dreg = DistributionalRegressionCfg(num_bins=num_bins, vmin=vmin, vmax=vmax)
         self.simnorm_dim = simnorm_dim
+        self.q_dropout = q_dropout
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
         self.loss_weights = loss_weights or WorldModelLossWeights()
@@ -191,16 +195,32 @@ class LatentWorldModel(nn.Module):
         self.reward_head = mlp(latent_dim + action_dim, hidden_dim, head_dim, depth)
         self.continue_head = mlp(latent_dim, hidden_dim, 1, depth)
         self.policy_head = mlp(latent_dim, hidden_dim, 2 * action_dim, depth)
-        self.q_heads = nn.ModuleList(mlp(latent_dim + action_dim, hidden_dim, head_dim, depth) for _ in range(num_q))
+        self.q_heads = nn.ModuleList(
+            mlp(latent_dim + action_dim, hidden_dim, head_dim, depth, dropout=q_dropout) for _ in range(num_q)
+        )
+        self._zero_init_distribution_heads()
 
         self.target_encoder = deepcopy(self.encoder)
         self.target_q_heads = deepcopy(self.q_heads)
         self._set_targets_requires_grad(False)
 
+    def _zero_init_distribution_heads(self) -> None:
+        for head in [self.reward_head, *self.q_heads]:
+            final_layer = next((module for module in reversed(head) if isinstance(module, nn.Linear)), None)
+            if final_layer is not None:
+                nn.init.zeros_(final_layer.weight)
+                nn.init.zeros_(final_layer.bias)
+
     def _set_targets_requires_grad(self, requires_grad: bool) -> None:
         for module in (self.target_encoder, self.target_q_heads):
             for param in module.parameters():
                 param.requires_grad_(requires_grad)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.target_encoder.train(False)
+        self.target_q_heads.train(False)
+        return self
 
     @torch.no_grad()
     def soft_update_targets(self) -> None:
@@ -259,11 +279,28 @@ class LatentWorldModel(nn.Module):
         }
         return action, info
 
-    def Q(self, z: torch.Tensor, actions: torch.Tensor, target: bool = False, return_all: bool = False) -> torch.Tensor:
+    def Q(
+        self,
+        z: torch.Tensor,
+        actions: torch.Tensor,
+        target: bool = False,
+        return_all: bool = False,
+        return_type: str = "min",
+    ) -> torch.Tensor:
         qs = self.Q_logits(z, actions, target=target)
         if return_all:
             return two_hot_inv(qs, self.dreg)
-        return two_hot_inv(qs, self.dreg).min(dim=0).values
+        values = two_hot_inv(qs, self.dreg)
+        if return_type == "all":
+            return values
+        if values.shape[0] >= 2:
+            pair = torch.randperm(values.shape[0], device=values.device)[:2]
+            values = values[pair]
+        if return_type == "min":
+            return values.min(dim=0).values
+        if return_type == "avg":
+            return values.mean(dim=0)
+        raise ValueError(f"Unsupported Q return_type: {return_type}")
 
     def Q_logits(self, z: torch.Tensor, actions: torch.Tensor, target: bool = False) -> torch.Tensor:
         heads = self.target_q_heads if target else self.q_heads
@@ -284,8 +321,7 @@ class LatentWorldModel(nn.Module):
         for param in q_params:
             param.requires_grad_(False)
         actions, info = self.pi(zs.detach(), deterministic=False, return_info=True)
-        q_logits = self.Q_logits(zs.detach(), actions)
-        q = two_hot_inv(q_logits, self.dreg).mean(dim=0)
+        q = self.Q(zs.detach(), actions, return_type="avg")
         self.q_scale.update(q[0])
         scaled_q = self.q_scale(q)
         rho = torch.pow(
@@ -316,14 +352,14 @@ class LatentWorldModel(nn.Module):
 
         horizon = actions.shape[0]
         with torch.no_grad():
-            target_zs = self.encode(obs[1:].reshape(-1, self.obs_dim), target=True).view(horizon, obs.shape[1], -1)
+            target_zs = self.encode(obs[1:].reshape(-1, self.obs_dim), target=False).view(horizon, obs.shape[1], -1)
 
         z = self.encode(obs[0])
         consistency_loss = torch.zeros((), device=obs.device)
         reward_loss = torch.zeros((), device=obs.device)
         value_loss = torch.zeros((), device=obs.device)
         continue_loss = torch.zeros((), device=obs.device)
-        rollout_zs = []
+        rollout_zs = [z]
 
         for t in range(horizon):
             weight = self.rho**t
@@ -338,16 +374,21 @@ class LatentWorldModel(nn.Module):
             continue_pred = self.continue_logits(z_next)
 
             with torch.no_grad():
-                target_action = self.pi(z_target, deterministic=True)
-                target_q = reward_t + self.discount * continue_t * self.Q(z_target, target_action, target=True)
+                target_action = self.pi(z_target, deterministic=False)
+                target_q = reward_t + self.discount * continue_t * self.Q(
+                    z_target,
+                    target_action,
+                    target=True,
+                    return_type="min",
+                )
 
             consistency_loss = consistency_loss + weight * F.mse_loss(z_next, z_target)
             reward_loss = reward_loss + weight * soft_ce(reward_logits, reward_t, self.dreg).mean()
             value_target = target_q.unsqueeze(0).expand(q_logits.shape[0], *target_q.shape)
             value_loss = value_loss + weight * soft_ce(q_logits.reshape(-1, q_logits.shape[-1]), value_target.reshape(-1, 1), self.dreg).mean()
             continue_loss = continue_loss + weight * F.binary_cross_entropy_with_logits(continue_pred, continue_t)
-            rollout_zs.append(z)
             z = z_next
+            rollout_zs.append(z)
 
         normalizer = sum(self.rho**t for t in range(horizon))
         consistency_loss = consistency_loss / normalizer
