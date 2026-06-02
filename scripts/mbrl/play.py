@@ -113,6 +113,9 @@ parser.add_argument(
     default=None,
     help="Override using the best evaluated candidate as the final MPPI plan.",
 )
+parser.add_argument("--num_pi_trajs", type=int, default=None, help="Override TD-MPC2-style policy trajectories in latent planning.")
+parser.add_argument("--min_std", type=float, default=None, help="Override minimum latent planner action std.")
+parser.add_argument("--max_std", type=float, default=None, help="Override maximum latent planner action std.")
 parser.add_argument("--planner_velocity_objective_weight", type=float, default=None, help="Override planner-only velocity objective weight.")
 parser.add_argument("--planner_velocity_target_x", type=float, default=None, help="Override planner-only target body x velocity.")
 parser.add_argument("--planner_velocity_target_y", type=float, default=None, help="Override planner-only target body y velocity.")
@@ -310,6 +313,10 @@ def main() -> None:
                 tau=checkpoint_args.get("target_tau", 0.01),
                 rho=checkpoint_args.get("rho", 0.5),
                 entropy_coef=checkpoint_args.get("entropy_coef", 1e-4),
+                num_bins=checkpoint_args.get("num_bins", 101),
+                vmin=checkpoint_args.get("vmin", -10.0),
+                vmax=checkpoint_args.get("vmax", 10.0),
+                simnorm_dim=checkpoint_args.get("simnorm_dim", 8),
             ).to(device)
         else:
             model = DynamicsEnsemble(
@@ -334,6 +341,11 @@ def main() -> None:
             discount=checkpoint_args["discount"],
             temperature=checkpoint_args.get("planner_temperature", 0.5),
             lambda_=checkpoint_args.get("mppi_lambda", 1.0),
+            min_std=args_cli.min_std if args_cli.min_std is not None else checkpoint_args.get("min_std", 0.05),
+            max_std=args_cli.max_std if args_cli.max_std is not None else checkpoint_args.get("max_std", 2.0),
+            num_pi_trajs=(
+                args_cli.num_pi_trajs if args_cli.num_pi_trajs is not None else checkpoint_args.get("num_pi_trajs", 24)
+            ),
             action_spline_knots=checkpoint_args.get("action_spline_knots", 0),
             action_prior=action_prior,
             prior_residual_scale=(

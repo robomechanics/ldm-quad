@@ -629,7 +629,7 @@ class MPPIPlanner(TrajectoryPlanner):
 
 
 class LatentMPPIPlanner:
-    """MPPI planner that evaluates trajectories in a TD-MPC-style latent world model."""
+    """TD-MPC2-style planner over a latent world model."""
 
     def __init__(
         self,
@@ -638,10 +638,14 @@ class LatentMPPIPlanner:
         action_high: torch.Tensor,
         horizon: int = 30,
         candidates: int = 512,
+        elites: int = 64,
         iterations: int = 5,
         discount: float = 0.99,
         temperature: float = 0.5,
         lambda_: float = 1.0,
+        min_std: float = 0.05,
+        max_std: float = 2.0,
+        num_pi_trajs: int = 24,
         action_spline_knots: int = 0,
         action_prior: Callable[[torch.Tensor], torch.Tensor] | None = None,
         prior_candidate_fraction: float = 0.1,
@@ -655,10 +659,14 @@ class LatentMPPIPlanner:
         self.action_high = action_high
         self.horizon = horizon
         self.candidates = candidates
+        self.elites = min(max(1, elites), candidates)
         self.iterations = iterations
         self.discount = discount
         self.temperature = temperature
         self.lambda_ = lambda_
+        self.min_std = min_std
+        self.max_std = max(max_std, min_std)
+        self.num_pi_trajs = min(max(0, num_pi_trajs), candidates)
         self.action_dim = action_low.numel()
         self.action_spline_knots = action_spline_knots if 1 < action_spline_knots < horizon else 0
         self.action_prior = action_prior
@@ -763,28 +771,32 @@ class LatentMPPIPlanner:
             z = self.model.next(z, action)
         return torch.stack(actions, dim=1)
 
-    def _inject_prior_candidates(self, obs: torch.Tensor, controls: torch.Tensor) -> torch.Tensor:
-        prior_count = max(1, int(round(self.prior_candidate_fraction * self.candidates)))
-        prior_count = min(prior_count, self.candidates)
-        controls[:, 0, :, :] = self._controls_from_actions(self._rollout_policy_actions(obs, deterministic=True))
+    def _policy_candidate_controls(self, obs: torch.Tensor) -> torch.Tensor:
+        controls = torch.empty(
+            (obs.shape[0], self.num_pi_trajs, self.control_horizon, self.action_dim),
+            device=obs.device,
+            dtype=obs.dtype,
+        )
+        if self.num_pi_trajs == 0:
+            return controls
 
-        if self.action_prior is not None and prior_count > 1:
+        controls[:, 0] = self._controls_from_actions(self._rollout_policy_actions(obs, deterministic=True))
+        next_index = 1
+
+        if self.action_prior is not None and next_index < self.num_pi_trajs:
             external_prior = self._clip_actions(self.action_prior(obs))
             external_actions = external_prior.unsqueeze(1).expand(-1, self.horizon, -1)
-            controls[:, 1, :, :] = self._controls_from_actions(external_actions)
-            noise_start = 2
-        else:
-            noise_start = 1
+            controls[:, next_index] = self._controls_from_actions(external_actions)
+            next_index += 1
 
-        policy_sample_count = max(noise_start, prior_count // 2)
-        for candidate in range(noise_start, policy_sample_count):
-            controls[:, candidate, :, :] = self._controls_from_actions(self._rollout_policy_actions(obs, deterministic=False))
-
-        if prior_count > noise_start and self.prior_candidate_noise > 0.0:
-            base = controls[:, :1, :, :]
-            noise = self.prior_candidate_noise * torch.randn_like(controls[:, policy_sample_count:prior_count])
-            controls[:, policy_sample_count:prior_count] = self._clip_actions(base + noise)
+        for candidate in range(next_index, self.num_pi_trajs):
+            controls[:, candidate] = self._controls_from_actions(self._rollout_policy_actions(obs, deterministic=False))
         return controls
+
+    def _elite_score_weights(self, elite_returns: torch.Tensor) -> torch.Tensor:
+        centered = elite_returns - elite_returns.max(dim=1, keepdim=True).values
+        weights = torch.softmax(float(self.temperature) * centered, dim=1)
+        return weights
 
     @torch.no_grad()
     def evaluate_sequences(self, obs: torch.Tensor, action_sequences: torch.Tensor) -> torch.Tensor:
@@ -814,7 +826,7 @@ class LatentMPPIPlanner:
             "planner_candidate_return_mean": float(returns.mean().item()),
             "planner_candidate_return_best": float(returns.max(dim=1).values.mean().item()),
             "planner_candidate_return_std": float(returns.std(unbiased=False).item()),
-            "planner_prior_candidate_fraction": float(max(1, int(round(self.prior_candidate_fraction * self.candidates))) / self.candidates),
+            "planner_prior_candidate_fraction": float(self.num_pi_trajs / self.candidates),
             "planner_prior_command_candidate_fraction": 0.0,
             "planner_full_action_mode": 1.0,
             "planner_best_candidate_mode": float(self.use_best_candidate),
@@ -833,36 +845,50 @@ class LatentMPPIPlanner:
 
     def plan(self, obs: torch.Tensor) -> torch.Tensor:
         mean = self._warm_start_mean(obs)
-        std = torch.full_like(mean, self.temperature)
-        best_controls = mean
+        std = torch.full_like(mean, self.max_std).clamp_(self.min_std, self.max_std)
+        policy_controls = self._policy_candidate_controls(obs)
+        random_candidates = self.candidates - self.num_pi_trajs
+        final_elite_controls = mean.unsqueeze(1)
+        final_elite_returns = torch.zeros((obs.shape[0], 1), device=obs.device, dtype=obs.dtype)
         last_returns = torch.zeros((obs.shape[0], self.candidates), device=obs.device, dtype=obs.dtype)
 
         for _ in range(self.iterations):
-            noise = torch.randn(
-                (obs.shape[0], self.candidates, self.control_horizon, self.action_dim),
-                device=obs.device,
-                dtype=obs.dtype,
-            )
-            controls = self._clip_actions(mean.unsqueeze(1) + std.unsqueeze(1) * noise)
-            controls = self._inject_prior_candidates(obs, controls)
+            if random_candidates > 0:
+                noise = torch.randn(
+                    (obs.shape[0], random_candidates, self.control_horizon, self.action_dim),
+                    device=obs.device,
+                    dtype=obs.dtype,
+                )
+                sampled_controls = self._clip_actions(mean.unsqueeze(1) + std.unsqueeze(1) * noise)
+                controls = torch.cat((policy_controls, sampled_controls), dim=1)
+            else:
+                controls = policy_controls
+
             actions = self._expand_controls(controls)
             returns = self.evaluate_sequences(obs, actions)
             last_returns = returns
 
-            best_indices = returns.argmax(dim=1)
-            best_controls = controls.gather(
+            final_elite_returns, elite_indices = returns.topk(self.elites, dim=1)
+            final_elite_controls = controls.gather(
                 1,
-                best_indices.view(-1, 1, 1, 1).expand(-1, 1, self.control_horizon, self.action_dim),
-            ).squeeze(1)
-            weights = torch.softmax((returns - returns.max(dim=1, keepdim=True).values) / max(self.lambda_, 1e-6), dim=1)
-            mean = (weights.unsqueeze(-1).unsqueeze(-1) * controls).sum(dim=1)
-            variance = (weights.unsqueeze(-1).unsqueeze(-1) * (controls - mean.unsqueeze(1)).square()).sum(dim=1)
-            std = variance.sqrt().clamp_min(1e-3)
+                elite_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.control_horizon, self.action_dim),
+            )
+            weights = self._elite_score_weights(final_elite_returns)
+            mean = (weights.unsqueeze(-1).unsqueeze(-1) * final_elite_controls).sum(dim=1)
+            variance = (weights.unsqueeze(-1).unsqueeze(-1) * (final_elite_controls - mean.unsqueeze(1)).square()).sum(dim=1)
+            std = variance.sqrt().clamp_(self.min_std, self.max_std)
 
         if self.use_best_candidate:
-            mean = best_controls
+            selected_indices = final_elite_returns.argmax(dim=1)
+        else:
+            gumbel = -torch.empty_like(final_elite_returns).exponential_().log()
+            selected_indices = (float(self.temperature) * final_elite_returns + gumbel).argmax(dim=1)
+        selected_controls = final_elite_controls.gather(
+            1,
+            selected_indices.view(-1, 1, 1, 1).expand(-1, 1, self.control_horizon, self.action_dim),
+        ).squeeze(1)
         self._prev_mean = mean.detach()
-        action = self._clip_actions(self._expand_controls(mean)[:, 0])
+        action = self._clip_actions(self._expand_controls(selected_controls)[:, 0])
         self._record_diagnostics(last_returns, action)
         return action
 
@@ -879,6 +905,9 @@ def build_planner(
     discount: float,
     temperature: float,
     lambda_: float,
+    min_std: float = 0.05,
+    max_std: float = 2.0,
+    num_pi_trajs: int = 24,
     action_spline_knots: int = 0,
     action_prior: Callable[[torch.Tensor], torch.Tensor] | None = None,
     prior_residual_scale: float = 0.3,
@@ -908,10 +937,14 @@ def build_planner(
             action_high=action_high,
             horizon=horizon,
             candidates=candidates,
+            elites=elites,
             iterations=iterations,
             discount=discount,
             temperature=temperature,
             lambda_=lambda_,
+            min_std=min_std,
+            max_std=max_std,
+            num_pi_trajs=num_pi_trajs,
             action_spline_knots=action_spline_knots,
             action_prior=action_prior,
             prior_candidate_fraction=prior_candidate_fraction,

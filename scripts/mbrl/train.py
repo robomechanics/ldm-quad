@@ -67,6 +67,14 @@ parser.add_argument("--num_q", type=int, default=2, help="Number of Q heads for 
 parser.add_argument("--target_tau", type=float, default=0.01, help="Soft-update rate for latent target encoder/Q heads.")
 parser.add_argument("--rho", type=float, default=0.5, help="Temporal loss discount for latent rollout losses.")
 parser.add_argument("--entropy_coef", type=float, default=1e-4, help="Entropy coefficient for the latent stochastic actor.")
+parser.add_argument("--num_bins", type=int, default=101, help="Number of symlog two-hot bins for latent reward/value heads.")
+parser.add_argument("--vmin", type=float, default=-10.0, help="Minimum symlog bin value for latent distributional regression.")
+parser.add_argument("--vmax", type=float, default=10.0, help="Maximum symlog bin value for latent distributional regression.")
+parser.add_argument("--consistency_coef", type=float, default=20.0, help="Latent consistency loss coefficient.")
+parser.add_argument("--reward_coef", type=float, default=0.1, help="Distributional reward loss coefficient.")
+parser.add_argument("--value_coef", type=float, default=0.1, help="Distributional value loss coefficient.")
+parser.add_argument("--continue_coef", type=float, default=1.0, help="Continuation/termination loss coefficient.")
+parser.add_argument("--simnorm_dim", type=int, default=8, help="SimNorm group size for latent encoder/dynamics outputs. Set <=1 to disable.")
 parser.add_argument("--hidden_dim", type=int, default=512, help="Model hidden dimension.")
 parser.add_argument("--model_depth", type=int, default=3, help="Number of hidden layers per ensemble member.")
 parser.add_argument("--ensemble_size", type=int, default=5, help="Number of dynamics models in the ensemble.")
@@ -74,10 +82,13 @@ parser.add_argument("--planner", type=str, default="mppi", choices=["cem", "mppi
 parser.add_argument("--horizon", type=int, default=30, help="Planning horizon in environment steps.")
 parser.add_argument("--candidates", type=int, default=512, help="Candidate action sequences for planning.")
 parser.add_argument("--elites", type=int, default=64, help="Elite sequences kept each CEM iteration.")
+parser.add_argument("--num_pi_trajs", type=int, default=24, help="TD-MPC2-style learned-policy trajectories injected into latent planning.")
 parser.add_argument("--planner_iterations", type=int, default=5, help="Planner refinement iterations.")
 parser.add_argument("--discount", type=float, default=0.99, help="Planning discount factor.")
-parser.add_argument("--planner_temperature", type=float, default=0.35, help="Initial planner exploration scale.")
+parser.add_argument("--planner_temperature", type=float, default=0.35, help="Planner temperature for latent elite weighting / legacy exploration.")
 parser.add_argument("--mppi_lambda", type=float, default=1.0, help="MPPI reward temperature.")
+parser.add_argument("--min_std", type=float, default=0.05, help="Minimum latent planner action distribution std.")
+parser.add_argument("--max_std", type=float, default=2.0, help="Maximum latent planner action distribution std.")
 parser.add_argument(
     "--planner_use_best_candidate",
     action=argparse.BooleanOptionalAction,
@@ -173,6 +184,7 @@ parser.add_argument(
 )
 parser.add_argument("--lr", type=float, default=3e-4, help="Dynamics model learning rate.")
 parser.add_argument("--policy_lr", type=float, default=3e-4, help="Latent actor learning rate.")
+parser.add_argument("--grad_clip_norm", type=float, default=20.0, help="Gradient clipping norm.")
 parser.add_argument("--eval_interval", type=int, default=10, help="Steps between console/log summaries.")
 parser.add_argument("--save_interval", type=int, default=50, help="Steps between checkpoints.")
 parser.add_argument("--wandb", action="store_true", default=False, help="Log this run to Weights & Biases via TensorBoard sync.")
@@ -242,7 +254,7 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
 import ldm_quad.tasks  # noqa: F401
-from ldm_quad.mbrl import DynamicsEnsemble, LatentWorldModel, ReplayBuffer, build_planner, load_policy_prior
+from ldm_quad.mbrl import DynamicsEnsemble, LatentWorldModel, ReplayBuffer, WorldModelLossWeights, build_planner, load_policy_prior
 
 
 @dataclass
@@ -466,6 +478,16 @@ def main() -> None:
             tau=args_cli.target_tau,
             rho=args_cli.rho,
             entropy_coef=args_cli.entropy_coef,
+            num_bins=args_cli.num_bins,
+            vmin=args_cli.vmin,
+            vmax=args_cli.vmax,
+            simnorm_dim=args_cli.simnorm_dim,
+            loss_weights=WorldModelLossWeights(
+                consistency=args_cli.consistency_coef,
+                reward=args_cli.reward_coef,
+                value=args_cli.value_coef,
+                continue_=args_cli.continue_coef,
+            ),
         ).to(device)
         optimizer = torch.optim.Adam(model.model_parameters(), lr=args_cli.lr)
         policy_optimizer = torch.optim.Adam(model.policy_parameters(), lr=args_cli.policy_lr)
@@ -492,6 +514,9 @@ def main() -> None:
         discount=args_cli.discount,
         temperature=args_cli.planner_temperature,
         lambda_=args_cli.mppi_lambda,
+        min_std=args_cli.min_std,
+        max_std=args_cli.max_std,
+        num_pi_trajs=args_cli.num_pi_trajs,
         action_spline_knots=args_cli.action_spline_knots,
         action_prior=action_prior,
         prior_residual_scale=args_cli.prior_residual_scale,
@@ -528,7 +553,10 @@ def main() -> None:
             "continue_loss": 0.0,
             "policy_loss": 0.0,
             "policy_q": 0.0,
+            "policy_scaled_q": 0.0,
             "policy_entropy": 0.0,
+            "policy_scaled_entropy": 0.0,
+            "policy_q_scale": 1.0,
         }
     else:
         latest_losses = {"loss": 0.0, "delta_loss": 0.0, "reward_loss": 0.0, "continue_loss": 0.0}
@@ -658,7 +686,7 @@ def main() -> None:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     model.model_parameters() if args_cli.model_type == "latent" else model.parameters(),
-                    10.0,
+                    args_cli.grad_clip_norm,
                 )
                 optimizer.step()
                 if args_cli.model_type == "latent":
@@ -666,7 +694,7 @@ def main() -> None:
                     policy_loss, policy_metrics = model.policy_loss(rollout_zs)
                     policy_optimizer.zero_grad(set_to_none=True)
                     policy_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.policy_parameters(), 10.0)
+                    torch.nn.utils.clip_grad_norm_(model.policy_parameters(), args_cli.grad_clip_norm)
                     policy_optimizer.step()
                     metrics.update(policy_metrics)
                 if hasattr(model, "soft_update_targets"):
