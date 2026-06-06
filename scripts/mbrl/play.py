@@ -122,6 +122,13 @@ parser.add_argument(
     default=None,
     help="Override using the learned continuation model during latent planning.",
 )
+parser.add_argument(
+    "--planner_hard_continue_model",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="Override using a hard learned continuation mask during latent planning.",
+)
+parser.add_argument("--planner_continue_threshold", type=float, default=None, help="Override hard continuation threshold.")
 parser.add_argument("--planner_velocity_objective_weight", type=float, default=None, help="Override planner-only velocity objective weight.")
 parser.add_argument("--planner_velocity_target_x", type=float, default=None, help="Override planner-only target body x velocity.")
 parser.add_argument("--planner_velocity_target_y", type=float, default=None, help="Override planner-only target body y velocity.")
@@ -333,7 +340,17 @@ def main() -> None:
                 hidden_dim=checkpoint_args["hidden_dim"],
                 depth=checkpoint_args["model_depth"],
             ).to(device)
-        model.load_state_dict(checkpoint["model"])
+        missing_keys, unexpected_keys = model.load_state_dict(checkpoint["model"], strict=False)
+        if hasattr(model, "sync_detached_qs"):
+            model.sync_detached_qs()
+        if missing_keys:
+            preview = ", ".join(missing_keys[:4])
+            suffix = "..." if len(missing_keys) > 4 else ""
+            print(f"[INFO] Checkpoint missing {len(missing_keys)} model keys initialized from current code: {preview}{suffix}")
+        if unexpected_keys:
+            preview = ", ".join(unexpected_keys[:4])
+            suffix = "..." if len(unexpected_keys) > 4 else ""
+            print(f"[INFO] Checkpoint has {len(unexpected_keys)} unused model keys: {preview}{suffix}")
         model.eval()
 
         planner = build_planner(
@@ -358,6 +375,16 @@ def main() -> None:
                 args_cli.planner_use_continue_model
                 if args_cli.planner_use_continue_model is not None
                 else checkpoint_args.get("planner_use_continue_model", False)
+            ),
+            hard_continue_model=(
+                args_cli.planner_hard_continue_model
+                if args_cli.planner_hard_continue_model is not None
+                else checkpoint_args.get("planner_hard_continue_model", False)
+            ),
+            continue_threshold=(
+                args_cli.planner_continue_threshold
+                if args_cli.planner_continue_threshold is not None
+                else checkpoint_args.get("planner_continue_threshold", 0.5)
             ),
             action_spline_knots=checkpoint_args.get("action_spline_knots", 0),
             action_prior=action_prior,
@@ -482,7 +509,7 @@ def main() -> None:
                     raise RuntimeError("--prior_only requires a prior checkpoint in the MBRL checkpoint or --prior_checkpoint.")
                 actions = action_prior(obs)
             else:
-                actions = planner.plan(obs, eval_mode=True)
+                actions = planner.plan(obs, eval_mode=True, t0=steps == 0)
             if args_cli.debug_actions and steps % 100 == 0:
                 if obs.shape[-1] == 45:
                     command_obs = obs[:, 6:9]

@@ -654,6 +654,8 @@ class LatentMPPIPlanner:
         use_best_candidate: bool = False,
         action_noise: bool = True,
         use_continue_model: bool = False,
+        hard_continue_model: bool = False,
+        continue_threshold: float = 0.5,
         **_: object,
     ):
         self.model = model
@@ -678,6 +680,8 @@ class LatentMPPIPlanner:
         self.use_best_candidate = use_best_candidate
         self.action_noise = action_noise
         self.use_continue_model = use_continue_model
+        self.hard_continue_model = hard_continue_model
+        self.continue_threshold = continue_threshold
         self._prev_mean: torch.Tensor | None = None
         self.last_diagnostics: dict[str, float] = {}
 
@@ -769,7 +773,7 @@ class LatentMPPIPlanner:
             z = self.model.next(z, action)
         return torch.stack(actions, dim=1)
 
-    def _policy_candidate_controls(self, obs: torch.Tensor) -> torch.Tensor:
+    def _policy_candidate_controls(self, obs: torch.Tensor, z0: torch.Tensor | None = None) -> torch.Tensor:
         controls = torch.empty(
             (obs.shape[0], self.num_pi_trajs, self.control_horizon, self.action_dim),
             device=obs.device,
@@ -786,8 +790,17 @@ class LatentMPPIPlanner:
             controls[:, next_index] = self._controls_from_actions(external_actions)
             next_index += 1
 
-        for candidate in range(next_index, self.num_pi_trajs):
-            controls[:, candidate] = self._controls_from_actions(self._rollout_policy_actions(obs, deterministic=False))
+        stochastic_count = self.num_pi_trajs - next_index
+        if stochastic_count > 0:
+            z = self.model.encode(obs) if z0 is None else z0
+            z = z.unsqueeze(1).expand(-1, stochastic_count, -1).reshape(obs.shape[0] * stochastic_count, -1)
+            actions = []
+            for _ in range(self.horizon):
+                action = self._clip_actions(self.model.pi(z, deterministic=False))
+                actions.append(action.view(obs.shape[0], stochastic_count, self.action_dim))
+                z = self.model.next(z, action)
+            action_sequences = torch.stack(actions, dim=2)
+            controls[:, next_index:] = self._controls_from_actions(action_sequences)
         return controls
 
     def _elite_score_weights(self, elite_returns: torch.Tensor) -> torch.Tensor:
@@ -796,9 +809,15 @@ class LatentMPPIPlanner:
         return weights
 
     @torch.no_grad()
-    def evaluate_sequences(self, obs: torch.Tensor, action_sequences: torch.Tensor) -> torch.Tensor:
+    def evaluate_sequences(
+        self,
+        obs: torch.Tensor,
+        action_sequences: torch.Tensor,
+        z0: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         batch_size, candidates, _, action_dim = action_sequences.shape
-        z = self.model.encode(obs).unsqueeze(1).expand(-1, candidates, -1).reshape(batch_size * candidates, -1)
+        z = self.model.encode(obs) if z0 is None else z0
+        z = z.unsqueeze(1).expand(-1, candidates, -1).reshape(batch_size * candidates, -1)
         returns = torch.zeros(batch_size * candidates, device=obs.device, dtype=obs.dtype)
         discounts = torch.ones_like(returns)
         alive = torch.ones_like(returns)
@@ -810,7 +829,10 @@ class LatentMPPIPlanner:
             returns = returns + discounts * alive * reward
             if self.use_continue_model:
                 continue_prob = self.model.continue_logits(z).sigmoid().squeeze(-1)
-                alive = alive * continue_prob
+                if self.hard_continue_model:
+                    alive = alive * (continue_prob > self.continue_threshold).to(alive.dtype)
+                else:
+                    alive = alive * continue_prob
             discounts = discounts * self.discount
 
         terminal_action = self.model.pi(z, deterministic=False)
@@ -830,6 +852,7 @@ class LatentMPPIPlanner:
             "planner_best_candidate_mode": float(self.use_best_candidate),
             "planner_action_noise_mode": float(self.action_noise),
             "planner_continue_model_mode": float(self.use_continue_model),
+            "planner_hard_continue_model_mode": float(self.hard_continue_model),
             "planner_prior_action_norm_mean": 0.0,
             "planner_residual_norm_mean": 0.0,
             "planner_residual_abs_mean": 0.0,
@@ -843,10 +866,13 @@ class LatentMPPIPlanner:
             "planner_prior_fallback_fraction": 0.0,
         }
 
-    def plan(self, obs: torch.Tensor, eval_mode: bool = False) -> torch.Tensor:
+    def plan(self, obs: torch.Tensor, eval_mode: bool = False, t0: bool = False) -> torch.Tensor:
+        if t0:
+            self.reset()
+        z0 = self.model.encode(obs)
         mean = self._warm_start_mean(obs)
         std = torch.full_like(mean, self.max_std).clamp_(self.min_std, self.max_std)
-        policy_controls = self._policy_candidate_controls(obs)
+        policy_controls = self._policy_candidate_controls(obs, z0)
         random_candidates = self.candidates - self.num_pi_trajs
         final_elite_controls = mean.unsqueeze(1)
         final_elite_returns = torch.zeros((obs.shape[0], 1), device=obs.device, dtype=obs.dtype)
@@ -865,7 +891,8 @@ class LatentMPPIPlanner:
                 controls = policy_controls
 
             actions = self._expand_controls(controls)
-            returns = self.evaluate_sequences(obs, actions)
+            returns = self.evaluate_sequences(obs, actions, z0)
+            returns = returns.nan_to_num(0.0, posinf=0.0, neginf=0.0)
             last_returns = returns
 
             final_elite_returns, elite_indices = returns.topk(self.elites, dim=1)
@@ -926,6 +953,8 @@ def build_planner(
     action_bounds_finite: bool = True,
     action_noise: bool = True,
     use_continue_model: bool = False,
+    hard_continue_model: bool = False,
+    continue_threshold: float = 0.5,
     planner_velocity_objective_weight: float = 0.0,
     planner_velocity_target_x: float = 0.0,
     planner_velocity_target_y: float = 0.0,
@@ -957,6 +986,8 @@ def build_planner(
             use_best_candidate=use_best_candidate,
             action_noise=action_noise,
             use_continue_model=use_continue_model,
+            hard_continue_model=hard_continue_model,
+            continue_threshold=continue_threshold,
         )
     if planner_name == "mppi":
         return MPPIPlanner(

@@ -25,7 +25,7 @@ def mlp(input_dim: int, hidden_dim: int, output_dim: int, depth: int, dropout: f
     for _ in range(depth):
         layers.append(nn.Linear(dim, hidden_dim))
         layers.append(nn.LayerNorm(hidden_dim))
-        layers.append(nn.SiLU())
+        layers.append(nn.Mish())
         if dropout > 0.0:
             layers.append(nn.Dropout(dropout))
         dim = hidden_dim
@@ -79,7 +79,7 @@ def two_hot(x: torch.Tensor, cfg: DistributionalRegressionCfg) -> torch.Tensor:
 
     target = torch.zeros(*x.shape, cfg.num_bins, device=x.device, dtype=x.dtype)
     target.scatter_(-1, bin_idx.unsqueeze(-1), 1.0 - bin_offset)
-    target.scatter_add_(-1, ((bin_idx + 1) % cfg.num_bins).unsqueeze(-1), bin_offset)
+    target.scatter_add_(-1, (bin_idx + 1).clamp(max=cfg.num_bins - 1).unsqueeze(-1), bin_offset)
     return target
 
 
@@ -202,6 +202,7 @@ class LatentWorldModel(nn.Module):
 
         self.target_encoder = deepcopy(self.encoder)
         self.target_q_heads = deepcopy(self.q_heads)
+        self.detach_q_heads = deepcopy(self.q_heads)
         self._set_targets_requires_grad(False)
 
     def _zero_init_distribution_heads(self) -> None:
@@ -212,7 +213,7 @@ class LatentWorldModel(nn.Module):
                 nn.init.zeros_(final_layer.bias)
 
     def _set_targets_requires_grad(self, requires_grad: bool) -> None:
-        for module in (self.target_encoder, self.target_q_heads):
+        for module in (self.target_encoder, self.target_q_heads, self.detach_q_heads):
             for param in module.parameters():
                 param.requires_grad_(requires_grad)
 
@@ -220,6 +221,7 @@ class LatentWorldModel(nn.Module):
         super().train(mode)
         self.target_encoder.train(False)
         self.target_q_heads.train(False)
+        self.detach_q_heads.train(False)
         return self
 
     @torch.no_grad()
@@ -228,6 +230,11 @@ class LatentWorldModel(nn.Module):
             target_param.lerp_(param, self.tau)
         for target_param, param in zip(self.target_q_heads.parameters(), self.q_heads.parameters(), strict=True):
             target_param.lerp_(param, self.tau)
+
+    @torch.no_grad()
+    def sync_detached_qs(self) -> None:
+        for detach_param, param in zip(self.detach_q_heads.parameters(), self.q_heads.parameters(), strict=True):
+            detach_param.copy_(param)
 
     def encode(self, obs: torch.Tensor, target: bool = False) -> torch.Tensor:
         encoder = self.target_encoder if target else self.encoder
@@ -248,7 +255,8 @@ class LatentWorldModel(nn.Module):
 
     def _policy_stats(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         mean, log_std = self.policy_head(z).chunk(2, dim=-1)
-        log_std = log_std.clamp(self.log_std_min, self.log_std_max)
+        log_std = torch.tanh(log_std)
+        log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (log_std + 1.0)
         return mean, log_std
 
     def pi(self, z: torch.Tensor, deterministic: bool = True, return_info: bool = False):
@@ -286,8 +294,9 @@ class LatentWorldModel(nn.Module):
         target: bool = False,
         return_all: bool = False,
         return_type: str = "min",
+        detach: bool = False,
     ) -> torch.Tensor:
-        qs = self.Q_logits(z, actions, target=target)
+        qs = self.Q_logits(z, actions, target=target, detach=detach)
         if return_all:
             return two_hot_inv(qs, self.dreg)
         values = two_hot_inv(qs, self.dreg)
@@ -302,10 +311,23 @@ class LatentWorldModel(nn.Module):
             return values.mean(dim=0)
         raise ValueError(f"Unsupported Q return_type: {return_type}")
 
-    def Q_logits(self, z: torch.Tensor, actions: torch.Tensor, target: bool = False) -> torch.Tensor:
-        heads = self.target_q_heads if target else self.q_heads
+    def Q_logits(self, z: torch.Tensor, actions: torch.Tensor, target: bool = False, detach: bool = False) -> torch.Tensor:
+        if target:
+            heads = self.target_q_heads
+        elif detach:
+            heads = self.detach_q_heads
+        else:
+            heads = self.q_heads
         inputs = torch.cat([z, actions], dim=-1)
         return torch.stack([head(inputs) for head in heads], dim=0)
+
+    def encoder_parameters(self):
+        yield from self.encoder.parameters()
+
+    def non_encoder_model_parameters(self):
+        modules = (self.dynamics, self.reward_head, self.continue_head, self.q_heads)
+        for module in modules:
+            yield from module.parameters()
 
     def model_parameters(self):
         modules = (self.encoder, self.dynamics, self.reward_head, self.continue_head, self.q_heads)
@@ -316,12 +338,8 @@ class LatentWorldModel(nn.Module):
         yield from self.policy_head.parameters()
 
     def policy_loss(self, zs: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
-        q_requires_grad = [param.requires_grad for head in self.q_heads for param in head.parameters()]
-        q_params = [param for head in self.q_heads for param in head.parameters()]
-        for param in q_params:
-            param.requires_grad_(False)
         actions, info = self.pi(zs.detach(), deterministic=False, return_info=True)
-        q = self.Q(zs.detach(), actions, return_type="avg")
+        q = self.Q(zs.detach(), actions, return_type="avg", detach=True)
         self.q_scale.update(q[0])
         scaled_q = self.q_scale(q)
         rho = torch.pow(
@@ -330,8 +348,6 @@ class LatentWorldModel(nn.Module):
         )
         per_step_loss = -(scaled_q + self.entropy_coef * info["scaled_entropy"]).mean(dim=(1, 2))
         loss = (per_step_loss * rho).mean()
-        for param, requires_grad in zip(q_params, q_requires_grad, strict=True):
-            param.requires_grad_(requires_grad)
         metrics = {
             "policy_loss": float(loss.detach().item()),
             "policy_q": float(q.detach().mean().item()),

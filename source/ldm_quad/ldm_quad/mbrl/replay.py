@@ -21,6 +21,7 @@ class ReplayBuffer:
         self._last_batch_size = 1
         self._env_episode_ids = torch.zeros(1, dtype=torch.long)
         self._env_step_ids = torch.zeros(1, dtype=torch.long)
+        self._valid_start_cache: dict[int, torch.Tensor] = {}
 
     def __len__(self) -> int:
         return self.size
@@ -84,6 +85,7 @@ class ReplayBuffer:
 
         self.ptr = end % self.capacity
         self.size = min(self.size + batch_size, self.capacity)
+        self._valid_start_cache.clear()
         done = resets.view(-1).bool() if resets is not None else continues.view(-1) <= 0.0
         self._env_step_ids[:batch_size] += 1
         done_indices = done.nonzero(as_tuple=False).view(-1)
@@ -101,56 +103,66 @@ class ReplayBuffer:
             "continues": self.continues[indices].to(device),
         }
 
-    def can_sample_sequences(self, batch_size: int, horizon: int) -> bool:
+    def _valid_sequence_starts(self, horizon: int) -> torch.Tensor:
         stride = max(int(self._last_batch_size), 1)
-        return self.size >= batch_size and self.size >= horizon * stride + 1 and self.episode_ids[: self.size].min().item() >= 0
+        horizon = int(horizon)
+        cached = self._valid_start_cache.get(horizon)
+        if cached is not None:
+            return cached
+
+        if horizon <= 0 or self.size < horizon * stride + 1 or self.episode_ids[: self.size].min().item() < 0:
+            starts = torch.empty(0, dtype=torch.long)
+            self._valid_start_cache[horizon] = starts
+            return starts
+
+        valid_limit = self.capacity if self.size == self.capacity else self.size
+        starts = torch.arange(valid_limit, dtype=torch.long)
+        offsets = torch.arange(horizon + 1, dtype=torch.long) * stride
+        indices = (starts.unsqueeze(1) + offsets.unsqueeze(0)) % self.capacity
+
+        valid = torch.ones(starts.shape[0], dtype=torch.bool)
+        if self.size < self.capacity:
+            valid &= (indices < self.size).all(dim=1)
+
+        first = indices[:, 0]
+        valid &= (self.env_ids[indices] == self.env_ids[first].unsqueeze(1)).all(dim=1)
+        valid &= (self.episode_ids[indices] == self.episode_ids[first].unsqueeze(1)).all(dim=1)
+        expected_steps = self.step_ids[first].unsqueeze(1) + torch.arange(horizon + 1)
+        valid &= (self.step_ids[indices] == expected_steps).all(dim=1)
+        if horizon > 1:
+            valid &= (self.continues[indices[:, :-2]].squeeze(-1) > 0.0).all(dim=1)
+
+        starts = starts[valid]
+        self._valid_start_cache[horizon] = starts
+        return starts
+
+    def valid_sequence_count(self, horizon: int) -> int:
+        return int(self._valid_sequence_starts(horizon).numel())
+
+    def can_sample_sequences(self, batch_size: int, horizon: int) -> bool:
+        return self.size >= batch_size and self.valid_sequence_count(horizon) > 0
 
     def sample_sequences(
         self,
         batch_size: int,
         horizon: int,
         device: torch.device | str,
-        max_attempts: int = 10000,
     ) -> dict[str, torch.Tensor]:
-        """Sample same-env contiguous transition sequences.
+        """Sample strict same-env, same-episode contiguous transition sequences.
 
         The buffer is filled by vectorized env steps, so transition `i + num_envs`
         is the next transition for the same environment as transition `i`.
         """
 
         stride = max(int(self._last_batch_size), 1)
-        if not self.can_sample_sequences(batch_size, horizon):
+        starts = self._valid_sequence_starts(horizon)
+        if self.size < batch_size or starts.numel() == 0:
             raise ValueError(
                 f"Cannot sample horizon={horizon} sequences from buffer size={self.size} "
-                f"with vectorized stride={stride}."
+                f"with vectorized stride={stride}. valid_sequences={starts.numel()}."
             )
 
-        starts: list[int] = []
-        attempts = 0
-        valid_limit = self.capacity if self.size == self.capacity else self.size
-        while len(starts) < batch_size and attempts < max_attempts:
-            attempts += 1
-            start = int(torch.randint(0, valid_limit, ()).item())
-            indices = (start + torch.arange(horizon + 1) * stride) % self.capacity
-            if self.size < self.capacity and int(indices[-1].item()) >= self.size:
-                continue
-            if self.env_ids[indices].unique().numel() != 1:
-                continue
-            if self.episode_ids[indices].unique().numel() != 1:
-                continue
-            if not torch.equal(self.step_ids[indices], self.step_ids[indices[0]] + torch.arange(horizon + 1)):
-                continue
-            if horizon > 1 and self.continues[indices[:-2]].min().item() <= 0.0:
-                continue
-            starts.append(start)
-
-        if len(starts) < batch_size:
-            raise RuntimeError(
-                f"Only found {len(starts)} valid horizon={horizon} sequences after {max_attempts} attempts. "
-                "Collect more non-terminal data or reduce the sequence horizon."
-            )
-
-        start_t = torch.as_tensor(starts, dtype=torch.long)
+        start_t = starts[torch.randint(0, starts.numel(), (batch_size,))]
         indices = (start_t.unsqueeze(0) + torch.arange(horizon + 1).unsqueeze(1) * stride) % self.capacity
         transition_indices = indices[:-1]
         return {

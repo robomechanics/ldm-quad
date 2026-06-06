@@ -90,7 +90,7 @@ parser.add_argument("--horizon", type=int, default=3, help="Planning/model rollo
 parser.add_argument("--candidates", type=int, default=512, help="Candidate action sequences for planning.")
 parser.add_argument("--elites", type=int, default=64, help="Elite sequences kept each CEM iteration.")
 parser.add_argument("--num_pi_trajs", type=int, default=24, help="TD-MPC2-style learned-policy trajectories injected into latent planning.")
-parser.add_argument("--planner_iterations", type=int, default=5, help="Planner refinement iterations.")
+parser.add_argument("--planner_iterations", type=int, default=6, help="Planner refinement iterations.")
 parser.add_argument("--discount", type=float, default=0.99, help="Planning discount factor.")
 parser.add_argument("--planner_temperature", type=float, default=0.5, help="Planner temperature for latent elite weighting / legacy exploration.")
 parser.add_argument("--mppi_lambda", type=float, default=1.0, help="MPPI reward temperature.")
@@ -108,6 +108,13 @@ parser.add_argument(
     default=False,
     help="Use the learned continuation model inside latent planning. TD-MPC2-style default is disabled.",
 )
+parser.add_argument(
+    "--planner_hard_continue_model",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Use a hard continuation mask when --planner_use_continue_model is enabled.",
+)
+parser.add_argument("--planner_continue_threshold", type=float, default=0.5, help="Hard continuation threshold.")
 parser.add_argument(
     "--planner_use_best_candidate",
     action=argparse.BooleanOptionalAction,
@@ -202,16 +209,34 @@ parser.add_argument(
     help="Required predicted-return improvement before using residual actions over the pure prior.",
 )
 parser.add_argument("--lr", type=float, default=3e-4, help="Dynamics model learning rate.")
+parser.add_argument("--enc_lr_scale", type=float, default=0.3, help="Latent encoder learning-rate multiplier.")
 parser.add_argument("--policy_lr", type=float, default=3e-4, help="Latent actor learning rate.")
 parser.add_argument("--grad_clip_norm", type=float, default=20.0, help="Gradient clipping norm.")
 parser.add_argument("--eval_interval", type=int, default=10, help="Steps between console/log summaries.")
+parser.add_argument(
+    "--online_eval",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Run held-out evaluation episodes during training without adding them to replay.",
+)
+parser.add_argument("--online_eval_interval", type=int, default=5000, help="Environment steps between held-out eval passes.")
+parser.add_argument("--online_eval_num_envs", type=int, default=16, help="Number of held-out eval environments.")
+parser.add_argument("--online_eval_episodes", type=int, default=16, help="Completed held-out episodes per eval pass.")
+parser.add_argument("--online_eval_max_steps", type=int, default=4000, help="Maximum held-out eval environment steps per eval pass.")
+parser.add_argument("--online_eval_task", type=str, default=None, help="Optional held-out eval task. Defaults to the matching play task.")
 parser.add_argument("--save_interval", type=int, default=50, help="Steps between checkpoints.")
 parser.add_argument(
     "--save_best_metric",
     type=str,
     default="mean_return",
-    choices=["mean_return", "estimated_return"],
+    choices=["mean_return", "estimated_return", "eval_return"],
     help="Metric used to save checkpoints/model_best.pt.",
+)
+parser.add_argument(
+    "--save_best_requires_planner",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Only update model_best.pt on logging rows where the learned planner is active.",
 )
 parser.add_argument("--wandb", action="store_true", default=False, help="Log this run to Weights & Biases via TensorBoard sync.")
 parser.add_argument("--wandb_project", type=str, default="ldm-quad-mbrl", help="Weights & Biases project name.")
@@ -233,7 +258,7 @@ parser.add_argument(
     "--early_stop_metric",
     type=str,
     default="mean_return",
-    choices=["mean_return", "estimated_return"],
+    choices=["mean_return", "estimated_return", "eval_return"],
     help="Metric used for early-stop plateau detection.",
 )
 parser.add_argument(
@@ -354,6 +379,12 @@ def make_log_dir() -> str:
     return log_dir
 
 
+def infer_eval_task(train_task: str | None) -> str:
+    if train_task == "Flat-Unitree-Go2-train-v0":
+        return "Random-Agent-Unitree-Go2-Play-v0"
+    return train_task or "Random-Agent-Unitree-Go2-Play-v0"
+
+
 def apply_fixed_velocity_command(env_cfg: object) -> None:
     if not args_cli.wander and args_cli.command_x is None and args_cli.command_y is None and args_cli.command_yaw is None:
         return
@@ -389,6 +420,56 @@ def format_duration(seconds: float) -> str:
     if hours > 0:
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
     return f"{minutes:02d}:{seconds:02d}"
+
+
+def command_slice(obs_dim: int) -> slice | None:
+    if obs_dim == 45:
+        return slice(6, 9)
+    if obs_dim >= 12:
+        return slice(9, 12)
+    return None
+
+
+def command_tracking_metrics(obs: torch.Tensor) -> dict[str, float]:
+    metrics = {
+        "command_x_mean": 0.0,
+        "command_y_mean": 0.0,
+        "command_yaw_mean": 0.0,
+        "command_abs_y_mean": 0.0,
+        "command_abs_yaw_mean": 0.0,
+        "velocity_x_mean": 0.0,
+        "velocity_y_mean": 0.0,
+        "velocity_yaw_mean": 0.0,
+        "tracking_x_abs_error": 0.0,
+        "tracking_y_abs_error": 0.0,
+        "tracking_yaw_abs_error": 0.0,
+    }
+    if obs.ndim != 2 or obs.shape[-1] < 6:
+        return metrics
+
+    velocity = obs[:, [0, 1, 5]]
+    metrics["velocity_x_mean"] = float(velocity[:, 0].mean().item())
+    metrics["velocity_y_mean"] = float(velocity[:, 1].mean().item())
+    metrics["velocity_yaw_mean"] = float(velocity[:, 2].mean().item())
+
+    command_idx = command_slice(obs.shape[-1])
+    if command_idx is None:
+        return metrics
+
+    command = obs[:, command_idx]
+    if command.shape[-1] < 3:
+        return metrics
+
+    metrics["command_x_mean"] = float(command[:, 0].mean().item())
+    metrics["command_y_mean"] = float(command[:, 1].mean().item())
+    metrics["command_yaw_mean"] = float(command[:, 2].mean().item())
+    metrics["command_abs_y_mean"] = float(command[:, 1].abs().mean().item())
+    metrics["command_abs_yaw_mean"] = float(command[:, 2].abs().mean().item())
+    error = (velocity - command[:, :3]).abs()
+    metrics["tracking_x_abs_error"] = float(error[:, 0].mean().item())
+    metrics["tracking_y_abs_error"] = float(error[:, 1].mean().item())
+    metrics["tracking_yaw_abs_error"] = float(error[:, 2].mean().item())
+    return metrics
 
 
 def infer_episode_horizon_steps(env: gym.Env, env_cfg: object) -> float:
@@ -451,8 +532,106 @@ def save_checkpoint(
     )
 
 
+def zero_eval_metrics() -> dict[str, float]:
+    return {
+        "eval_ran": 0.0,
+        "eval_completed_episodes": 0.0,
+        "eval_steps": 0.0,
+        "eval_mean_return": 0.0,
+        "eval_std_return": 0.0,
+        "eval_mean_length": 0.0,
+        "eval_termination_rate": 0.0,
+        "eval_timeout_rate": 0.0,
+        "eval_tracking_x_abs_error": 0.0,
+        "eval_tracking_y_abs_error": 0.0,
+        "eval_tracking_yaw_abs_error": 0.0,
+    }
+
+
+@torch.no_grad()
+def run_heldout_eval(
+    env: gym.Env,
+    planner: object,
+    device: torch.device,
+    num_episodes: int,
+    max_steps: int,
+) -> dict[str, float]:
+    obs_raw, _ = env.reset()
+    obs = flatten_obs(obs_raw, device)
+    planner.reset()
+
+    episode_returns = torch.zeros(obs.shape[0], dtype=torch.float32, device=device)
+    episode_lengths = torch.zeros(obs.shape[0], dtype=torch.float32, device=device)
+    completed_returns: list[float] = []
+    completed_lengths: list[float] = []
+    terminated_count = 0
+    truncated_count = 0
+    tracking_error_sum = torch.zeros(3, dtype=torch.float32, device=device)
+    tracking_error_count = 0
+
+    steps = 0
+    while steps < max_steps and len(completed_returns) < num_episodes:
+        actions = planner.plan(obs, eval_mode=True, t0=steps == 0)
+        next_obs_raw, rewards, terminated, truncated, _ = env.step(actions)
+        next_obs = flatten_obs(next_obs_raw, device)
+        rewards = to_tensor(rewards, device).float().view(-1)
+        terminated = to_tensor(terminated, device).bool().view(-1)
+        truncated = to_tensor(truncated, device).bool().view(-1)
+        done = terminated | truncated
+
+        command_idx = command_slice(obs.shape[-1])
+        if command_idx is not None and obs.shape[-1] >= 6:
+            command = obs[:, command_idx]
+            if command.shape[-1] >= 3:
+                velocity = obs[:, [0, 1, 5]]
+                tracking_error_sum += (velocity - command[:, :3]).abs().sum(dim=0)
+                tracking_error_count += obs.shape[0]
+
+        episode_returns += rewards
+        episode_lengths += 1
+        if done.any():
+            done_mask = done
+            completed_returns.extend(episode_returns[done_mask].detach().cpu().tolist())
+            completed_lengths.extend(episode_lengths[done_mask].detach().cpu().tolist())
+            terminated_count += int(terminated.sum().item())
+            truncated_count += int(truncated.sum().item())
+            episode_returns[done_mask] = 0.0
+            episode_lengths[done_mask] = 0.0
+            planner.reset(done_mask)
+
+        obs = next_obs
+        steps += 1
+
+    eval_returns = completed_returns[:num_episodes]
+    eval_lengths = completed_lengths[:num_episodes]
+    metrics = zero_eval_metrics()
+    metrics["eval_ran"] = 1.0
+    metrics["eval_completed_episodes"] = float(len(eval_returns))
+    metrics["eval_steps"] = float(steps)
+    if eval_returns:
+        metrics["eval_mean_return"] = float(np.mean(eval_returns))
+        metrics["eval_std_return"] = float(np.std(eval_returns))
+        metrics["eval_mean_length"] = float(np.mean(eval_lengths))
+    done_count = terminated_count + truncated_count
+    if done_count > 0:
+        metrics["eval_termination_rate"] = float(terminated_count / done_count)
+        metrics["eval_timeout_rate"] = float(truncated_count / done_count)
+    if tracking_error_count > 0:
+        tracking_error = tracking_error_sum / tracking_error_count
+        metrics["eval_tracking_x_abs_error"] = float(tracking_error[0].item())
+        metrics["eval_tracking_y_abs_error"] = float(tracking_error[1].item())
+        metrics["eval_tracking_yaw_abs_error"] = float(tracking_error[2].item())
+    return metrics
+
+
 def main() -> None:
     set_seed(args_cli.seed)
+    if args_cli.save_best_metric == "eval_return" and not args_cli.online_eval:
+        raise ValueError("--save_best_metric eval_return requires --online_eval.")
+    if args_cli.early_stop_metric == "eval_return" and not args_cli.online_eval:
+        raise ValueError("--early_stop_metric eval_return requires --online_eval.")
+    if args_cli.online_eval and args_cli.online_eval_interval <= 0:
+        raise ValueError("--online_eval_interval must be positive when --online_eval is enabled.")
     env_cfg = parse_env_cfg(
         args_cli.task,
         device=args_cli.device,
@@ -519,8 +698,14 @@ def main() -> None:
                 continue_=args_cli.continue_coef,
             ),
         ).to(device)
-        optimizer = torch.optim.Adam(model.model_parameters(), lr=args_cli.lr)
-        policy_optimizer = torch.optim.Adam(model.policy_parameters(), lr=args_cli.policy_lr)
+        optimizer = torch.optim.Adam(
+            [
+                {"params": list(model.encoder_parameters()), "lr": args_cli.lr * args_cli.enc_lr_scale},
+                {"params": list(model.non_encoder_model_parameters()), "lr": args_cli.lr},
+            ],
+            lr=args_cli.lr,
+        )
+        policy_optimizer = torch.optim.Adam(model.policy_parameters(), lr=args_cli.policy_lr, eps=1e-5)
     else:
         model = DynamicsEnsemble(
             obs_dim=obs_dim,
@@ -563,12 +748,84 @@ def main() -> None:
         action_bounds_finite=action_bounds_finite,
         action_noise=args_cli.planner_action_noise,
         use_continue_model=args_cli.planner_use_continue_model,
+        hard_continue_model=args_cli.planner_hard_continue_model,
+        continue_threshold=args_cli.planner_continue_threshold,
         planner_velocity_objective_weight=args_cli.planner_velocity_objective_weight,
         planner_velocity_target_x=args_cli.planner_velocity_target_x,
         planner_velocity_target_y=args_cli.planner_velocity_target_y,
         planner_velocity_target_yaw=args_cli.planner_velocity_target_yaw,
         use_best_candidate=args_cli.planner_use_best_candidate,
     )
+    eval_env = None
+    eval_planner = None
+    if args_cli.online_eval:
+        eval_task = args_cli.online_eval_task or infer_eval_task(args_cli.task)
+        eval_env_cfg = parse_env_cfg(
+            eval_task,
+            device=args_cli.device,
+            num_envs=args_cli.online_eval_num_envs,
+            use_fabric=not args_cli.disable_fabric,
+        )
+        eval_env_cfg.seed = args_cli.seed + 10000
+        apply_fixed_velocity_command(eval_env_cfg)
+        eval_env = gym.make(eval_task, cfg=eval_env_cfg)
+        eval_obs_sample, _ = eval_env.reset()
+        eval_obs_dim = flatten_obs(eval_obs_sample, device).shape[-1]
+        if eval_obs_dim != obs_dim:
+            raise ValueError(f"Eval obs_dim={eval_obs_dim} does not match train obs_dim={obs_dim}.")
+        eval_action_shape = eval_env.action_space.shape
+        eval_action_dim = int(eval_action_shape[-1]) if len(eval_action_shape) > 0 else int(np.prod(eval_action_shape))
+        eval_action_low, eval_action_high, eval_action_bounds_finite = get_action_bounds(
+            eval_env.action_space,
+            device,
+            eval_action_dim,
+        )
+        if eval_action_dim != action_dim:
+            raise ValueError(f"Eval action_dim={eval_action_dim} does not match train action_dim={action_dim}.")
+        eval_planner = build_planner(
+            planner_name=args_cli.planner,
+            model=model,
+            action_low=eval_action_low,
+            action_high=eval_action_high,
+            horizon=args_cli.horizon,
+            candidates=args_cli.candidates,
+            elites=args_cli.elites,
+            iterations=args_cli.planner_iterations,
+            discount=args_cli.discount,
+            temperature=args_cli.planner_temperature,
+            lambda_=args_cli.mppi_lambda,
+            min_std=args_cli.min_std,
+            max_std=args_cli.max_std,
+            num_pi_trajs=args_cli.num_pi_trajs,
+            action_spline_knots=args_cli.action_spline_knots,
+            action_prior=action_prior,
+            prior_residual_scale=args_cli.prior_residual_scale,
+            prior_residual_penalty=args_cli.prior_residual_penalty,
+            prior_acceptance_margin=args_cli.prior_acceptance_margin,
+            prior_fallback=args_cli.prior_fallback,
+            prior_candidate_fraction=args_cli.prior_candidate_fraction,
+            prior_candidate_noise=args_cli.prior_candidate_noise,
+            prior_command_candidate_fraction=args_cli.prior_command_candidate_fraction,
+            prior_command_noise=args_cli.prior_command_noise,
+            prior_command_start=args_cli.prior_command_start,
+            prior_command_dim=args_cli.prior_command_dim,
+            prior_control_mode=args_cli.prior_control_mode,
+            action_bounds_finite=eval_action_bounds_finite,
+            action_noise=False,
+            use_continue_model=args_cli.planner_use_continue_model,
+            hard_continue_model=args_cli.planner_hard_continue_model,
+            continue_threshold=args_cli.planner_continue_threshold,
+            planner_velocity_objective_weight=args_cli.planner_velocity_objective_weight,
+            planner_velocity_target_x=args_cli.planner_velocity_target_x,
+            planner_velocity_target_y=args_cli.planner_velocity_target_y,
+            planner_velocity_target_yaw=args_cli.planner_velocity_target_yaw,
+            use_best_candidate=args_cli.planner_use_best_candidate,
+        )
+        print(
+            "[MBRL] Online eval enabled: "
+            f"task={eval_task} num_envs={args_cli.online_eval_num_envs} "
+            f"episodes={args_cli.online_eval_episodes} interval={args_cli.online_eval_interval}"
+        )
 
     train_state = TrainState()
     episode_returns = torch.zeros(num_envs, dtype=torch.float32, device=device)
@@ -602,6 +859,7 @@ def main() -> None:
         "planner_best_candidate_mode": 0.0,
         "planner_action_noise_mode": 0.0,
         "planner_continue_model_mode": 0.0,
+        "planner_hard_continue_model_mode": 0.0,
         "planner_prior_action_norm_mean": 0.0,
         "planner_residual_norm_mean": 0.0,
         "planner_residual_abs_mean": 0.0,
@@ -622,7 +880,10 @@ def main() -> None:
     planner_start_steps = args_cli.planner_start_steps if args_cli.planner_start_steps is not None else args_cli.seed_steps
     planner_min_length = args_cli.planner_min_length_fraction * episode_horizon_steps
     planner_active = False
+    planner_was_active = False
     best_checkpoint_metric = float("-inf")
+    latest_eval_metrics = zero_eval_metrics()
+    next_online_eval_step = args_cli.online_eval_interval if args_cli.online_eval else None
 
     with open(os.path.join(log_dir, "config.txt"), "w", encoding="utf-8") as f:
         for key, value in sorted(vars(args_cli).items()):
@@ -650,6 +911,8 @@ def main() -> None:
             planner_active = planner_ready
 
             if not planner_ready:
+                if planner_was_active:
+                    planner.reset()
                 latest_planner_diagnostics = dict.fromkeys(latest_planner_diagnostics, 0.0)
                 if action_prior is not None and args_cli.seed_with_prior:
                     actions = action_prior(obs)
@@ -660,8 +923,9 @@ def main() -> None:
                 else:
                     actions = random_actions(obs.shape[0], action_low, action_high)
             else:
-                actions = planner.plan(obs)
+                actions = planner.plan(obs, t0=not planner_was_active)
                 latest_planner_diagnostics.update(planner.last_diagnostics)
+            planner_was_active = planner_ready
 
             next_obs_raw, rewards, terminated, truncated, _ = env.step(actions)
             next_obs = flatten_obs(next_obs_raw, device)
@@ -727,6 +991,7 @@ def main() -> None:
                 optimizer.step()
                 if args_cli.model_type == "latent":
                     assert policy_optimizer is not None
+                    model.sync_detached_qs()
                     policy_loss, policy_metrics = model.policy_loss(rollout_zs)
                     policy_optimizer.zero_grad(set_to_none=True)
                     policy_loss.backward()
@@ -747,7 +1012,34 @@ def main() -> None:
             current_length_mean = float(episode_lengths.mean().item())
             estimated_return_100 = mean_step_reward_100 * episode_horizon_steps
             train_state.best_mean_return = max(train_state.best_mean_return, mean_return)
-            save_best_value = mean_return if args_cli.save_best_metric == "mean_return" else estimated_return_100
+            tracking_metrics = command_tracking_metrics(obs)
+            eval_due = (
+                args_cli.online_eval
+                and eval_env is not None
+                and eval_planner is not None
+                and args_cli.online_eval_interval > 0
+                and next_online_eval_step is not None
+                and train_state.env_steps >= next_online_eval_step
+            )
+            if eval_due:
+                model.eval()
+                latest_eval_metrics = run_heldout_eval(
+                    env=eval_env,
+                    planner=eval_planner,
+                    device=device,
+                    num_episodes=args_cli.online_eval_episodes,
+                    max_steps=args_cli.online_eval_max_steps,
+                )
+                while next_online_eval_step is not None and next_online_eval_step <= train_state.env_steps:
+                    next_online_eval_step += args_cli.online_eval_interval
+            else:
+                latest_eval_metrics = {**latest_eval_metrics, "eval_ran": 0.0}
+            if args_cli.save_best_metric == "mean_return":
+                save_best_value = mean_return
+            elif args_cli.save_best_metric == "estimated_return":
+                save_best_value = estimated_return_100
+            else:
+                save_best_value = latest_eval_metrics["eval_mean_return"]
             elapsed_s = time.monotonic() - train_start_time
             remaining_steps = max(args_cli.train_steps - train_state.env_steps, 0)
             steps_per_second = train_state.env_steps / max(elapsed_s, 1e-6)
@@ -757,6 +1049,7 @@ def main() -> None:
                 "gradient_updates": train_state.gradient_updates,
                 "episodes_finished": train_state.episodes_finished,
                 "buffer_size": len(replay),
+                "valid_sequence_count": replay.valid_sequence_count(args_cli.horizon) if args_cli.model_type == "latent" else 0,
                 "mean_return_100": mean_return,
                 "mean_length_100": mean_length,
                 "mean_step_reward_100": mean_step_reward_100,
@@ -770,6 +1063,8 @@ def main() -> None:
                 "wall_time_s": elapsed_s,
                 "steps_per_second": steps_per_second,
                 "eta_s": eta_s,
+                **tracking_metrics,
+                **latest_eval_metrics,
                 **latest_planner_diagnostics,
                 **latest_losses,
             }
@@ -782,6 +1077,8 @@ def main() -> None:
             writer.add_scalar("Episode / current_episode_length_mean", current_length_mean, train_state.env_steps)
             writer.add_scalar("Train / gradient_updates", train_state.gradient_updates, train_state.env_steps)
             writer.add_scalar("Train / buffer_size", len(replay), train_state.env_steps)
+            if args_cli.model_type == "latent":
+                writer.add_scalar("Train / valid_sequence_count", row["valid_sequence_count"], train_state.env_steps)
             writer.add_scalar("Train / episodes_finished", train_state.episodes_finished, train_state.env_steps)
             writer.add_scalar("Train / planner_active", int(planner_active), train_state.env_steps)
             writer.add_scalar("Train / planner_disabled_until", planner_disabled_until, train_state.env_steps)
@@ -789,6 +1086,10 @@ def main() -> None:
             writer.add_scalar("Time / wall_time_s", elapsed_s, train_state.env_steps)
             writer.add_scalar("Time / steps_per_second", steps_per_second, train_state.env_steps)
             writer.add_scalar("Time / eta_s", eta_s, train_state.env_steps)
+            for tracking_name, tracking_value in tracking_metrics.items():
+                writer.add_scalar(f"Tracking / {tracking_name}", tracking_value, train_state.env_steps)
+            for eval_name, eval_value in latest_eval_metrics.items():
+                writer.add_scalar(f"Eval / {eval_name}", eval_value, train_state.env_steps)
             for diagnostic_name, diagnostic_value in latest_planner_diagnostics.items():
                 writer.add_scalar(f"Planner / {diagnostic_name}", diagnostic_value, train_state.env_steps)
             for loss_name, loss_value in latest_losses.items():
@@ -807,31 +1108,73 @@ def main() -> None:
                 f"residual_norm={latest_planner_diagnostics['planner_residual_norm_mean']:.3f} "
                 f"fallback={latest_planner_diagnostics['planner_prior_fallback_fraction']:.2f} "
                 f"model_margin={latest_planner_diagnostics['planner_predicted_return_margin_mean']:.3f} "
+                f"track_x={tracking_metrics['tracking_x_abs_error']:.3f} "
+                f"track_yaw={tracking_metrics['tracking_yaw_abs_error']:.3f} "
                 f"loss={latest_losses['loss']:.4f} "
                 f"elapsed={format_duration(elapsed_s)} "
                 f"eta={format_duration(eta_s)}"
             )
+            if latest_eval_metrics["eval_ran"]:
+                print(
+                    "[EVAL] "
+                    f"step={train_state.env_steps} "
+                    f"episodes={latest_eval_metrics['eval_completed_episodes']:.0f} "
+                    f"return={latest_eval_metrics['eval_mean_return']:.3f} "
+                    f"std={latest_eval_metrics['eval_std_return']:.3f} "
+                    f"len={latest_eval_metrics['eval_mean_length']:.2f} "
+                    f"term_rate={latest_eval_metrics['eval_termination_rate']:.2f} "
+                    f"track_x={latest_eval_metrics['eval_tracking_x_abs_error']:.3f} "
+                    f"track_yaw={latest_eval_metrics['eval_tracking_yaw_abs_error']:.3f}"
+                )
 
-            if save_best_value > best_checkpoint_metric and (recent_returns or args_cli.save_best_metric == "estimated_return"):
+            if args_cli.save_best_metric == "eval_return":
+                best_has_metric = latest_eval_metrics["eval_completed_episodes"] > 0
+                best_planner_ok = True
+            else:
+                best_has_metric = recent_returns or args_cli.save_best_metric == "estimated_return"
+                best_planner_ok = planner_active or not args_cli.save_best_requires_planner
+            if best_has_metric and best_planner_ok and save_best_value > best_checkpoint_metric:
                 best_checkpoint_metric = save_best_value
                 best_path = os.path.join(log_dir, "checkpoints", "model_best.pt")
                 save_checkpoint(best_path, model, optimizer, policy_optimizer, train_state, args_cli)
 
             if args_cli.early_stop:
-                stop_metric = mean_return if args_cli.early_stop_metric == "mean_return" else estimated_return_100
-                full_length_ready = mean_length >= args_cli.early_stop_length_fraction * episode_horizon_steps
+                if args_cli.early_stop_metric == "mean_return":
+                    stop_metric = mean_return
+                    stop_metric_ready = bool(recent_returns)
+                    stop_length = mean_length
+                elif args_cli.early_stop_metric == "estimated_return":
+                    stop_metric = estimated_return_100
+                    stop_metric_ready = True
+                    stop_length = mean_length
+                else:
+                    stop_metric = latest_eval_metrics["eval_mean_return"]
+                    stop_metric_ready = (
+                        bool(latest_eval_metrics["eval_ran"])
+                        and latest_eval_metrics["eval_completed_episodes"] > 0
+                    )
+                    stop_length = latest_eval_metrics["eval_mean_length"]
+
+                full_length_ready = stop_length >= args_cli.early_stop_length_fraction * episode_horizon_steps
                 min_steps_ready = train_state.env_steps >= args_cli.early_stop_min_steps
                 has_completed_episodes = train_state.episodes_finished > 0
 
-                if stop_metric > early_stop_best_metric + args_cli.early_stop_min_delta:
+                if stop_metric_ready and early_stop_best_metric == float("-inf"):
+                    early_stop_best_metric = stop_metric
+                    early_stop_best_step = train_state.env_steps
+                elif stop_metric_ready and stop_metric > early_stop_best_metric + args_cli.early_stop_min_delta:
                     early_stop_best_metric = stop_metric
                     early_stop_best_step = train_state.env_steps
 
                 no_improvement_steps = train_state.env_steps - early_stop_best_step
-                target_ready = args_cli.early_stop_return is not None and stop_metric >= args_cli.early_stop_return
-                plateau_ready = no_improvement_steps >= args_cli.early_stop_patience
+                target_ready = (
+                    stop_metric_ready
+                    and args_cli.early_stop_return is not None
+                    and stop_metric >= args_cli.early_stop_return
+                )
+                plateau_ready = stop_metric_ready and no_improvement_steps >= args_cli.early_stop_patience
 
-                if min_steps_ready and has_completed_episodes and full_length_ready and (target_ready or plateau_ready):
+                if stop_metric_ready and min_steps_ready and has_completed_episodes and full_length_ready and (target_ready or plateau_ready):
                     if target_ready:
                         early_stop_reason = (
                             f"{args_cli.early_stop_metric}={stop_metric:.3f} reached target "
@@ -858,6 +1201,8 @@ def main() -> None:
             f.write(f"reason: {early_stop_reason}\n")
             f.write(f"checkpoint: {final_path}\n")
     writer.close()
+    if eval_env is not None:
+        eval_env.close()
     env.close()
     if wandb_run is not None:
         if args_cli.wandb_alert:
