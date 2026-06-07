@@ -223,7 +223,13 @@ parser.add_argument("--online_eval_interval", type=int, default=5000, help="Envi
 parser.add_argument("--online_eval_num_envs", type=int, default=16, help="Number of held-out eval environments.")
 parser.add_argument("--online_eval_episodes", type=int, default=16, help="Completed held-out episodes per eval pass.")
 parser.add_argument("--online_eval_max_steps", type=int, default=4000, help="Maximum held-out eval environment steps per eval pass.")
-parser.add_argument("--online_eval_task", type=str, default=None, help="Optional held-out eval task. Defaults to the matching play task.")
+parser.add_argument("--online_eval_task", type=str, default=None, help="Optional held-out eval task. Defaults to the training task.")
+parser.add_argument(
+    "--online_eval_separate_env",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Create a separate eval env. Disabled by default because Isaac can hang when constructing a second env in one process.",
+)
 parser.add_argument("--save_interval", type=int, default=50, help="Steps between checkpoints.")
 parser.add_argument(
     "--save_best_metric",
@@ -380,9 +386,7 @@ def make_log_dir() -> str:
 
 
 def infer_eval_task(train_task: str | None) -> str:
-    if train_task == "Flat-Unitree-Go2-train-v0":
-        return "Random-Agent-Unitree-Go2-Play-v0"
-    return train_task or "Random-Agent-Unitree-Go2-Play-v0"
+    return train_task or "Flat-Unitree-Go2-train-v0"
 
 
 def apply_fixed_velocity_command(env_cfg: object) -> None:
@@ -494,7 +498,7 @@ def init_wandb(log_dir: str) -> object | None:
     try:
         import wandb
     except ImportError:
-        print("[MBRL] W&B logging requested but wandb is not installed. Install with: pip install wandb")
+        print("[MBRL] W&B logging requested but wandb is not installed. Install with: pip install wandb", flush=True)
         return None
 
     try:
@@ -508,7 +512,7 @@ def init_wandb(log_dir: str) -> object | None:
             mode=args_cli.wandb_mode,
         )
     except Exception as exc:
-        print(f"[MBRL] Failed to initialize W&B logging: {exc}")
+        print(f"[MBRL] Failed to initialize W&B logging: {exc}", flush=True)
         return None
 
 
@@ -671,7 +675,7 @@ def main() -> None:
             obs_adapter=args_cli.prior_obs_adapter,
             action_adapter=args_cli.prior_action_adapter,
         )
-        print(f"[MBRL] Loaded locomotion prior ({args_cli.prior_type}): {os.path.abspath(args_cli.prior_checkpoint)}")
+        print(f"[MBRL] Loaded locomotion prior ({args_cli.prior_type}): {os.path.abspath(args_cli.prior_checkpoint)}", flush=True)
 
     replay = ReplayBuffer(args_cli.buffer_capacity, obs_dim=obs_dim, action_dim=action_dim)
     if args_cli.model_type == "latent":
@@ -760,28 +764,43 @@ def main() -> None:
     eval_planner = None
     if args_cli.online_eval:
         eval_task = args_cli.online_eval_task or infer_eval_task(args_cli.task)
-        eval_env_cfg = parse_env_cfg(
-            eval_task,
-            device=args_cli.device,
-            num_envs=args_cli.online_eval_num_envs,
-            use_fabric=not args_cli.disable_fabric,
-        )
-        eval_env_cfg.seed = args_cli.seed + 10000
-        apply_fixed_velocity_command(eval_env_cfg)
-        eval_env = gym.make(eval_task, cfg=eval_env_cfg)
-        eval_obs_sample, _ = eval_env.reset()
-        eval_obs_dim = flatten_obs(eval_obs_sample, device).shape[-1]
-        if eval_obs_dim != obs_dim:
-            raise ValueError(f"Eval obs_dim={eval_obs_dim} does not match train obs_dim={obs_dim}.")
-        eval_action_shape = eval_env.action_space.shape
-        eval_action_dim = int(eval_action_shape[-1]) if len(eval_action_shape) > 0 else int(np.prod(eval_action_shape))
-        eval_action_low, eval_action_high, eval_action_bounds_finite = get_action_bounds(
-            eval_env.action_space,
-            device,
-            eval_action_dim,
-        )
-        if eval_action_dim != action_dim:
-            raise ValueError(f"Eval action_dim={eval_action_dim} does not match train action_dim={action_dim}.")
+        if args_cli.online_eval_separate_env:
+            print(
+                "[MBRL] Creating separate online eval env "
+                f"task={eval_task} num_envs={args_cli.online_eval_num_envs}",
+                flush=True,
+            )
+            eval_env_cfg = parse_env_cfg(
+                eval_task,
+                device=args_cli.device,
+                num_envs=args_cli.online_eval_num_envs,
+                use_fabric=not args_cli.disable_fabric,
+            )
+            eval_env_cfg.seed = args_cli.seed + 10000
+            apply_fixed_velocity_command(eval_env_cfg)
+            eval_env = gym.make(eval_task, cfg=eval_env_cfg)
+            eval_obs_sample, _ = eval_env.reset()
+            eval_obs_dim = flatten_obs(eval_obs_sample, device).shape[-1]
+            if eval_obs_dim != obs_dim:
+                raise ValueError(f"Eval obs_dim={eval_obs_dim} does not match train obs_dim={obs_dim}.")
+            eval_action_shape = eval_env.action_space.shape
+            eval_action_dim = int(eval_action_shape[-1]) if len(eval_action_shape) > 0 else int(np.prod(eval_action_shape))
+            eval_action_low, eval_action_high, eval_action_bounds_finite = get_action_bounds(
+                eval_env.action_space,
+                device,
+                eval_action_dim,
+            )
+            if eval_action_dim != action_dim:
+                raise ValueError(f"Eval action_dim={eval_action_dim} does not match train action_dim={action_dim}.")
+        else:
+            print(
+                "[MBRL] Online eval will reuse the training env to avoid constructing a second Isaac env.",
+                flush=True,
+            )
+            eval_env = env
+            eval_action_low = action_low
+            eval_action_high = action_high
+            eval_action_bounds_finite = action_bounds_finite
         eval_planner = build_planner(
             planner_name=args_cli.planner,
             model=model,
@@ -823,9 +842,21 @@ def main() -> None:
         )
         print(
             "[MBRL] Online eval enabled: "
-            f"task={eval_task} num_envs={args_cli.online_eval_num_envs} "
-            f"episodes={args_cli.online_eval_episodes} interval={args_cli.online_eval_interval}"
+            f"task={eval_task} separate_env={int(args_cli.online_eval_separate_env)} "
+            f"episodes={args_cli.online_eval_episodes} interval={args_cli.online_eval_interval}",
+            flush=True,
         )
+    print(
+        "[MBRL] Training loop starting "
+        f"log_dir={log_dir} "
+        f"task={args_cli.task} num_envs={num_envs} "
+        f"train_steps={args_cli.train_steps} "
+        f"eval_interval={args_cli.eval_interval} "
+        f"save_interval={args_cli.save_interval} "
+        f"online_eval={'on' if args_cli.online_eval else 'off'} "
+        f"planner_start={args_cli.planner_start_steps if args_cli.planner_start_steps is not None else args_cli.seed_steps}",
+        flush=True,
+    )
 
     train_state = TrainState()
     episode_returns = torch.zeros(num_envs, dtype=torch.float32, device=device)
@@ -1022,6 +1053,13 @@ def main() -> None:
                 and train_state.env_steps >= next_online_eval_step
             )
             if eval_due:
+                print(
+                    "[EVAL] Starting held-out eval "
+                    f"step={train_state.env_steps} "
+                    f"episodes={args_cli.online_eval_episodes} "
+                    f"max_steps={args_cli.online_eval_max_steps}",
+                    flush=True,
+                )
                 model.eval()
                 latest_eval_metrics = run_heldout_eval(
                     env=eval_env,
@@ -1030,6 +1068,13 @@ def main() -> None:
                     num_episodes=args_cli.online_eval_episodes,
                     max_steps=args_cli.online_eval_max_steps,
                 )
+                if eval_env is env:
+                    obs_raw, _ = env.reset()
+                    obs = flatten_obs(obs_raw, device)
+                    episode_returns.zero_()
+                    episode_lengths.zero_()
+                    planner.reset()
+                    planner_was_active = False
                 while next_online_eval_step is not None and next_online_eval_step <= train_state.env_steps:
                     next_online_eval_step += args_cli.online_eval_interval
             else:
@@ -1112,7 +1157,8 @@ def main() -> None:
                 f"track_yaw={tracking_metrics['tracking_yaw_abs_error']:.3f} "
                 f"loss={latest_losses['loss']:.4f} "
                 f"elapsed={format_duration(elapsed_s)} "
-                f"eta={format_duration(eta_s)}"
+                f"eta={format_duration(eta_s)}",
+                flush=True,
             )
             if latest_eval_metrics["eval_ran"]:
                 print(
@@ -1124,7 +1170,8 @@ def main() -> None:
                     f"len={latest_eval_metrics['eval_mean_length']:.2f} "
                     f"term_rate={latest_eval_metrics['eval_termination_rate']:.2f} "
                     f"track_x={latest_eval_metrics['eval_tracking_x_abs_error']:.3f} "
-                    f"track_yaw={latest_eval_metrics['eval_tracking_yaw_abs_error']:.3f}"
+                    f"track_yaw={latest_eval_metrics['eval_tracking_yaw_abs_error']:.3f}",
+                    flush=True,
                 )
 
             if args_cli.save_best_metric == "eval_return":
@@ -1185,7 +1232,7 @@ def main() -> None:
                             f"{args_cli.early_stop_metric} plateaued for {no_improvement_steps} steps "
                             f"(best={early_stop_best_metric:.3f} at step {early_stop_best_step})"
                         )
-                    print(f"[MBRL] Early stopping: {early_stop_reason}")
+                    print(f"[MBRL] Early stopping: {early_stop_reason}", flush=True)
                     break
 
         if train_state.env_steps % args_cli.save_interval == 0:
@@ -1201,7 +1248,7 @@ def main() -> None:
             f.write(f"reason: {early_stop_reason}\n")
             f.write(f"checkpoint: {final_path}\n")
     writer.close()
-    if eval_env is not None:
+    if eval_env is not None and eval_env is not env:
         eval_env.close()
     env.close()
     if wandb_run is not None:
@@ -1216,7 +1263,7 @@ def main() -> None:
                     ),
                 )
             except Exception as exc:
-                print(f"[MBRL] Failed to send W&B completion alert: {exc}")
+                print(f"[MBRL] Failed to send W&B completion alert: {exc}", flush=True)
         wandb_run.finish()
 
 
