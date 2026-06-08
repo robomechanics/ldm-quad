@@ -224,6 +224,11 @@ parser.add_argument("--online_eval_num_envs", type=int, default=16, help="Number
 parser.add_argument("--online_eval_episodes", type=int, default=16, help="Completed held-out episodes per eval pass.")
 parser.add_argument("--online_eval_max_steps", type=int, default=4000, help="Maximum held-out eval environment steps per eval pass.")
 parser.add_argument("--online_eval_task", type=str, default=None, help="Optional held-out eval task. Defaults to the training task.")
+parser.add_argument("--online_eval_candidates", type=int, default=64, help="Planner candidates used only for online eval.")
+parser.add_argument("--online_eval_elites", type=int, default=8, help="Planner elites used only for online eval.")
+parser.add_argument("--online_eval_iterations", type=int, default=2, help="Planner iterations used only for online eval.")
+parser.add_argument("--online_eval_num_pi_trajs", type=int, default=1, help="Policy trajectories used only for online eval.")
+parser.add_argument("--online_eval_progress_interval", type=int, default=100, help="Eval steps between progress prints. Set <=0 to disable.")
 parser.add_argument(
     "--online_eval_separate_env",
     action=argparse.BooleanOptionalAction,
@@ -559,6 +564,7 @@ def run_heldout_eval(
     device: torch.device,
     num_episodes: int,
     max_steps: int,
+    progress_interval: int = 0,
 ) -> dict[str, float]:
     obs_raw, _ = env.reset()
     obs = flatten_obs(obs_raw, device)
@@ -605,6 +611,13 @@ def run_heldout_eval(
 
         obs = next_obs
         steps += 1
+        if progress_interval > 0 and steps % progress_interval == 0:
+            print(
+                "[EVAL] progress "
+                f"steps={steps}/{max_steps} "
+                f"completed={min(len(completed_returns), num_episodes)}/{num_episodes}",
+                flush=True,
+            )
 
     eval_returns = completed_returns[:num_episodes]
     eval_lengths = completed_lengths[:num_episodes]
@@ -807,15 +820,15 @@ def main() -> None:
             action_low=eval_action_low,
             action_high=eval_action_high,
             horizon=args_cli.horizon,
-            candidates=args_cli.candidates,
-            elites=args_cli.elites,
-            iterations=args_cli.planner_iterations,
+            candidates=args_cli.online_eval_candidates,
+            elites=min(args_cli.online_eval_elites, args_cli.online_eval_candidates),
+            iterations=args_cli.online_eval_iterations,
             discount=args_cli.discount,
             temperature=args_cli.planner_temperature,
             lambda_=args_cli.mppi_lambda,
             min_std=args_cli.min_std,
             max_std=args_cli.max_std,
-            num_pi_trajs=args_cli.num_pi_trajs,
+            num_pi_trajs=min(args_cli.online_eval_num_pi_trajs, args_cli.online_eval_candidates),
             action_spline_knots=args_cli.action_spline_knots,
             action_prior=action_prior,
             prior_residual_scale=args_cli.prior_residual_scale,
@@ -843,7 +856,8 @@ def main() -> None:
         print(
             "[MBRL] Online eval enabled: "
             f"task={eval_task} separate_env={int(args_cli.online_eval_separate_env)} "
-            f"episodes={args_cli.online_eval_episodes} interval={args_cli.online_eval_interval}",
+            f"episodes={args_cli.online_eval_episodes} interval={args_cli.online_eval_interval} "
+            f"candidates={args_cli.online_eval_candidates} iterations={args_cli.online_eval_iterations}",
             flush=True,
         )
     print(
@@ -1067,6 +1081,7 @@ def main() -> None:
                     device=device,
                     num_episodes=args_cli.online_eval_episodes,
                     max_steps=args_cli.online_eval_max_steps,
+                    progress_interval=args_cli.online_eval_progress_interval,
                 )
                 if eval_env is env:
                     obs_raw, _ = env.reset()
