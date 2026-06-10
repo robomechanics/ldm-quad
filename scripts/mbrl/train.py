@@ -220,9 +220,17 @@ parser.add_argument(
     help="Run held-out evaluation episodes during training without adding them to replay.",
 )
 parser.add_argument("--online_eval_interval", type=int, default=5000, help="Environment steps between held-out eval passes.")
+parser.add_argument("--online_eval_min_steps", type=int, default=None, help="Earliest env step for online eval. Defaults to one eval interval after planner starts.")
+parser.add_argument(
+    "--online_eval_requires_planner",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Only run online eval after the learned planner is active.",
+)
 parser.add_argument("--online_eval_num_envs", type=int, default=16, help="Number of held-out eval environments.")
 parser.add_argument("--online_eval_episodes", type=int, default=16, help="Completed held-out episodes per eval pass.")
 parser.add_argument("--online_eval_max_steps", type=int, default=4000, help="Maximum held-out eval environment steps per eval pass.")
+parser.add_argument("--online_eval_max_seconds", type=float, default=300.0, help="Wall-clock seconds allowed per online eval pass. Set <=0 to disable.")
 parser.add_argument("--online_eval_task", type=str, default=None, help="Optional held-out eval task. Defaults to the training task.")
 parser.add_argument("--online_eval_candidates", type=int, default=64, help="Planner candidates used only for online eval.")
 parser.add_argument("--online_eval_elites", type=int, default=8, help="Planner elites used only for online eval.")
@@ -565,6 +573,7 @@ def run_heldout_eval(
     num_episodes: int,
     max_steps: int,
     progress_interval: int = 0,
+    max_seconds: float = 0.0,
 ) -> dict[str, float]:
     obs_raw, _ = env.reset()
     obs = flatten_obs(obs_raw, device)
@@ -580,7 +589,21 @@ def run_heldout_eval(
     tracking_error_count = 0
 
     steps = 0
+    eval_start_time = time.monotonic()
     while steps < max_steps and len(completed_returns) < num_episodes:
+        if max_seconds > 0.0 and time.monotonic() - eval_start_time >= max_seconds:
+            print(
+                "[EVAL] stopping early due to wall-clock budget "
+                f"seconds={max_seconds:.1f} steps={steps} completed={len(completed_returns)}/{num_episodes}",
+                flush=True,
+            )
+            break
+        if steps == 0 or (progress_interval > 0 and steps % progress_interval == 0):
+            print(
+                "[EVAL] planning "
+                f"step={steps}/{max_steps} completed={min(len(completed_returns), num_episodes)}/{num_episodes}",
+                flush=True,
+            )
         actions = planner.plan(obs, eval_mode=True, t0=steps == 0)
         next_obs_raw, rewards, terminated, truncated, _ = env.step(actions)
         next_obs = flatten_obs(next_obs_raw, device)
@@ -928,11 +951,25 @@ def main() -> None:
     planner_was_active = False
     best_checkpoint_metric = float("-inf")
     latest_eval_metrics = zero_eval_metrics()
-    next_online_eval_step = args_cli.online_eval_interval if args_cli.online_eval else None
+    online_eval_min_steps = (
+        args_cli.online_eval_min_steps
+        if args_cli.online_eval_min_steps is not None
+        else planner_start_steps + args_cli.online_eval_interval
+    )
+    next_online_eval_step = online_eval_min_steps if args_cli.online_eval else None
 
     with open(os.path.join(log_dir, "config.txt"), "w", encoding="utf-8") as f:
         for key, value in sorted(vars(args_cli).items()):
             f.write(f"{key}: {value}\n")
+        f.write(f"resolved_online_eval_min_steps: {online_eval_min_steps}\n")
+    if args_cli.online_eval:
+        print(
+            "[MBRL] Online eval schedule "
+            f"first_step={online_eval_min_steps} interval={args_cli.online_eval_interval} "
+            f"requires_planner={int(args_cli.online_eval_requires_planner)} "
+            f"max_seconds={args_cli.online_eval_max_seconds}",
+            flush=True,
+        )
 
     def app_is_running() -> bool:
         return simulation_app is None or simulation_app.is_running()
@@ -1065,6 +1102,7 @@ def main() -> None:
                 and args_cli.online_eval_interval > 0
                 and next_online_eval_step is not None
                 and train_state.env_steps >= next_online_eval_step
+                and (planner_active or not args_cli.online_eval_requires_planner)
             )
             if eval_due:
                 print(
@@ -1082,6 +1120,7 @@ def main() -> None:
                     num_episodes=args_cli.online_eval_episodes,
                     max_steps=args_cli.online_eval_max_steps,
                     progress_interval=args_cli.online_eval_progress_interval,
+                    max_seconds=args_cli.online_eval_max_seconds,
                 )
                 if eval_env is env:
                     obs_raw, _ = env.reset()
