@@ -64,9 +64,9 @@ parser.add_argument("--batch_size", type=int, default=4096, help="Replay batch s
 parser.add_argument(
     "--model_type",
     type=str,
-    default="latent",
-    choices=["latent", "dynamics"],
-    help="Use a TD-MPC-style latent world model or the legacy observation-delta dynamics ensemble.",
+    default="state",
+    choices=["latent", "state", "dynamics"],
+    help="Use a TD-MPC-style latent model, enhanced state-space world model, or simple observation-delta ensemble.",
 )
 parser.add_argument("--latent_dim", type=int, default=128, help="Latent dimension for --model_type latent.")
 parser.add_argument("--num_q", type=int, default=5, help="Number of Q heads for --model_type latent.")
@@ -85,14 +85,27 @@ parser.add_argument("--simnorm_dim", type=int, default=8, help="SimNorm group si
 parser.add_argument("--hidden_dim", type=int, default=512, help="Model hidden dimension.")
 parser.add_argument("--model_depth", type=int, default=3, help="Number of hidden layers per ensemble member.")
 parser.add_argument("--ensemble_size", type=int, default=5, help="Number of dynamics models in the ensemble.")
+parser.add_argument("--state_value_coef", type=float, default=0.1, help="Value loss coefficient for --model_type state.")
+parser.add_argument(
+    "--state_terminal_value",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Add learned terminal state value to non-latent planner rollouts when --model_type state.",
+)
+parser.add_argument(
+    "--state_disagreement_penalty",
+    type=float,
+    default=0.0,
+    help="Penalty on ensemble disagreement during --model_type state planning.",
+)
 parser.add_argument("--planner", type=str, default="mppi", choices=["cem", "mppi"], help="Sampling-based planner.")
 parser.add_argument("--horizon", type=int, default=3, help="Planning/model rollout horizon in environment steps.")
 parser.add_argument("--candidates", type=int, default=512, help="Candidate action sequences for planning.")
 parser.add_argument("--elites", type=int, default=64, help="Elite sequences kept each CEM iteration.")
-parser.add_argument("--num_pi_trajs", type=int, default=24, help="TD-MPC2-style learned-policy trajectories injected into latent planning.")
+parser.add_argument("--num_pi_trajs", type=int, default=24, help="Learned-policy trajectories injected into state/latent planning.")
 parser.add_argument("--planner_iterations", type=int, default=6, help="Planner refinement iterations.")
 parser.add_argument("--discount", type=float, default=0.99, help="Planning discount factor.")
-parser.add_argument("--planner_temperature", type=float, default=0.5, help="Planner temperature for latent elite weighting / legacy exploration.")
+parser.add_argument("--planner_temperature", type=float, default=0.5, help="Planner temperature for elite weighting / exploration.")
 parser.add_argument("--mppi_lambda", type=float, default=1.0, help="MPPI reward temperature.")
 parser.add_argument("--min_std", type=float, default=0.05, help="Minimum latent planner action distribution std.")
 parser.add_argument("--max_std", type=float, default=2.0, help="Maximum latent planner action distribution std.")
@@ -324,7 +337,15 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
 import ldm_quad.tasks  # noqa: F401
-from ldm_quad.mbrl import DynamicsEnsemble, LatentWorldModel, ReplayBuffer, WorldModelLossWeights, build_planner, load_policy_prior
+from ldm_quad.mbrl import (
+    DynamicsEnsemble,
+    LatentWorldModel,
+    ReplayBuffer,
+    StateWorldModel,
+    WorldModelLossWeights,
+    build_planner,
+    load_policy_prior,
+)
 
 
 @dataclass
@@ -746,6 +767,26 @@ def main() -> None:
             lr=args_cli.lr,
         )
         policy_optimizer = torch.optim.Adam(model.policy_parameters(), lr=args_cli.policy_lr, eps=1e-5)
+    elif args_cli.model_type == "state":
+        model = StateWorldModel(
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            ensemble_size=args_cli.ensemble_size,
+            hidden_dim=args_cli.hidden_dim,
+            depth=args_cli.model_depth,
+            discount=args_cli.discount,
+            tau=args_cli.target_tau,
+            rho=args_cli.rho,
+            entropy_coef=args_cli.entropy_coef,
+            num_bins=args_cli.num_bins,
+            vmin=args_cli.vmin,
+            vmax=args_cli.vmax,
+            value_coef=args_cli.state_value_coef,
+            reward_coef=args_cli.reward_coef,
+            continue_coef=args_cli.continue_coef,
+        ).to(device)
+        optimizer = torch.optim.Adam(model.model_parameters(), lr=args_cli.lr)
+        policy_optimizer = torch.optim.Adam(model.policy_parameters(), lr=args_cli.policy_lr, eps=1e-5)
     else:
         model = DynamicsEnsemble(
             obs_dim=obs_dim,
@@ -795,6 +836,9 @@ def main() -> None:
         planner_velocity_target_y=args_cli.planner_velocity_target_y,
         planner_velocity_target_yaw=args_cli.planner_velocity_target_yaw,
         use_best_candidate=args_cli.planner_use_best_candidate,
+        terminal_value=args_cli.model_type == "state" and args_cli.state_terminal_value,
+        disagreement_penalty=args_cli.state_disagreement_penalty if args_cli.model_type == "state" else 0.0,
+        model_policy_candidate_count=args_cli.num_pi_trajs if args_cli.model_type == "state" else 0,
     )
     eval_env = None
     eval_planner = None
@@ -875,6 +919,13 @@ def main() -> None:
             planner_velocity_target_y=args_cli.planner_velocity_target_y,
             planner_velocity_target_yaw=args_cli.planner_velocity_target_yaw,
             use_best_candidate=args_cli.planner_use_best_candidate,
+            terminal_value=args_cli.model_type == "state" and args_cli.state_terminal_value,
+            disagreement_penalty=args_cli.state_disagreement_penalty if args_cli.model_type == "state" else 0.0,
+            model_policy_candidate_count=(
+                min(args_cli.online_eval_num_pi_trajs, args_cli.online_eval_candidates)
+                if args_cli.model_type == "state"
+                else 0
+            ),
         )
         print(
             "[MBRL] Online eval enabled: "
@@ -915,6 +966,18 @@ def main() -> None:
             "policy_scaled_entropy": 0.0,
             "policy_q_scale": 1.0,
         }
+    elif args_cli.model_type == "state":
+        latest_losses = {
+            "loss": 0.0,
+            "delta_loss": 0.0,
+            "reward_loss": 0.0,
+            "continue_loss": 0.0,
+            "value_loss": 0.0,
+            "value_mean": 0.0,
+            "policy_loss": 0.0,
+            "policy_value": 0.0,
+            "policy_entropy": 0.0,
+        }
     else:
         latest_losses = {"loss": 0.0, "delta_loss": 0.0, "reward_loss": 0.0, "continue_loss": 0.0}
     latest_planner_diagnostics = {
@@ -922,6 +985,7 @@ def main() -> None:
         "planner_candidate_return_best": 0.0,
         "planner_candidate_return_std": 0.0,
         "planner_prior_candidate_fraction": 0.0,
+        "planner_model_policy_candidate_fraction": 0.0,
         "planner_prior_command_candidate_fraction": 0.0,
         "planner_full_action_mode": 0.0,
         "planner_best_candidate_mode": 0.0,
@@ -981,7 +1045,7 @@ def main() -> None:
             prior_policy_available = action_prior is not None and args_cli.seed_with_prior
             replay_ready = (
                 replay.can_sample_sequences(args_cli.batch_size, args_cli.horizon)
-                if args_cli.model_type == "latent"
+                if args_cli.model_type in {"latent", "state"}
                 else len(replay) >= args_cli.batch_size
             )
             planner_ready = (
@@ -1052,29 +1116,38 @@ def main() -> None:
 
         train_ready = (
             replay.can_sample_sequences(args_cli.batch_size, args_cli.horizon)
-            if args_cli.model_type == "latent"
+            if args_cli.model_type in {"latent", "state"}
             else len(replay) >= args_cli.batch_size
         )
         if train_ready:
             model.train()
             for _ in range(args_cli.updates_per_step):
-                if args_cli.model_type == "latent":
+                if args_cli.model_type in {"latent", "state"}:
                     batch = replay.sample_sequences(args_cli.batch_size, args_cli.horizon, device=device)
-                    loss, metrics, rollout_zs = model.loss(batch)
+                    loss, metrics, rollout_states = model.loss(batch)
                 else:
                     batch = replay.sample(args_cli.batch_size, device=device)
                     loss, metrics = model.loss(batch)
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                model_params = model.model_parameters() if hasattr(model, "model_parameters") else model.parameters()
                 torch.nn.utils.clip_grad_norm_(
-                    model.model_parameters() if args_cli.model_type == "latent" else model.parameters(),
+                    model_params,
                     args_cli.grad_clip_norm,
                 )
                 optimizer.step()
                 if args_cli.model_type == "latent":
                     assert policy_optimizer is not None
                     model.sync_detached_qs()
-                    policy_loss, policy_metrics = model.policy_loss(rollout_zs)
+                    policy_loss, policy_metrics = model.policy_loss(rollout_states)
+                    policy_optimizer.zero_grad(set_to_none=True)
+                    policy_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.policy_parameters(), args_cli.grad_clip_norm)
+                    policy_optimizer.step()
+                    metrics.update(policy_metrics)
+                elif args_cli.model_type == "state":
+                    assert policy_optimizer is not None
+                    policy_loss, policy_metrics = model.policy_loss(rollout_states)
                     policy_optimizer.zero_grad(set_to_none=True)
                     policy_loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.policy_parameters(), args_cli.grad_clip_norm)
@@ -1148,7 +1221,9 @@ def main() -> None:
                 "gradient_updates": train_state.gradient_updates,
                 "episodes_finished": train_state.episodes_finished,
                 "buffer_size": len(replay),
-                "valid_sequence_count": replay.valid_sequence_count(args_cli.horizon) if args_cli.model_type == "latent" else 0,
+                "valid_sequence_count": (
+                    replay.valid_sequence_count(args_cli.horizon) if args_cli.model_type in {"latent", "state"} else 0
+                ),
                 "mean_return_100": mean_return,
                 "mean_length_100": mean_length,
                 "mean_step_reward_100": mean_step_reward_100,
@@ -1176,7 +1251,7 @@ def main() -> None:
             writer.add_scalar("Episode / current_episode_length_mean", current_length_mean, train_state.env_steps)
             writer.add_scalar("Train / gradient_updates", train_state.gradient_updates, train_state.env_steps)
             writer.add_scalar("Train / buffer_size", len(replay), train_state.env_steps)
-            if args_cli.model_type == "latent":
+            if args_cli.model_type in {"latent", "state"}:
                 writer.add_scalar("Train / valid_sequence_count", row["valid_sequence_count"], train_state.env_steps)
             writer.add_scalar("Train / episodes_finished", train_state.episodes_finished, train_state.env_steps)
             writer.add_scalar("Train / planner_active", int(planner_active), train_state.env_steps)

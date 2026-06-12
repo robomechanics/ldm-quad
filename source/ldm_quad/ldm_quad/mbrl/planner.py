@@ -4,7 +4,7 @@ from collections.abc import Callable
 
 import torch
 
-from .models import DynamicsEnsemble
+from .models import DynamicsEnsemble, StateWorldModel
 from .world_model import LatentWorldModel
 
 
@@ -39,6 +39,9 @@ class TrajectoryPlanner:
         planner_velocity_target_y: float = 0.0,
         planner_velocity_target_yaw: float = 0.0,
         use_best_candidate: bool = False,
+        terminal_value: bool = False,
+        disagreement_penalty: float = 0.0,
+        model_policy_candidate_count: int = 0,
     ):
         self.model = model
         self.action_low = action_low
@@ -69,6 +72,9 @@ class TrajectoryPlanner:
         self.planner_velocity_target_y = planner_velocity_target_y
         self.planner_velocity_target_yaw = planner_velocity_target_yaw
         self.use_best_candidate = use_best_candidate
+        self.terminal_value = terminal_value
+        self.disagreement_penalty = disagreement_penalty
+        self.model_policy_candidate_count = max(0, int(model_policy_candidate_count))
         self._prev_mean: torch.Tensor | None = None
         self.last_diagnostics: dict[str, float] = {}
 
@@ -173,6 +179,14 @@ class TrajectoryPlanner:
         fraction = min(max(float(self.prior_candidate_fraction), 0.0), 1.0)
         return min(num_candidates, max(1, int(round(fraction * num_candidates))))
 
+    def _model_policy_candidate_count(self, num_candidates: int) -> int:
+        if num_candidates <= 0 or self.model_policy_candidate_count <= 0 or not hasattr(self.model, "pi"):
+            return 0
+        if self.action_prior is not None and not self._uses_full_action_prior:
+            return 0
+        prior_count = self._prior_candidate_count(num_candidates)
+        return min(max(num_candidates - prior_count, 0), self.model_policy_candidate_count)
+
     def _prior_command_candidate_count(self, num_candidates: int) -> int:
         if not self._uses_full_action_prior or num_candidates <= 1:
             return 0
@@ -231,6 +245,17 @@ class TrajectoryPlanner:
             return self._sample_actions_at_knots(prior_actions)
         return prior_actions
 
+    def _rollout_model_policy_actions(self, obs: torch.Tensor, candidate_count: int) -> torch.Tensor:
+        leading_shape = (obs.shape[0], candidate_count)
+        states = obs.unsqueeze(1).expand(-1, candidate_count, -1).reshape(-1, obs.shape[-1])
+        actions = []
+        for _ in range(self.horizon):
+            action = self._clip_actions(self.model.pi(states, deterministic=False))
+            actions.append(action.view(*leading_shape, self.action_dim))
+            preds = self.model.predict(states, action)
+            states = states + preds.delta_obs
+        return torch.stack(actions, dim=2)
+
     def _prior_baseline_controls(self, obs: torch.Tensor) -> torch.Tensor:
         if self._uses_full_action_prior:
             return self._prior_control_mean(obs)
@@ -240,9 +265,11 @@ class TrajectoryPlanner:
         """Reserve initial candidates for pure or near-prior closed-loop rollouts."""
         count = self._prior_candidate_count(controls.shape[1])
         if count == 0:
-            return controls
+            policy_start = 0
+        else:
+            policy_start = count
 
-        if self._uses_full_action_prior:
+        if count > 0 and self._uses_full_action_prior:
             prior_controls = self._prior_control_mean(obs)
             controls[:, :count, :, :] = prior_controls.unsqueeze(1)
             command_count = self._prior_command_candidate_count(controls.shape[1])
@@ -254,7 +281,7 @@ class TrajectoryPlanner:
                 else:
                     command_prior_controls = command_prior_actions
                 controls[:, 1 : 1 + command_count, :, :] = command_prior_controls
-        else:
+        elif count > 0:
             controls[:, :count, :, :] = 0.0
 
         noise_scale = max(float(self.prior_candidate_noise), 0.0)
@@ -268,6 +295,12 @@ class TrajectoryPlanner:
                 )
             else:
                 controls[:, noise_start:count, :, :] = self._clip_controls(prior_noise)
+
+        policy_count = self._model_policy_candidate_count(controls.shape[1])
+        if policy_count > 0:
+            policy_actions = self._rollout_model_policy_actions(obs, policy_count)
+            policy_controls = self._sample_actions_at_knots(policy_actions) if self.action_spline_knots else policy_actions
+            controls[:, policy_start : policy_start + policy_count, :, :] = policy_controls
         return controls
 
     def _actions_from_controls(self, states: torch.Tensor, controls_t: torch.Tensor) -> torch.Tensor:
@@ -335,6 +368,9 @@ class TrajectoryPlanner:
             "planner_residual_abs_mean": float(first_delta.abs().mean().item()),
             "planner_selected_prior_fraction": float((residual_norm <= 1e-6).float().mean().item()),
             "planner_prior_candidate_fraction": float(self._prior_candidate_count(self.candidates) / max(self.candidates, 1)),
+            "planner_model_policy_candidate_fraction": float(
+                self._model_policy_candidate_count(self.candidates) / max(self.candidates, 1)
+            ),
             "planner_prior_command_candidate_fraction": float(
                 self._prior_command_candidate_count(self.candidates) / max(self.candidates, 1)
             ),
@@ -416,6 +452,8 @@ class TrajectoryPlanner:
             preds = self.model.predict(states, actions_t)
             reward = preds.rewards.squeeze(-1)
             reward = reward + self._planner_velocity_objective_reward(states)
+            if self.disagreement_penalty > 0.0 and hasattr(self.model, "disagreement"):
+                reward = reward - self.disagreement_penalty * self.model.disagreement(states, actions_t)
             if self.action_prior is not None and self.prior_residual_penalty > 0.0:
                 if self._uses_full_action_prior:
                     prior_actions = self._clip_actions(self.action_prior(states))
@@ -428,6 +466,9 @@ class TrajectoryPlanner:
             alive = alive * continue_prob
             discounts = discounts * self.discount
             states = states + preds.delta_obs
+
+        if self.terminal_value and hasattr(self.model, "value"):
+            returns = returns + discounts * alive * self.model.value(states).squeeze(-1)
 
         return returns.view(batch_size, candidates)
 
@@ -465,6 +506,9 @@ class CEMPlanner(TrajectoryPlanner):
         planner_velocity_target_y: float = 0.0,
         planner_velocity_target_yaw: float = 0.0,
         use_best_candidate: bool = False,
+        terminal_value: bool = False,
+        disagreement_penalty: float = 0.0,
+        model_policy_candidate_count: int = 0,
     ):
         super().__init__(
             model=model,
@@ -493,6 +537,9 @@ class CEMPlanner(TrajectoryPlanner):
             planner_velocity_target_y=planner_velocity_target_y,
             planner_velocity_target_yaw=planner_velocity_target_yaw,
             use_best_candidate=use_best_candidate,
+            terminal_value=terminal_value,
+            disagreement_penalty=disagreement_penalty,
+            model_policy_candidate_count=model_policy_candidate_count,
         )
         self.elites = elites
         self.iterations = iterations
@@ -559,6 +606,9 @@ class MPPIPlanner(TrajectoryPlanner):
         planner_velocity_target_y: float = 0.0,
         planner_velocity_target_yaw: float = 0.0,
         use_best_candidate: bool = False,
+        terminal_value: bool = False,
+        disagreement_penalty: float = 0.0,
+        model_policy_candidate_count: int = 0,
     ):
         super().__init__(
             model=model,
@@ -587,6 +637,9 @@ class MPPIPlanner(TrajectoryPlanner):
             planner_velocity_target_y=planner_velocity_target_y,
             planner_velocity_target_yaw=planner_velocity_target_yaw,
             use_best_candidate=use_best_candidate,
+            terminal_value=terminal_value,
+            disagreement_penalty=disagreement_penalty,
+            model_policy_candidate_count=model_policy_candidate_count,
         )
         self.iterations = iterations
         self.lambda_ = lambda_
@@ -924,7 +977,7 @@ class LatentMPPIPlanner:
 
 def build_planner(
     planner_name: str,
-    model: DynamicsEnsemble | LatentWorldModel,
+    model: DynamicsEnsemble | StateWorldModel | LatentWorldModel,
     action_low: torch.Tensor,
     action_high: torch.Tensor,
     horizon: int,
@@ -960,6 +1013,9 @@ def build_planner(
     planner_velocity_target_y: float = 0.0,
     planner_velocity_target_yaw: float = 0.0,
     use_best_candidate: bool = False,
+    terminal_value: bool = False,
+    disagreement_penalty: float = 0.0,
+    model_policy_candidate_count: int = 0,
 ) -> TrajectoryPlanner | LatentMPPIPlanner:
     if getattr(model, "is_latent_world_model", False):
         if planner_name != "mppi":
@@ -1019,6 +1075,9 @@ def build_planner(
             planner_velocity_target_y=planner_velocity_target_y,
             planner_velocity_target_yaw=planner_velocity_target_yaw,
             use_best_candidate=use_best_candidate,
+            terminal_value=terminal_value,
+            disagreement_penalty=disagreement_penalty,
+            model_policy_candidate_count=model_policy_candidate_count,
         )
     if planner_name == "cem":
         return CEMPlanner(
@@ -1050,5 +1109,8 @@ def build_planner(
             planner_velocity_target_y=planner_velocity_target_y,
             planner_velocity_target_yaw=planner_velocity_target_yaw,
             use_best_candidate=use_best_candidate,
+            terminal_value=terminal_value,
+            disagreement_penalty=disagreement_penalty,
+            model_policy_candidate_count=model_policy_candidate_count,
         )
     raise ValueError(f"Unsupported planner: {planner_name}")
