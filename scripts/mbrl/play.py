@@ -113,6 +113,22 @@ parser.add_argument(
     default=None,
     help="Override using the best evaluated candidate as the final MPPI plan.",
 )
+parser.add_argument("--num_pi_trajs", type=int, default=None, help="Override TD-MPC2-style policy trajectories in latent planning.")
+parser.add_argument("--min_std", type=float, default=None, help="Override minimum latent planner action std.")
+parser.add_argument("--max_std", type=float, default=None, help="Override maximum latent planner action std.")
+parser.add_argument(
+    "--planner_use_continue_model",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="Override using the learned continuation model during latent planning.",
+)
+parser.add_argument(
+    "--planner_hard_continue_model",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="Override using a hard learned continuation mask during latent planning.",
+)
+parser.add_argument("--planner_continue_threshold", type=float, default=None, help="Override hard continuation threshold.")
 parser.add_argument("--planner_velocity_objective_weight", type=float, default=None, help="Override planner-only velocity objective weight.")
 parser.add_argument("--planner_velocity_target_x", type=float, default=None, help="Override planner-only target body x velocity.")
 parser.add_argument("--planner_velocity_target_y", type=float, default=None, help="Override planner-only target body y velocity.")
@@ -149,7 +165,7 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
 import ldm_quad.tasks  # noqa: F401
-from ldm_quad.mbrl import DynamicsEnsemble, build_planner, load_policy_prior
+from ldm_quad.mbrl import DynamicsEnsemble, LatentWorldModel, build_planner, load_policy_prior
 
 
 def set_seed(seed: int) -> None:
@@ -298,14 +314,43 @@ def main() -> None:
     planner_name = checkpoint_args.get("planner", "mppi")
     planner = None
     if not args_cli.prior_only:
-        model = DynamicsEnsemble(
-            obs_dim=obs.shape[-1],
-            action_dim=action_dim,
-            ensemble_size=checkpoint_args["ensemble_size"],
-            hidden_dim=checkpoint_args["hidden_dim"],
-            depth=checkpoint_args["model_depth"],
-        ).to(device)
-        model.load_state_dict(checkpoint["model"])
+        if checkpoint_args.get("model_type", "dynamics") == "latent":
+            model = LatentWorldModel(
+                obs_dim=obs.shape[-1],
+                action_dim=action_dim,
+                latent_dim=checkpoint_args.get("latent_dim", 128),
+                hidden_dim=checkpoint_args["hidden_dim"],
+                depth=checkpoint_args["model_depth"],
+                num_q=checkpoint_args.get("num_q", 5),
+                discount=checkpoint_args["discount"],
+                tau=checkpoint_args.get("target_tau", 0.01),
+                rho=checkpoint_args.get("rho", 0.5),
+                entropy_coef=checkpoint_args.get("entropy_coef", 1e-4),
+                num_bins=checkpoint_args.get("num_bins", 101),
+                vmin=checkpoint_args.get("vmin", -10.0),
+                vmax=checkpoint_args.get("vmax", 10.0),
+                simnorm_dim=checkpoint_args.get("simnorm_dim", 8),
+                q_dropout=checkpoint_args.get("q_dropout", 0.01),
+            ).to(device)
+        else:
+            model = DynamicsEnsemble(
+                obs_dim=obs.shape[-1],
+                action_dim=action_dim,
+                ensemble_size=checkpoint_args["ensemble_size"],
+                hidden_dim=checkpoint_args["hidden_dim"],
+                depth=checkpoint_args["model_depth"],
+            ).to(device)
+        missing_keys, unexpected_keys = model.load_state_dict(checkpoint["model"], strict=False)
+        if hasattr(model, "sync_detached_qs"):
+            model.sync_detached_qs()
+        if missing_keys:
+            preview = ", ".join(missing_keys[:4])
+            suffix = "..." if len(missing_keys) > 4 else ""
+            print(f"[INFO] Checkpoint missing {len(missing_keys)} model keys initialized from current code: {preview}{suffix}")
+        if unexpected_keys:
+            preview = ", ".join(unexpected_keys[:4])
+            suffix = "..." if len(unexpected_keys) > 4 else ""
+            print(f"[INFO] Checkpoint has {len(unexpected_keys)} unused model keys: {preview}{suffix}")
         model.eval()
 
         planner = build_planner(
@@ -320,6 +365,27 @@ def main() -> None:
             discount=checkpoint_args["discount"],
             temperature=checkpoint_args.get("planner_temperature", 0.5),
             lambda_=checkpoint_args.get("mppi_lambda", 1.0),
+            min_std=args_cli.min_std if args_cli.min_std is not None else checkpoint_args.get("min_std", 0.05),
+            max_std=args_cli.max_std if args_cli.max_std is not None else checkpoint_args.get("max_std", 2.0),
+            num_pi_trajs=(
+                args_cli.num_pi_trajs if args_cli.num_pi_trajs is not None else checkpoint_args.get("num_pi_trajs", 24)
+            ),
+            action_noise=False,
+            use_continue_model=(
+                args_cli.planner_use_continue_model
+                if args_cli.planner_use_continue_model is not None
+                else checkpoint_args.get("planner_use_continue_model", False)
+            ),
+            hard_continue_model=(
+                args_cli.planner_hard_continue_model
+                if args_cli.planner_hard_continue_model is not None
+                else checkpoint_args.get("planner_hard_continue_model", False)
+            ),
+            continue_threshold=(
+                args_cli.planner_continue_threshold
+                if args_cli.planner_continue_threshold is not None
+                else checkpoint_args.get("planner_continue_threshold", 0.5)
+            ),
             action_spline_knots=checkpoint_args.get("action_spline_knots", 0),
             action_prior=action_prior,
             prior_residual_scale=(
@@ -443,7 +509,7 @@ def main() -> None:
                     raise RuntimeError("--prior_only requires a prior checkpoint in the MBRL checkpoint or --prior_checkpoint.")
                 actions = action_prior(obs)
             else:
-                actions = planner.plan(obs)
+                actions = planner.plan(obs, eval_mode=True, t0=steps == 0)
             if args_cli.debug_actions and steps % 100 == 0:
                 if obs.shape[-1] == 45:
                     command_obs = obs[:, 6:9]

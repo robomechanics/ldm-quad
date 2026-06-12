@@ -5,6 +5,7 @@ from collections.abc import Callable
 import torch
 
 from .models import DynamicsEnsemble
+from .world_model import LatentWorldModel
 
 
 class TrajectoryPlanner:
@@ -627,9 +628,303 @@ class MPPIPlanner(TrajectoryPlanner):
         return self._first_action_from_controls(obs, mean)
 
 
+class LatentMPPIPlanner:
+    """TD-MPC2-style planner over a latent world model."""
+
+    def __init__(
+        self,
+        model: LatentWorldModel,
+        action_low: torch.Tensor,
+        action_high: torch.Tensor,
+        horizon: int = 30,
+        candidates: int = 512,
+        elites: int = 64,
+        iterations: int = 5,
+        discount: float = 0.99,
+        temperature: float = 0.5,
+        lambda_: float = 1.0,
+        min_std: float = 0.05,
+        max_std: float = 2.0,
+        num_pi_trajs: int = 24,
+        action_spline_knots: int = 0,
+        action_prior: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        prior_candidate_fraction: float = 0.1,
+        prior_candidate_noise: float = 0.02,
+        action_bounds_finite: bool = True,
+        use_best_candidate: bool = False,
+        action_noise: bool = True,
+        use_continue_model: bool = False,
+        hard_continue_model: bool = False,
+        continue_threshold: float = 0.5,
+        **_: object,
+    ):
+        self.model = model
+        self.action_low = action_low
+        self.action_high = action_high
+        self.horizon = horizon
+        self.candidates = candidates
+        self.elites = min(max(1, elites), candidates)
+        self.iterations = iterations
+        self.discount = discount
+        self.temperature = temperature
+        self.lambda_ = lambda_
+        self.min_std = min_std
+        self.max_std = max(max_std, min_std)
+        self.num_pi_trajs = min(max(0, num_pi_trajs), candidates)
+        self.action_dim = action_low.numel()
+        self.action_spline_knots = action_spline_knots if 1 < action_spline_knots < horizon else 0
+        self.action_prior = action_prior
+        self.prior_candidate_fraction = prior_candidate_fraction
+        self.prior_candidate_noise = prior_candidate_noise
+        self.action_bounds_finite = action_bounds_finite
+        self.use_best_candidate = use_best_candidate
+        self.action_noise = action_noise
+        self.use_continue_model = use_continue_model
+        self.hard_continue_model = hard_continue_model
+        self.continue_threshold = continue_threshold
+        self._prev_mean: torch.Tensor | None = None
+        self.last_diagnostics: dict[str, float] = {}
+
+    @property
+    def control_horizon(self) -> int:
+        return self.action_spline_knots or self.horizon
+
+    def reset(self, done: torch.Tensor | None = None) -> None:
+        if self._prev_mean is None:
+            return
+        if done is None:
+            self._prev_mean = None
+            return
+        done = done.to(device=self._prev_mean.device, dtype=torch.bool).view(-1)
+        if done.numel() != self._prev_mean.shape[0]:
+            self._prev_mean = None
+            return
+        self._prev_mean[done] = 0.0
+
+    def _clip_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        if not self.action_bounds_finite:
+            return actions.clamp(-1.0, 1.0)
+        return torch.max(
+            torch.min(actions, self.action_high.view(*([1] * (actions.ndim - 1)), -1)),
+            self.action_low.view(*([1] * (actions.ndim - 1)), -1),
+        )
+
+    def _sample_actions_at_knots(self, action_sequences: torch.Tensor) -> torch.Tensor:
+        knot_positions = torch.linspace(0, self.horizon - 1, self.control_horizon, device=action_sequences.device)
+        knot_indices = knot_positions.round().long().clamp_(0, self.horizon - 1)
+        return action_sequences[..., knot_indices, :]
+
+    def _interpolate_action_spline(self, action_knots: torch.Tensor) -> torch.Tensor:
+        knot_count = action_knots.shape[-2]
+        if knot_count == self.horizon:
+            return action_knots
+
+        positions = torch.linspace(0, knot_count - 1, self.horizon, device=action_knots.device)
+        left = positions.floor().long().clamp_(0, knot_count - 1)
+        right = (left + 1).clamp_(0, knot_count - 1)
+        before = (left - 1).clamp_(0, knot_count - 1)
+        after = (right + 1).clamp_(0, knot_count - 1)
+        frac = (positions - left.to(positions.dtype)).view(*([1] * (action_knots.ndim - 2)), self.horizon, 1)
+
+        p0 = action_knots[..., before, :]
+        p1 = action_knots[..., left, :]
+        p2 = action_knots[..., right, :]
+        p3 = action_knots[..., after, :]
+        frac2 = frac.square()
+        frac3 = frac2 * frac
+        return 0.5 * (
+            (2.0 * p1)
+            + (-p0 + p2) * frac
+            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * frac2
+            + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * frac3
+        )
+
+    def _expand_controls(self, controls: torch.Tensor) -> torch.Tensor:
+        if not self.action_spline_knots:
+            return controls
+        return self._interpolate_action_spline(controls)
+
+    def _controls_from_actions(self, action_sequences: torch.Tensor) -> torch.Tensor:
+        if not self.action_spline_knots:
+            return action_sequences
+        return self._sample_actions_at_knots(action_sequences)
+
+    def _warm_start_mean(self, obs: torch.Tensor) -> torch.Tensor:
+        shape = (obs.shape[0], self.control_horizon, self.action_dim)
+        if self._prev_mean is None or self._prev_mean.shape != shape or self._prev_mean.device != obs.device:
+            return torch.zeros(shape, device=obs.device, dtype=obs.dtype)
+        shifted = torch.zeros_like(self._prev_mean)
+        if not self.action_spline_knots:
+            shifted[:, :-1] = self._prev_mean[:, 1:]
+            return shifted
+
+        previous_actions = self._expand_controls(self._prev_mean)
+        shifted_actions = torch.zeros((obs.shape[0], self.horizon, self.action_dim), device=obs.device, dtype=obs.dtype)
+        shifted_actions[:, :-1] = previous_actions[:, 1:]
+        return self._controls_from_actions(shifted_actions)
+
+    @torch.no_grad()
+    def _rollout_policy_actions(self, obs: torch.Tensor, deterministic: bool) -> torch.Tensor:
+        z = self.model.encode(obs)
+        actions = []
+        for _ in range(self.horizon):
+            action = self._clip_actions(self.model.pi(z, deterministic=deterministic))
+            actions.append(action)
+            z = self.model.next(z, action)
+        return torch.stack(actions, dim=1)
+
+    def _policy_candidate_controls(self, obs: torch.Tensor, z0: torch.Tensor | None = None) -> torch.Tensor:
+        controls = torch.empty(
+            (obs.shape[0], self.num_pi_trajs, self.control_horizon, self.action_dim),
+            device=obs.device,
+            dtype=obs.dtype,
+        )
+        if self.num_pi_trajs == 0:
+            return controls
+
+        next_index = 0
+
+        if self.action_prior is not None and next_index < self.num_pi_trajs:
+            external_prior = self._clip_actions(self.action_prior(obs))
+            external_actions = external_prior.unsqueeze(1).expand(-1, self.horizon, -1)
+            controls[:, next_index] = self._controls_from_actions(external_actions)
+            next_index += 1
+
+        stochastic_count = self.num_pi_trajs - next_index
+        if stochastic_count > 0:
+            z = self.model.encode(obs) if z0 is None else z0
+            z = z.unsqueeze(1).expand(-1, stochastic_count, -1).reshape(obs.shape[0] * stochastic_count, -1)
+            actions = []
+            for _ in range(self.horizon):
+                action = self._clip_actions(self.model.pi(z, deterministic=False))
+                actions.append(action.view(obs.shape[0], stochastic_count, self.action_dim))
+                z = self.model.next(z, action)
+            action_sequences = torch.stack(actions, dim=2)
+            controls[:, next_index:] = self._controls_from_actions(action_sequences)
+        return controls
+
+    def _elite_score_weights(self, elite_returns: torch.Tensor) -> torch.Tensor:
+        centered = elite_returns - elite_returns.max(dim=1, keepdim=True).values
+        weights = torch.softmax(float(self.temperature) * centered, dim=1)
+        return weights
+
+    @torch.no_grad()
+    def evaluate_sequences(
+        self,
+        obs: torch.Tensor,
+        action_sequences: torch.Tensor,
+        z0: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch_size, candidates, _, action_dim = action_sequences.shape
+        z = self.model.encode(obs) if z0 is None else z0
+        z = z.unsqueeze(1).expand(-1, candidates, -1).reshape(batch_size * candidates, -1)
+        returns = torch.zeros(batch_size * candidates, device=obs.device, dtype=obs.dtype)
+        discounts = torch.ones_like(returns)
+        alive = torch.ones_like(returns)
+
+        for t in range(self.horizon):
+            actions_t = action_sequences[:, :, t, :].reshape(batch_size * candidates, action_dim)
+            reward = self.model.reward(z, actions_t).squeeze(-1)
+            z = self.model.next(z, actions_t)
+            returns = returns + discounts * alive * reward
+            if self.use_continue_model:
+                continue_prob = self.model.continue_logits(z).sigmoid().squeeze(-1)
+                if self.hard_continue_model:
+                    alive = alive * (continue_prob > self.continue_threshold).to(alive.dtype)
+                else:
+                    alive = alive * continue_prob
+            discounts = discounts * self.discount
+
+        terminal_action = self.model.pi(z, deterministic=False)
+        terminal_value = self.model.Q(z, terminal_action, return_type="avg").squeeze(-1)
+        returns = returns + discounts * alive * terminal_value
+        return returns.view(batch_size, candidates)
+
+    def _record_diagnostics(self, returns: torch.Tensor, action: torch.Tensor) -> None:
+        returns = returns.detach()
+        self.last_diagnostics = {
+            "planner_candidate_return_mean": float(returns.mean().item()),
+            "planner_candidate_return_best": float(returns.max(dim=1).values.mean().item()),
+            "planner_candidate_return_std": float(returns.std(unbiased=False).item()),
+            "planner_prior_candidate_fraction": float(self.num_pi_trajs / self.candidates),
+            "planner_prior_command_candidate_fraction": 0.0,
+            "planner_full_action_mode": 1.0,
+            "planner_best_candidate_mode": float(self.use_best_candidate),
+            "planner_action_noise_mode": float(self.action_noise),
+            "planner_continue_model_mode": float(self.use_continue_model),
+            "planner_hard_continue_model_mode": float(self.hard_continue_model),
+            "planner_prior_action_norm_mean": 0.0,
+            "planner_residual_norm_mean": 0.0,
+            "planner_residual_abs_mean": 0.0,
+            "planner_final_action_norm_mean": float(action.detach().norm(dim=-1).mean().item()),
+            "planner_residual_to_prior_norm": 0.0,
+            "planner_selected_prior_fraction": 0.0,
+            "planner_predicted_plan_return_mean": 0.0,
+            "planner_predicted_prior_return_mean": 0.0,
+            "planner_predicted_return_margin_mean": 0.0,
+            "planner_predicted_return_margin_min": 0.0,
+            "planner_prior_fallback_fraction": 0.0,
+        }
+
+    def plan(self, obs: torch.Tensor, eval_mode: bool = False, t0: bool = False) -> torch.Tensor:
+        if t0:
+            self.reset()
+        z0 = self.model.encode(obs)
+        mean = self._warm_start_mean(obs)
+        std = torch.full_like(mean, self.max_std).clamp_(self.min_std, self.max_std)
+        policy_controls = self._policy_candidate_controls(obs, z0)
+        random_candidates = self.candidates - self.num_pi_trajs
+        final_elite_controls = mean.unsqueeze(1)
+        final_elite_returns = torch.zeros((obs.shape[0], 1), device=obs.device, dtype=obs.dtype)
+        last_returns = torch.zeros((obs.shape[0], self.candidates), device=obs.device, dtype=obs.dtype)
+
+        for _ in range(self.iterations):
+            if random_candidates > 0:
+                noise = torch.randn(
+                    (obs.shape[0], random_candidates, self.control_horizon, self.action_dim),
+                    device=obs.device,
+                    dtype=obs.dtype,
+                )
+                sampled_controls = self._clip_actions(mean.unsqueeze(1) + std.unsqueeze(1) * noise)
+                controls = torch.cat((policy_controls, sampled_controls), dim=1)
+            else:
+                controls = policy_controls
+
+            actions = self._expand_controls(controls)
+            returns = self.evaluate_sequences(obs, actions, z0)
+            returns = returns.nan_to_num(0.0, posinf=0.0, neginf=0.0)
+            last_returns = returns
+
+            final_elite_returns, elite_indices = returns.topk(self.elites, dim=1)
+            final_elite_controls = controls.gather(
+                1,
+                elite_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.control_horizon, self.action_dim),
+            )
+            weights = self._elite_score_weights(final_elite_returns)
+            mean = (weights.unsqueeze(-1).unsqueeze(-1) * final_elite_controls).sum(dim=1)
+            variance = (weights.unsqueeze(-1).unsqueeze(-1) * (final_elite_controls - mean.unsqueeze(1)).square()).sum(dim=1)
+            std = variance.sqrt().clamp_(self.min_std, self.max_std)
+
+        if self.use_best_candidate:
+            selected_indices = final_elite_returns.argmax(dim=1)
+        else:
+            gumbel = -torch.empty_like(final_elite_returns).exponential_().log()
+            selected_indices = (float(self.temperature) * final_elite_returns + gumbel).argmax(dim=1)
+        selected_controls = final_elite_controls.gather(
+            1,
+            selected_indices.view(-1, 1, 1, 1).expand(-1, 1, self.control_horizon, self.action_dim),
+        ).squeeze(1)
+        self._prev_mean = mean.detach()
+        action = self._clip_actions(self._expand_controls(selected_controls)[:, 0])
+        if self.action_noise and not eval_mode:
+            action = self._clip_actions(action + std[:, 0] * torch.randn_like(action))
+        self._record_diagnostics(last_returns, action)
+        return action
+
+
 def build_planner(
     planner_name: str,
-    model: DynamicsEnsemble,
+    model: DynamicsEnsemble | LatentWorldModel,
     action_low: torch.Tensor,
     action_high: torch.Tensor,
     horizon: int,
@@ -639,6 +934,9 @@ def build_planner(
     discount: float,
     temperature: float,
     lambda_: float,
+    min_std: float = 0.05,
+    max_std: float = 2.0,
+    num_pi_trajs: int = 24,
     action_spline_knots: int = 0,
     action_prior: Callable[[torch.Tensor], torch.Tensor] | None = None,
     prior_residual_scale: float = 0.3,
@@ -653,12 +951,44 @@ def build_planner(
     prior_command_dim: int = 3,
     prior_control_mode: str = "residual",
     action_bounds_finite: bool = True,
+    action_noise: bool = True,
+    use_continue_model: bool = False,
+    hard_continue_model: bool = False,
+    continue_threshold: float = 0.5,
     planner_velocity_objective_weight: float = 0.0,
     planner_velocity_target_x: float = 0.0,
     planner_velocity_target_y: float = 0.0,
     planner_velocity_target_yaw: float = 0.0,
     use_best_candidate: bool = False,
-) -> TrajectoryPlanner:
+) -> TrajectoryPlanner | LatentMPPIPlanner:
+    if getattr(model, "is_latent_world_model", False):
+        if planner_name != "mppi":
+            raise ValueError("LatentWorldModel currently supports only the mppi planner.")
+        return LatentMPPIPlanner(
+            model=model,
+            action_low=action_low,
+            action_high=action_high,
+            horizon=horizon,
+            candidates=candidates,
+            elites=elites,
+            iterations=iterations,
+            discount=discount,
+            temperature=temperature,
+            lambda_=lambda_,
+            min_std=min_std,
+            max_std=max_std,
+            num_pi_trajs=num_pi_trajs,
+            action_spline_knots=action_spline_knots,
+            action_prior=action_prior,
+            prior_candidate_fraction=prior_candidate_fraction,
+            prior_candidate_noise=prior_candidate_noise,
+            action_bounds_finite=action_bounds_finite,
+            use_best_candidate=use_best_candidate,
+            action_noise=action_noise,
+            use_continue_model=use_continue_model,
+            hard_continue_model=hard_continue_model,
+            continue_threshold=continue_threshold,
+        )
     if planner_name == "mppi":
         return MPPIPlanner(
             model=model,
