@@ -261,7 +261,19 @@ class TrajectoryPlanner:
             return self._prior_control_mean(obs)
         return self._zero_controls(obs)
 
-    def _inject_prior_candidates(self, obs: torch.Tensor, controls: torch.Tensor) -> torch.Tensor:
+    def _policy_candidate_controls(self, obs: torch.Tensor) -> torch.Tensor | None:
+        policy_count = self._model_policy_candidate_count(self.candidates)
+        if policy_count == 0:
+            return None
+        policy_actions = self._rollout_model_policy_actions(obs, policy_count)
+        return self._sample_actions_at_knots(policy_actions) if self.action_spline_knots else policy_actions
+
+    def _inject_prior_candidates(
+        self,
+        obs: torch.Tensor,
+        controls: torch.Tensor,
+        policy_controls: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Reserve initial candidates for pure or near-prior closed-loop rollouts."""
         count = self._prior_candidate_count(controls.shape[1])
         if count == 0:
@@ -296,11 +308,9 @@ class TrajectoryPlanner:
             else:
                 controls[:, noise_start:count, :, :] = self._clip_controls(prior_noise)
 
-        policy_count = self._model_policy_candidate_count(controls.shape[1])
+        policy_count = 0 if policy_controls is None else min(policy_controls.shape[1], controls.shape[1] - policy_start)
         if policy_count > 0:
-            policy_actions = self._rollout_model_policy_actions(obs, policy_count)
-            policy_controls = self._sample_actions_at_knots(policy_actions) if self.action_spline_knots else policy_actions
-            controls[:, policy_start : policy_start + policy_count, :, :] = policy_controls
+            controls[:, policy_start : policy_start + policy_count, :, :] = policy_controls[:, :policy_count]
         return controls
 
     def _actions_from_controls(self, states: torch.Tensor, controls_t: torch.Tensor) -> torch.Tensor:
@@ -547,6 +557,7 @@ class CEMPlanner(TrajectoryPlanner):
     def plan(self, obs: torch.Tensor) -> torch.Tensor:
         mean = self._warm_start_mean(obs)
         std = torch.full_like(mean, self.temperature)
+        policy_controls = self._policy_candidate_controls(obs)
 
         for _ in range(self.iterations):
             noise = torch.randn(
@@ -556,7 +567,7 @@ class CEMPlanner(TrajectoryPlanner):
             )
             controls = mean.unsqueeze(1) + std.unsqueeze(1) * noise
             controls = self._clip_controls(controls)
-            controls = self._inject_prior_candidates(obs, controls)
+            controls = self._inject_prior_candidates(obs, controls, policy_controls)
             action_sequences = self._expand_controls(controls)
 
             returns = self.evaluate_sequences(obs, action_sequences)
@@ -648,6 +659,7 @@ class MPPIPlanner(TrajectoryPlanner):
         mean = self._warm_start_mean(obs)
         std = torch.full_like(mean, self.temperature)
         best_controls = mean
+        policy_controls = self._policy_candidate_controls(obs)
 
         for _ in range(self.iterations):
             noise = torch.randn(
@@ -657,7 +669,7 @@ class MPPIPlanner(TrajectoryPlanner):
             )
             controls = mean.unsqueeze(1) + std.unsqueeze(1) * noise
             controls = self._clip_controls(controls)
-            controls = self._inject_prior_candidates(obs, controls)
+            controls = self._inject_prior_candidates(obs, controls, policy_controls)
             action_sequences = self._expand_controls(controls)
             returns = self.evaluate_sequences(obs, action_sequences)
             self._record_candidate_diagnostics(returns)
