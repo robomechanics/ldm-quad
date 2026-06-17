@@ -448,6 +448,11 @@ class TrajectoryPlanner:
         error = error + (states[:, 5] - target_yaw).square()
         return -float(self.planner_velocity_objective_weight) * error
 
+    def _predict_for_planning(self, states: torch.Tensor, actions: torch.Tensor):
+        if hasattr(self.model, "predict_for_planning"):
+            return self.model.predict_for_planning(states, actions)
+        return self.model.predict(states, actions)
+
     @torch.no_grad()
     def evaluate_sequences(self, obs: torch.Tensor, control_sequences: torch.Tensor) -> torch.Tensor:
         batch_size, candidates, _, action_dim = control_sequences.shape
@@ -459,7 +464,7 @@ class TrajectoryPlanner:
         for t in range(self.horizon):
             controls_t = control_sequences[:, :, t, :].reshape(batch_size * candidates, action_dim)
             actions_t = self._actions_from_controls(states, controls_t)
-            preds = self.model.predict(states, actions_t)
+            preds = self._predict_for_planning(states, actions_t)
             reward = preds.rewards.squeeze(-1)
             reward = reward + self._planner_velocity_objective_reward(states)
             if self.disagreement_penalty > 0.0 and hasattr(self.model, "disagreement"):
@@ -721,6 +726,12 @@ class LatentMPPIPlanner:
         use_continue_model: bool = False,
         hard_continue_model: bool = False,
         continue_threshold: float = 0.5,
+        planner_velocity_objective_weight: float = 0.0,
+        planner_velocity_target_x: float = 0.0,
+        planner_velocity_target_y: float = 0.0,
+        planner_velocity_target_yaw: float = 0.0,
+        prior_command_start: int = -1,
+        prior_command_dim: int = 3,
         **_: object,
     ):
         self.model = model
@@ -747,6 +758,12 @@ class LatentMPPIPlanner:
         self.use_continue_model = use_continue_model
         self.hard_continue_model = hard_continue_model
         self.continue_threshold = continue_threshold
+        self.planner_velocity_objective_weight = planner_velocity_objective_weight
+        self.planner_velocity_target_x = planner_velocity_target_x
+        self.planner_velocity_target_y = planner_velocity_target_y
+        self.planner_velocity_target_yaw = planner_velocity_target_yaw
+        self.prior_command_start = prior_command_start
+        self.prior_command_dim = prior_command_dim
         self._prev_mean: torch.Tensor | None = None
         self.last_diagnostics: dict[str, float] = {}
 
@@ -873,6 +890,53 @@ class LatentMPPIPlanner:
         weights = torch.softmax(float(self.temperature) * centered, dim=1)
         return weights
 
+    def _command_slice(self, obs_dim: int) -> slice | None:
+        command_dim = int(self.prior_command_dim)
+        if command_dim < 3:
+            return None
+        if self.prior_command_start >= 0:
+            start = int(self.prior_command_start)
+        elif obs_dim == 45:
+            start = 6
+        else:
+            start = 9
+        end = start + 3
+        if start < 0 or end > obs_dim:
+            return None
+        return slice(start, end)
+
+    def _latent_velocity_objective_reward(
+        self,
+        z: torch.Tensor,
+        obs: torch.Tensor,
+        batch_size: int,
+        candidates: int,
+    ) -> torch.Tensor:
+        if self.planner_velocity_objective_weight <= 0.0 or not hasattr(self.model, "physical_features"):
+            return torch.zeros(z.shape[0], device=z.device, dtype=z.dtype)
+        try:
+            predicted = self.model.physical_features(z)
+        except RuntimeError:
+            return torch.zeros(z.shape[0], device=z.device, dtype=z.dtype)
+        if predicted.shape[-1] < 3:
+            return torch.zeros(z.shape[0], device=z.device, dtype=z.dtype)
+
+        command_slice = self._command_slice(obs.shape[-1])
+        if command_slice is not None:
+            target = obs[:, command_slice].unsqueeze(1).expand(-1, candidates, -1).reshape(batch_size * candidates, 3)
+        else:
+            target = torch.tensor(
+                [
+                    self.planner_velocity_target_x,
+                    self.planner_velocity_target_y,
+                    self.planner_velocity_target_yaw,
+                ],
+                device=z.device,
+                dtype=z.dtype,
+            ).view(1, 3).expand(batch_size * candidates, -1)
+        error = (predicted[:, :3] - target).square().sum(dim=-1)
+        return -float(self.planner_velocity_objective_weight) * error
+
     @torch.no_grad()
     def evaluate_sequences(
         self,
@@ -890,7 +954,9 @@ class LatentMPPIPlanner:
         for t in range(self.horizon):
             actions_t = action_sequences[:, :, t, :].reshape(batch_size * candidates, action_dim)
             reward = self.model.reward(z, actions_t).squeeze(-1)
-            z = self.model.next(z, actions_t)
+            z_next = self.model.next(z, actions_t)
+            reward = reward + self._latent_velocity_objective_reward(z_next, obs, batch_size, candidates)
+            z = z_next
             returns = returns + discounts * alive * reward
             if self.use_continue_model:
                 continue_prob = self.model.continue_logits(z).sigmoid().squeeze(-1)
@@ -1056,6 +1122,12 @@ def build_planner(
             use_continue_model=use_continue_model,
             hard_continue_model=hard_continue_model,
             continue_threshold=continue_threshold,
+            planner_velocity_objective_weight=planner_velocity_objective_weight,
+            planner_velocity_target_x=planner_velocity_target_x,
+            planner_velocity_target_y=planner_velocity_target_y,
+            planner_velocity_target_yaw=planner_velocity_target_yaw,
+            prior_command_start=prior_command_start,
+            prior_command_dim=prior_command_dim,
         )
     if planner_name == "mppi":
         return MPPIPlanner(

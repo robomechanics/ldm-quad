@@ -240,6 +240,17 @@ def flatten_obs(obs: object, device: torch.device) -> torch.Tensor:
     return obs.float().view(obs.shape[0], -1)
 
 
+def parse_index_list(value: object) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [int(item) for item in value]
+    value = str(value)
+    if not value.strip():
+        return []
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
+
+
 def to_tensor(x: object, device: torch.device) -> torch.Tensor:
     if isinstance(x, torch.Tensor):
         return x.to(device)
@@ -579,6 +590,7 @@ def main() -> None:
                 vmax=checkpoint_args.get("vmax", 10.0),
                 simnorm_dim=checkpoint_args.get("simnorm_dim", 8),
                 q_dropout=checkpoint_args.get("q_dropout", 0.01),
+                physical_feature_indices=parse_index_list(checkpoint_args.get("latent_physical_indices", "")),
             ).to(device)
         elif model_type == "state":
             model = StateWorldModel(

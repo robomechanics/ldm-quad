@@ -218,6 +218,16 @@ class StateWorldModel(DynamicsEnsemble):
         reward_std = preds.rewards.std(dim=0, unbiased=False)
         return delta_std.square().mean(dim=-1) + reward_std.squeeze(-1).square()
 
+    def predict_for_planning(self, obs: torch.Tensor, actions: torch.Tensor) -> DynamicsPrediction:
+        """Fast planner prediction using one dynamics member plus learned reward head."""
+        inputs = torch.cat([obs, actions], dim=-1)
+        pred = self.members[0](inputs)
+        return DynamicsPrediction(
+            delta_obs=pred[..., : self.obs_dim],
+            rewards=self.reward(obs, actions),
+            continue_logits=pred[..., self.obs_dim + 1 :],
+        )
+
     def predict(self, obs: torch.Tensor, actions: torch.Tensor) -> DynamicsPrediction:
         preds = super().predict(obs, actions)
         return DynamicsPrediction(

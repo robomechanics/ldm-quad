@@ -81,6 +81,18 @@ parser.add_argument("--consistency_coef", type=float, default=20.0, help="Latent
 parser.add_argument("--reward_coef", type=float, default=0.1, help="Distributional reward loss coefficient.")
 parser.add_argument("--value_coef", type=float, default=0.1, help="Distributional value loss coefficient.")
 parser.add_argument("--continue_coef", type=float, default=1.0, help="Continuation/termination loss coefficient.")
+parser.add_argument(
+    "--latent_physical_coef",
+    type=float,
+    default=0.0,
+    help="Auxiliary latent loss weight for predicting selected physical observation features.",
+)
+parser.add_argument(
+    "--latent_physical_indices",
+    type=str,
+    default="0,1,5",
+    help="Comma-separated observation indices decoded from latent state, defaulting to body vx, vy, yaw rate.",
+)
 parser.add_argument("--simnorm_dim", type=int, default=8, help="SimNorm group size for latent encoder/dynamics outputs. Set <=1 to disable.")
 parser.add_argument("--hidden_dim", type=int, default=512, help="Model hidden dimension.")
 parser.add_argument("--model_depth", type=int, default=3, help="Number of hidden layers per ensemble member.")
@@ -468,6 +480,18 @@ def command_slice(obs_dim: int) -> slice | None:
     return None
 
 
+def parse_index_list(value: str) -> list[int]:
+    if not value.strip():
+        return []
+    indices: list[int] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        indices.append(int(item))
+    return indices
+
+
 def command_tracking_metrics(obs: torch.Tensor) -> dict[str, float]:
     metrics = {
         "command_x_mean": 0.0,
@@ -735,6 +759,11 @@ def main() -> None:
         print(f"[MBRL] Loaded locomotion prior ({args_cli.prior_type}): {os.path.abspath(args_cli.prior_checkpoint)}", flush=True)
 
     replay = ReplayBuffer(args_cli.buffer_capacity, obs_dim=obs_dim, action_dim=action_dim)
+    latent_physical_indices = parse_index_list(args_cli.latent_physical_indices)
+    if any(index < 0 or index >= obs_dim for index in latent_physical_indices):
+        raise ValueError(
+            f"--latent_physical_indices must be within observation dim {obs_dim}: {latent_physical_indices}"
+        )
     if args_cli.model_type == "latent":
         model = LatentWorldModel(
             obs_dim=obs_dim,
@@ -752,11 +781,13 @@ def main() -> None:
             vmax=args_cli.vmax,
             simnorm_dim=args_cli.simnorm_dim,
             q_dropout=args_cli.q_dropout,
+            physical_feature_indices=latent_physical_indices,
             loss_weights=WorldModelLossWeights(
                 consistency=args_cli.consistency_coef,
                 reward=args_cli.reward_coef,
                 value=args_cli.value_coef,
                 continue_=args_cli.continue_coef,
+                physical=args_cli.latent_physical_coef,
             ),
         ).to(device)
         optimizer = torch.optim.Adam(
@@ -959,6 +990,7 @@ def main() -> None:
             "reward_loss": 0.0,
             "value_loss": 0.0,
             "continue_loss": 0.0,
+            "physical_loss": 0.0,
             "policy_loss": 0.0,
             "policy_q": 0.0,
             "policy_scaled_q": 0.0,
@@ -1069,7 +1101,20 @@ def main() -> None:
                 else:
                     actions = random_actions(obs.shape[0], action_low, action_high)
             else:
+                if not planner_was_active:
+                    print(
+                        f"[MBRL] planner starting at step={train_state.env_steps} "
+                        f"candidates={args_cli.candidates} horizon={args_cli.horizon} "
+                        f"iterations={args_cli.planner_iterations} num_envs={args_cli.num_envs}",
+                        flush=True,
+                    )
+                    planner_start_time = time.time()
                 actions = planner.plan(obs, t0=not planner_was_active)
+                if not planner_was_active:
+                    print(
+                        f"[MBRL] first planner action computed in {time.time() - planner_start_time:.2f}s",
+                        flush=True,
+                    )
                 latest_planner_diagnostics.update(planner.last_diagnostics)
             planner_was_active = planner_ready
 

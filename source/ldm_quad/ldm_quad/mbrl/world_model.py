@@ -144,6 +144,7 @@ class WorldModelLossWeights:
     reward: float = 0.1
     value: float = 0.1
     continue_: float = 1.0
+    physical: float = 0.0
 
 
 class LatentWorldModel(nn.Module):
@@ -170,6 +171,7 @@ class LatentWorldModel(nn.Module):
         q_dropout: float = 0.01,
         log_std_min: float = -10.0,
         log_std_max: float = 2.0,
+        physical_feature_indices: list[int] | tuple[int, ...] | None = None,
         loss_weights: WorldModelLossWeights | None = None,
     ):
         super().__init__()
@@ -186,6 +188,7 @@ class LatentWorldModel(nn.Module):
         self.q_dropout = q_dropout
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
+        self.physical_feature_indices = tuple(physical_feature_indices or ())
         self.loss_weights = loss_weights or WorldModelLossWeights()
         head_dim = max(num_bins, 1)
         self.q_scale = RunningScale(tau)
@@ -195,6 +198,11 @@ class LatentWorldModel(nn.Module):
         self.reward_head = mlp(latent_dim + action_dim, hidden_dim, head_dim, depth)
         self.continue_head = mlp(latent_dim, hidden_dim, 1, depth)
         self.policy_head = mlp(latent_dim, hidden_dim, 2 * action_dim, depth)
+        self.physical_head = (
+            mlp(latent_dim, hidden_dim, len(self.physical_feature_indices), depth)
+            if self.physical_feature_indices
+            else None
+        )
         self.q_heads = nn.ModuleList(
             mlp(latent_dim + action_dim, hidden_dim, head_dim, depth, dropout=q_dropout) for _ in range(num_q)
         )
@@ -252,6 +260,11 @@ class LatentWorldModel(nn.Module):
 
     def continue_logits(self, z: torch.Tensor) -> torch.Tensor:
         return self.continue_head(z)
+
+    def physical_features(self, z: torch.Tensor) -> torch.Tensor:
+        if self.physical_head is None:
+            raise RuntimeError("LatentWorldModel was created without physical feature prediction.")
+        return self.physical_head(z)
 
     def _policy_stats(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         mean, log_std = self.policy_head(z).chunk(2, dim=-1)
@@ -328,11 +341,15 @@ class LatentWorldModel(nn.Module):
         modules = (self.dynamics, self.reward_head, self.continue_head, self.q_heads)
         for module in modules:
             yield from module.parameters()
+        if self.physical_head is not None:
+            yield from self.physical_head.parameters()
 
     def model_parameters(self):
         modules = (self.encoder, self.dynamics, self.reward_head, self.continue_head, self.q_heads)
         for module in modules:
             yield from module.parameters()
+        if self.physical_head is not None:
+            yield from self.physical_head.parameters()
 
     def policy_parameters(self):
         yield from self.policy_head.parameters()
@@ -375,7 +392,11 @@ class LatentWorldModel(nn.Module):
         reward_loss = torch.zeros((), device=obs.device)
         value_loss = torch.zeros((), device=obs.device)
         continue_loss = torch.zeros((), device=obs.device)
+        physical_loss = torch.zeros((), device=obs.device)
         rollout_zs = [z]
+        physical_indices = None
+        if self.physical_head is not None and self.loss_weights.physical > 0.0:
+            physical_indices = torch.as_tensor(self.physical_feature_indices, device=obs.device, dtype=torch.long)
 
         for t in range(horizon):
             weight = self.rho**t
@@ -403,6 +424,9 @@ class LatentWorldModel(nn.Module):
             value_target = target_q.unsqueeze(0).expand(q_logits.shape[0], *target_q.shape)
             value_loss = value_loss + weight * soft_ce(q_logits.reshape(-1, q_logits.shape[-1]), value_target.reshape(-1, 1), self.dreg).mean()
             continue_loss = continue_loss + weight * F.binary_cross_entropy_with_logits(continue_pred, continue_t)
+            if physical_indices is not None:
+                physical_target = obs[t + 1].index_select(-1, physical_indices)
+                physical_loss = physical_loss + weight * F.mse_loss(self.physical_features(z_next), physical_target)
             z = z_next
             rollout_zs.append(z)
 
@@ -411,6 +435,7 @@ class LatentWorldModel(nn.Module):
         reward_loss = reward_loss / normalizer
         value_loss = value_loss / normalizer
         continue_loss = continue_loss / normalizer
+        physical_loss = physical_loss / normalizer
 
         weights = self.loss_weights
         total = (
@@ -418,6 +443,7 @@ class LatentWorldModel(nn.Module):
             + weights.reward * reward_loss
             + weights.value * value_loss
             + weights.continue_ * continue_loss
+            + weights.physical * physical_loss
         )
         metrics = {
             "loss": float(total.detach().item()),
@@ -425,5 +451,6 @@ class LatentWorldModel(nn.Module):
             "reward_loss": float(reward_loss.detach().item()),
             "value_loss": float(value_loss.detach().item()),
             "continue_loss": float(continue_loss.detach().item()),
+            "physical_loss": float(physical_loss.detach().item()),
         }
         return total, metrics, torch.stack(rollout_zs, dim=0).detach()
