@@ -64,9 +64,9 @@ parser.add_argument("--batch_size", type=int, default=4096, help="Replay batch s
 parser.add_argument(
     "--model_type",
     type=str,
-    default="state",
+    default="latent",
     choices=["latent", "state", "dynamics"],
-    help="Use a TD-MPC-style latent model, enhanced state-space world model, or simple observation-delta ensemble.",
+    help="Use the recommended quadruped-guided latent model, experimental state-space model, or simple observation-delta ensemble.",
 )
 parser.add_argument("--latent_dim", type=int, default=128, help="Latent dimension for --model_type latent.")
 parser.add_argument("--num_q", type=int, default=5, help="Number of Q heads for --model_type latent.")
@@ -84,7 +84,7 @@ parser.add_argument("--continue_coef", type=float, default=1.0, help="Continuati
 parser.add_argument(
     "--latent_physical_coef",
     type=float,
-    default=0.0,
+    default=2.0,
     help="Auxiliary latent loss weight for predicting selected physical observation features.",
 )
 parser.add_argument(
@@ -146,7 +146,12 @@ parser.add_argument(
     default=False,
     help="Use the best evaluated candidate as the final MPPI plan instead of the weighted candidate mean.",
 )
-parser.add_argument("--planner_velocity_objective_weight", type=float, default=0.0, help="Planner-only velocity objective weight. Disabled when 0.")
+parser.add_argument(
+    "--planner_velocity_objective_weight",
+    type=float,
+    default=1.0,
+    help="Planner-only velocity objective weight using decoded latent or state velocity features. Disabled when 0.",
+)
 parser.add_argument("--planner_velocity_target_x", type=float, default=0.0, help="Planner-only target body x velocity.")
 parser.add_argument("--planner_velocity_target_y", type=float, default=0.0, help="Planner-only target body y velocity.")
 parser.add_argument("--planner_velocity_target_yaw", type=float, default=0.0, help="Planner-only target yaw rate.")
