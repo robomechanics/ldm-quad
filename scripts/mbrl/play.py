@@ -8,7 +8,9 @@
 """Play or evaluate an MBRL checkpoint on the Go2 walking task."""
 
 import argparse
+import csv
 from copy import deepcopy
+from datetime import datetime
 import os
 import random
 import sys
@@ -195,6 +197,30 @@ parser.add_argument("--wander_yaw_min", type=float, default=-0.8, help="Minimum 
 parser.add_argument("--wander_yaw_max", type=float, default=0.8, help="Maximum wander yaw velocity command.")
 parser.add_argument("--wander_resample_min", type=float, default=3.0, help="Minimum wander command resample time.")
 parser.add_argument("--wander_resample_max", type=float, default=5.0, help="Maximum wander command resample time.")
+parser.add_argument(
+    "--diagnostics",
+    action="store_true",
+    default=False,
+    help="Write TensorBoard/CSV mismatch diagnostics from play/eval rollouts.",
+)
+parser.add_argument("--diagnostics_dir", type=str, default=None, help="Optional diagnostics output directory.")
+parser.add_argument("--diagnostics_interval", type=int, default=10, help="Environment steps between diagnostics rows.")
+parser.add_argument(
+    "--online_adapt",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Fine-tune the world model online from mismatch rollout transitions during play/eval.",
+)
+parser.add_argument("--adapt_buffer_capacity", type=int, default=50000, help="Replay capacity for --online_adapt.")
+parser.add_argument("--adapt_batch_size", type=int, default=1024, help="Replay batch size for --online_adapt.")
+parser.add_argument("--adapt_updates_per_step", type=int, default=1, help="World-model updates per env step for --online_adapt.")
+parser.add_argument("--adapt_lr", type=float, default=1e-4, help="World-model learning rate for --online_adapt.")
+parser.add_argument(
+    "--adapt_horizon",
+    type=int,
+    default=None,
+    help="Sequence horizon for latent/state online adaptation. Defaults to checkpoint horizon.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -216,7 +242,12 @@ from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 
 import ldm_quad.tasks  # noqa: F401
-from ldm_quad.mbrl import DynamicsEnsemble, LatentWorldModel, StateWorldModel, build_planner, load_policy_prior
+from ldm_quad.mbrl import DynamicsEnsemble, LatentWorldModel, ReplayBuffer, StateWorldModel, build_planner, load_policy_prior
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ModuleNotFoundError:
+    SummaryWriter = None
 
 
 def set_seed(seed: int) -> None:
@@ -498,6 +529,258 @@ def video_run_name() -> str:
     return f"mismatch_{args_cli.mismatch}"
 
 
+DIAGNOSTIC_FIELDS = [
+    "step",
+    "mismatch_active",
+    "runtime_motor_scale",
+    "completed_episodes",
+    "current_return_mean",
+    "current_length_mean",
+    "reward_mean",
+    "action_abs_mean",
+    "action_abs_max",
+    "velocity_x_mean",
+    "velocity_y_mean",
+    "velocity_yaw_mean",
+    "tracking_x_abs_error",
+    "tracking_y_abs_error",
+    "tracking_yaw_abs_error",
+    "model_obs_mse",
+    "model_obs_rmse",
+    "model_velocity_mse",
+    "model_reward_mse",
+    "model_reward_abs_error",
+    "model_continue_bce",
+    "model_continue_accuracy",
+    "model_latent_consistency_mse",
+    "model_physical_mse",
+    "adapt_loss",
+    "adapt_delta_loss",
+    "adapt_consistency_loss",
+    "adapt_reward_loss",
+    "adapt_value_loss",
+    "adapt_continue_loss",
+    "adapt_physical_loss",
+    "adapt_gradient_updates",
+    "adapt_buffer_size",
+    "planner_candidate_return_mean",
+    "planner_candidate_return_best",
+    "planner_candidate_return_std",
+    "planner_action_abs_mean",
+    "planner_action_abs_max",
+    "planner_action_std_mean",
+    "planner_action_std_max",
+    "planner_use_prior_fallback",
+    "planner_best_candidate_mode",
+    "planner_predicted_plan_return_mean",
+    "planner_predicted_prior_return_mean",
+    "planner_predicted_return_margin_mean",
+    "planner_predicted_return_margin_min",
+    "planner_prior_accept_rate",
+]
+
+
+class DiagnosticsLogger:
+    def __init__(self, output_dir: str):
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        self.csv_path = os.path.join(output_dir, "metrics.csv")
+        self.writer = SummaryWriter(log_dir=output_dir) if SummaryWriter is not None else None
+        self._csv_file = open(self.csv_path, "w", newline="", encoding="utf-8")
+        self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=DIAGNOSTIC_FIELDS)
+        self._csv_writer.writeheader()
+
+    def write(self, step: int, metrics: dict[str, float]) -> None:
+        row = {field: metrics.get(field, "") for field in DIAGNOSTIC_FIELDS}
+        row["step"] = step
+        self._csv_writer.writerow(row)
+        self._csv_file.flush()
+        if self.writer is not None:
+            for name, value in metrics.items():
+                if name == "step" or value is None:
+                    continue
+                self.writer.add_scalar(name.replace("_", " / ", 1), float(value), step)
+            self.writer.flush()
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+        self._csv_file.close()
+
+
+def make_diagnostics_dir(checkpoint_path: str) -> str:
+    if args_cli.diagnostics_dir:
+        return os.path.abspath(args_cli.diagnostics_dir)
+    run_dir = os.path.dirname(os.path.dirname(checkpoint_path))
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    name = f"{video_run_name()}_{timestamp}"
+    return os.path.join(run_dir, "mismatch_diagnostics", name)
+
+
+def command_slice(obs_dim: int) -> slice | None:
+    if obs_dim == 45:
+        return slice(6, 9)
+    if obs_dim >= 12:
+        return slice(9, 12)
+    return None
+
+
+def tracking_metrics(obs: torch.Tensor) -> dict[str, float]:
+    metrics = {
+        "velocity_x_mean": 0.0,
+        "velocity_y_mean": 0.0,
+        "velocity_yaw_mean": 0.0,
+        "tracking_x_abs_error": 0.0,
+        "tracking_y_abs_error": 0.0,
+        "tracking_yaw_abs_error": 0.0,
+    }
+    if obs.ndim != 2 or obs.shape[-1] < 6:
+        return metrics
+
+    velocity = obs[:, [0, 1, 5]]
+    metrics["velocity_x_mean"] = float(velocity[:, 0].mean().item())
+    metrics["velocity_y_mean"] = float(velocity[:, 1].mean().item())
+    metrics["velocity_yaw_mean"] = float(velocity[:, 2].mean().item())
+    command_idx = command_slice(obs.shape[-1])
+    if command_idx is None:
+        return metrics
+    command = obs[:, command_idx]
+    if command.shape[-1] < 3:
+        return metrics
+    error = (velocity - command[:, :3]).abs()
+    metrics["tracking_x_abs_error"] = float(error[:, 0].mean().item())
+    metrics["tracking_y_abs_error"] = float(error[:, 1].mean().item())
+    metrics["tracking_yaw_abs_error"] = float(error[:, 2].mean().item())
+    return metrics
+
+
+def bce_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.binary_cross_entropy_with_logits(logits, targets)
+
+
+@torch.no_grad()
+def prediction_error_metrics(
+    model: torch.nn.Module | None,
+    model_type: str | None,
+    obs: torch.Tensor,
+    actions: torch.Tensor,
+    rewards: torch.Tensor,
+    next_obs: torch.Tensor,
+    continues: torch.Tensor,
+) -> dict[str, float]:
+    metrics = {
+        "model_obs_mse": 0.0,
+        "model_obs_rmse": 0.0,
+        "model_velocity_mse": 0.0,
+        "model_reward_mse": 0.0,
+        "model_reward_abs_error": 0.0,
+        "model_continue_bce": 0.0,
+        "model_continue_accuracy": 0.0,
+        "model_latent_consistency_mse": 0.0,
+        "model_physical_mse": 0.0,
+    }
+    if model is None or model_type is None:
+        return metrics
+
+    if model_type == "latent":
+        z = model.encode(obs)
+        z_next = model.next(z, actions)
+        z_target = model.encode(next_obs)
+        latent_error = (z_next - z_target).square().mean()
+        reward_pred = model.reward(z, actions)
+        continue_logits = model.continue_logits(z_next)
+        metrics["model_latent_consistency_mse"] = float(latent_error.item())
+        if getattr(model, "physical_head", None) is not None and getattr(model, "physical_feature_indices", None):
+            physical_indices = torch.as_tensor(model.physical_feature_indices, dtype=torch.long, device=obs.device)
+            physical_target = next_obs.index_select(-1, physical_indices)
+            metrics["model_physical_mse"] = float((model.physical_features(z_next) - physical_target).square().mean().item())
+    else:
+        preds = model.predict(obs, actions)
+        pred_next_obs = obs + preds.delta_obs
+        obs_error = (pred_next_obs - next_obs).square()
+        metrics["model_obs_mse"] = float(obs_error.mean().item())
+        metrics["model_obs_rmse"] = float(obs_error.mean().sqrt().item())
+        if obs.shape[-1] >= 6:
+            metrics["model_velocity_mse"] = float(obs_error[:, [0, 1, 5]].mean().item())
+        reward_pred = preds.rewards
+        continue_logits = preds.continue_logits
+
+    reward_target = rewards.view(-1, 1)
+    continue_target = continues.view(-1, 1)
+    reward_error = reward_pred - reward_target
+    continue_prob = continue_logits.sigmoid()
+    metrics["model_reward_mse"] = float(reward_error.square().mean().item())
+    metrics["model_reward_abs_error"] = float(reward_error.abs().mean().item())
+    metrics["model_continue_bce"] = float(bce_from_logits(continue_logits, continue_target).item())
+    metrics["model_continue_accuracy"] = float(((continue_prob >= 0.5) == (continue_target >= 0.5)).float().mean().item())
+    return metrics
+
+
+def build_adapt_optimizer(model: torch.nn.Module | None) -> torch.optim.Optimizer | None:
+    if model is None or not args_cli.online_adapt:
+        return None
+    if hasattr(model, "model_parameters"):
+        params = list(model.model_parameters())
+    else:
+        params = list(model.parameters())
+    if not params:
+        return None
+    return torch.optim.Adam(params, lr=args_cli.adapt_lr)
+
+
+def online_adapt_step(
+    model: torch.nn.Module | None,
+    model_type: str | None,
+    optimizer: torch.optim.Optimizer | None,
+    replay: ReplayBuffer | None,
+    device: torch.device,
+    horizon: int,
+) -> tuple[dict[str, float], int]:
+    if model is None or model_type is None or optimizer is None or replay is None or len(replay) < args_cli.adapt_batch_size:
+        return {}, 0
+
+    metrics: dict[str, float] = {}
+    updates = 0
+    model.train()
+    for _ in range(max(0, args_cli.adapt_updates_per_step)):
+        if model_type == "latent":
+            if not replay.can_sample_sequences(args_cli.adapt_batch_size, horizon):
+                break
+            batch = replay.sample_sequences(args_cli.adapt_batch_size, horizon, device)
+            loss, batch_metrics, _ = model.loss(batch)
+        elif model_type == "state" and replay.can_sample_sequences(args_cli.adapt_batch_size, horizon):
+            batch = replay.sample_sequences(args_cli.adapt_batch_size, horizon, device)
+            loss, batch_metrics, _ = model.loss(batch)
+        else:
+            batch = replay.sample(args_cli.adapt_batch_size, device)
+            result = model.loss(batch)
+            loss, batch_metrics = result[:2]
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 20.0)
+        optimizer.step()
+        if hasattr(model, "soft_update_targets"):
+            model.soft_update_targets()
+        if hasattr(model, "sync_detached_qs"):
+            model.sync_detached_qs()
+        metrics = {f"adapt_{name}": float(value) for name, value in batch_metrics.items()}
+        updates += 1
+
+    model.eval()
+    return metrics, updates
+
+
+def mismatch_active_value(steps: int) -> float:
+    if args_cli.showcase:
+        return 1.0
+    if args_cli.mismatch == "nominal":
+        return 0.0
+    if args_cli.mismatch_mode == "delayed" and args_cli.mismatch in ("motor_weakness", "push"):
+        return float(steps >= args_cli.mismatch_start_step)
+    return 1.0
+
+
 def main() -> None:
     checkpoint_path = os.path.abspath(args_cli.checkpoint)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -570,6 +853,8 @@ def main() -> None:
         print(f"[INFO] Loaded locomotion prior ({prior_type}): {os.path.abspath(prior_checkpoint)}")
 
     planner_name = checkpoint_args.get("planner", "mppi")
+    model = None
+    model_type = None
     planner = None
     if not args_cli.prior_only:
         model_type = checkpoint_args.get("model_type", "dynamics")
@@ -756,6 +1041,22 @@ def main() -> None:
             ),
         )
 
+    diagnostics = DiagnosticsLogger(make_diagnostics_dir(checkpoint_path)) if args_cli.diagnostics else None
+    if diagnostics is not None:
+        print(f"[INFO] Writing mismatch diagnostics to: {diagnostics.output_dir}")
+        if diagnostics.writer is None:
+            print("[WARN] TensorBoard is not installed; writing diagnostics CSV only.", flush=True)
+    if args_cli.online_adapt and model is None:
+        raise RuntimeError("--online_adapt requires an MBRL world model; it cannot run with --prior_only.")
+    adapt_replay = (
+        ReplayBuffer(args_cli.adapt_buffer_capacity, obs.shape[-1], action_dim)
+        if args_cli.online_adapt or args_cli.diagnostics
+        else None
+    )
+    adapt_optimizer = build_adapt_optimizer(model)
+    adapt_horizon = int(args_cli.adapt_horizon or checkpoint_args.get("horizon", 1))
+    adapt_gradient_updates = 0
+
     try:
         dt = env.step_dt
     except AttributeError:
@@ -783,6 +1084,13 @@ def main() -> None:
             flush=True,
         )
     print(f"[INFO] Planner={'prior_only' if args_cli.prior_only else planner_name}")
+    if args_cli.online_adapt:
+        print(
+            "[INFO] Online model adaptation enabled "
+            f"lr={args_cli.adapt_lr} batch={args_cli.adapt_batch_size} "
+            f"updates_per_step={args_cli.adapt_updates_per_step} horizon={adapt_horizon}",
+            flush=True,
+        )
     if args_cli.showcase:
         print_showcase_groups(showcase_groups)
     if args_cli.wander:
@@ -806,7 +1114,7 @@ def main() -> None:
     ):
         start_time = time.time()
 
-        with torch.inference_mode():
+        with torch.no_grad():
             if args_cli.prior_only:
                 if action_prior is None:
                     raise RuntimeError("--prior_only requires a prior checkpoint in the MBRL checkpoint or --prior_checkpoint.")
@@ -845,39 +1153,86 @@ def main() -> None:
                     f"action_first={actions[0].detach().cpu().tolist()} "
                     f"command_obs={command_obs[0].detach().cpu().tolist() if command_obs is not None else None}"
                 )
-            next_obs_raw, rewards, terminated, truncated, _ = env.step(actions)
-            next_obs = flatten_obs(next_obs_raw, device)
-            rewards = to_tensor(rewards, device).float().view(-1)
-            done = to_tensor(terminated, device).bool().view(-1) | to_tensor(truncated, device).bool().view(-1)
 
-            episode_returns += rewards
-            episode_lengths += 1
+        next_obs_raw, rewards, terminated, truncated, _ = env.step(actions)
+        next_obs = flatten_obs(next_obs_raw, device)
+        rewards = to_tensor(rewards, device).float().view(-1)
+        done = to_tensor(terminated, device).bool().view(-1) | to_tensor(truncated, device).bool().view(-1)
+        continues = (~done).float().view(-1, 1)
 
-            if done.any():
-                done_mask = done
-                done_returns = episode_returns[done_mask].detach().cpu().tolist()
-                done_lengths = episode_lengths[done_mask].detach().cpu().tolist()
-                completed_returns.extend(done_returns)
-                completed_lengths.extend(done_lengths)
-                if args_cli.showcase:
-                    for group_name, group_ids in showcase_groups.items():
-                        if group_ids.numel() == 0:
-                            continue
-                        group_done = done[group_ids]
-                        if group_done.any():
-                            showcase_completed_returns[group_name].extend(
-                                episode_returns[group_ids][group_done].detach().cpu().tolist()
-                            )
-                            showcase_completed_lengths[group_name].extend(
-                                episode_lengths[group_ids][group_done].detach().cpu().tolist()
-                            )
-                episode_returns[done_mask] = 0.0
-                episode_lengths[done_mask] = 0.0
-                if planner is not None:
-                    planner.reset(done_mask)
+        diag_metrics: dict[str, float] = {}
+        if diagnostics is not None:
+            diag_metrics.update(
+                {
+                    "mismatch_active": mismatch_active_value(steps),
+                    "runtime_motor_scale": runtime_motor_scale(steps),
+                    "completed_episodes": float(len(completed_returns)),
+                    "current_return_mean": float(episode_returns.mean().item()),
+                    "current_length_mean": float(episode_lengths.mean().item()),
+                    "reward_mean": float(rewards.mean().item()),
+                    "action_abs_mean": float(actions.abs().mean().item()),
+                    "action_abs_max": float(actions.abs().max().item()),
+                }
+            )
+            diag_metrics.update(tracking_metrics(obs))
+            diag_metrics.update(prediction_error_metrics(model, model_type, obs, actions, rewards, next_obs, continues))
+            if planner is not None:
+                diag_metrics.update({name: float(value) for name, value in planner.last_diagnostics.items()})
 
-            obs = next_obs
-            steps += 1
+        if adapt_replay is not None:
+            adapt_replay.add_batch(
+                obs.detach().cpu(),
+                actions.detach().cpu(),
+                rewards.view(-1, 1).detach().cpu(),
+                next_obs.detach().cpu(),
+                continues.detach().cpu(),
+                resets=done.detach().cpu(),
+            )
+
+        adapt_metrics, updates = online_adapt_step(
+            model=model,
+            model_type=model_type,
+            optimizer=adapt_optimizer,
+            replay=adapt_replay,
+            device=device,
+            horizon=adapt_horizon,
+        )
+        adapt_gradient_updates += updates
+
+        if diagnostics is not None and (steps % max(1, args_cli.diagnostics_interval) == 0):
+            diag_metrics.update(adapt_metrics)
+            diag_metrics["adapt_gradient_updates"] = float(adapt_gradient_updates)
+            diag_metrics["adapt_buffer_size"] = float(len(adapt_replay) if adapt_replay is not None else 0)
+            diagnostics.write(steps, diag_metrics)
+
+        episode_returns += rewards
+        episode_lengths += 1
+
+        if done.any():
+            done_mask = done
+            done_returns = episode_returns[done_mask].detach().cpu().tolist()
+            done_lengths = episode_lengths[done_mask].detach().cpu().tolist()
+            completed_returns.extend(done_returns)
+            completed_lengths.extend(done_lengths)
+            if args_cli.showcase:
+                for group_name, group_ids in showcase_groups.items():
+                    if group_ids.numel() == 0:
+                        continue
+                    group_done = done[group_ids]
+                    if group_done.any():
+                        showcase_completed_returns[group_name].extend(
+                            episode_returns[group_ids][group_done].detach().cpu().tolist()
+                        )
+                        showcase_completed_lengths[group_name].extend(
+                            episode_lengths[group_ids][group_done].detach().cpu().tolist()
+                        )
+            episode_returns[done_mask] = 0.0
+            episode_lengths[done_mask] = 0.0
+            if planner is not None:
+                planner.reset(done_mask)
+
+        obs = next_obs
+        steps += 1
 
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
@@ -914,6 +1269,9 @@ def main() -> None:
                 )
             else:
                 print(f"[SHOWCASE] {group_name}: no completed episodes")
+
+    if diagnostics is not None:
+        diagnostics.close()
 
     env.close()
 
