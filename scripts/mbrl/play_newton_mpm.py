@@ -516,7 +516,7 @@ def patch_isaaclab_deployment_config(mpm_example, runner_args: argparse.Namespac
         robot = cfg.setdefault("robot", {})
         robot["initial_position"] = [0.0, -1.5, float(runner_args.spawn_z)]
         robot["initial_yaw_axis"] = [0.0, 0.0, 1.0]
-        robot["initial_yaw_angle_pi_mult"] = 0.5
+        robot["initial_yaw_angle_pi_mult"] = float(runner_args.spawn_yaw_pi_mult)
         robot["enable_self_collisions"] = False
 
         policy = cfg.setdefault("policy", {})
@@ -557,7 +557,7 @@ def patch_isaaclab_deployment_config(mpm_example, runner_args: argparse.Namespac
         cfg.setdefault("control", {})["auto_forward"] = False
         print(
             "[INFO] TD-MPC Newton deployment config forced: "
-            f"spawn=(0,-1.5,{float(runner_args.spawn_z):.3g}), yaw=+90deg, "
+            f"spawn=(0,-1.5,{float(runner_args.spawn_z):.3g}), yaw={float(runner_args.spawn_yaw_pi_mult):.3g}*pi, "
             f"actuator={runner_args.actuator_model}, kp={float(runner_args.pd_kp):.3g}, kd={float(runner_args.pd_kd):.3g}, "
             f"effort={float(runner_args.effort_limit):.3g}, "
             f"action_scale={float(runner_args.config_action_scale):.3g}, mu={float(runner_args.ground_mu):.3g}"
@@ -597,6 +597,7 @@ def attach_command_driver(
     goal_max_yaw_rate: float,
     yaw_command_sign: float,
     forward_command_sign: float,
+    policy_forward_yaw_offset: float,
 ) -> None:
     """Replace George's hardcoded auto-forward with Isaac-style velocity commands."""
 
@@ -667,6 +668,7 @@ def attach_command_driver(
                 self.command[0, 2] = 0.0
             else:
                 desired_yaw = (math.pi / 2.0 if dy >= 0.0 else -math.pi / 2.0) if goal_x is None else math.atan2(dy, dx)
+                desired_yaw = wrap_to_pi(desired_yaw + float(self._policy_forward_yaw_offset))
                 yaw_error = wrap_to_pi(desired_yaw - yaw)
                 heading_scale = clamp((math.cos(yaw_error) + 1.0) * 0.5, 0.0, 1.0)
                 self.command[0, 0] = float(self._forward_command_sign) * speed * heading_scale
@@ -707,6 +709,7 @@ def attach_command_driver(
     example._goal_max_yaw_rate = float(goal_max_yaw_rate)
     example._yaw_command_sign = float(yaw_command_sign)
     example._forward_command_sign = float(forward_command_sign)
+    example._policy_forward_yaw_offset = float(policy_forward_yaw_offset)
     example._auto_forward = False
     example._read_command = MethodType(read_command, example)
 
@@ -917,6 +920,13 @@ def main() -> None:
         help="Initial floating-base z position in Newton. Defaults to the IsaacLab initial root height.",
     )
     parser.add_argument(
+        "--spawn-yaw-pi-mult",
+        "--spawn_yaw_pi_mult",
+        type=float,
+        default=0.5,
+        help="Initial base yaw as a multiple of pi. Default faces the robot toward +Y mud.",
+    )
+    parser.add_argument(
         "--joint-order",
         choices=[
             "auto",
@@ -1000,8 +1010,15 @@ def main() -> None:
         "--forward_command_sign",
         type=float,
         choices=[-1.0, 1.0],
-        default=-1.0,
+        default=1.0,
         help="Sign conversion for forward velocity commands sent to the TD-MPC policy in Newton.",
+    )
+    parser.add_argument(
+        "--policy-forward-yaw-offset-pi-mult",
+        "--policy_forward_yaw_offset_pi_mult",
+        type=float,
+        default=0.0,
+        help="Yaw offset from desired travel direction to base yaw for heading mode, as a multiple of pi.",
     )
     parser.add_argument(
         "--wander",
@@ -1172,6 +1189,7 @@ def main() -> None:
                 "config_action_scale": float(runner_args.config_action_scale),
                 "ground_mu": float(runner_args.ground_mu),
                 "spawn_z": float(runner_args.spawn_z),
+                "spawn_yaw_pi_mult": float(runner_args.spawn_yaw_pi_mult),
                 "planner_velocity_objective_weight": (
                     None
                     if runner_args.planner_velocity_objective_weight is None
@@ -1185,6 +1203,7 @@ def main() -> None:
                 "goal_y": None if runner_args.goal_y is None else float(runner_args.goal_y),
                 "yaw_command_sign": float(runner_args.yaw_command_sign),
                 "forward_command_sign": float(runner_args.forward_command_sign),
+                "policy_forward_yaw_offset_pi_mult": float(runner_args.policy_forward_yaw_offset_pi_mult),
             }
         )
         print(f"[INFO] Writing structured debug log to {runner_args.log_jsonl.expanduser()}")
@@ -1289,6 +1308,7 @@ def main() -> None:
             runner_args.goal_max_yaw_rate,
             runner_args.yaw_command_sign,
             runner_args.forward_command_sign,
+            math.pi * float(runner_args.policy_forward_yaw_offset_pi_mult),
         )
         if runner_args.wander:
             print(
