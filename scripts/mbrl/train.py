@@ -27,6 +27,21 @@ parser.add_argument("--num_envs", type=int, default=64, help="Number of environm
 parser.add_argument("--task", type=str, default="Flat-Unitree-Go2-train-v0", help="Name of the task.")
 parser.add_argument("--seed", type=int, default=42, help="Seed used for training.")
 parser.add_argument("--buffer_capacity", type=int, default=300000, help="Replay buffer capacity.")
+parser.add_argument(
+    "--resume_checkpoint",
+    type=str,
+    default=None,
+    help=(
+        "Resume an MBRL training run from a checkpoint saved by this script. "
+        "--train_steps remains the total target env step count, not extra steps."
+    ),
+)
+parser.add_argument(
+    "--resume_load_optim",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Restore optimizer state when --resume_checkpoint is set.",
+)
 parser.add_argument("--seed_steps", type=int, default=50, help="Initial random environment steps before planning.")
 parser.add_argument(
     "--planner_start_steps",
@@ -587,16 +602,51 @@ def save_checkpoint(
     train_state: TrainState,
     args: argparse.Namespace,
 ) -> None:
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "policy_optimizer": policy_optimizer.state_dict() if policy_optimizer is not None else None,
-            "train_state": asdict(train_state),
-            "args": vars(args),
-        },
-        path,
+    payload = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "policy_optimizer": policy_optimizer.state_dict() if policy_optimizer is not None else None,
+        "train_state": asdict(train_state),
+        "args": vars(args),
+    }
+    tmp_path = f"{path}.tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def load_training_checkpoint(
+    path: str,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    policy_optimizer: torch.optim.Optimizer | None,
+    *,
+    device: torch.device,
+    load_optim: bool,
+) -> tuple[TrainState, dict[str, object]]:
+    checkpoint = torch.load(os.path.expanduser(path), map_location=device)
+    if not isinstance(checkpoint, dict) or "model" not in checkpoint:
+        raise ValueError(f"Unsupported MBRL checkpoint format: {path}")
+
+    model.load_state_dict(checkpoint["model"])
+    if load_optim:
+        optimizer_state = checkpoint.get("optimizer")
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
+        policy_optimizer_state = checkpoint.get("policy_optimizer")
+        if policy_optimizer is not None and policy_optimizer_state is not None:
+            policy_optimizer.load_state_dict(policy_optimizer_state)
+
+    state_dict = checkpoint.get("train_state") or {}
+    if not isinstance(state_dict, dict):
+        raise ValueError(f"Checkpoint train_state is not a dictionary: {path}")
+    train_state = TrainState(
+        env_steps=int(state_dict.get("env_steps", 0)),
+        gradient_updates=int(state_dict.get("gradient_updates", 0)),
+        episodes_finished=int(state_dict.get("episodes_finished", 0)),
+        best_mean_return=float(state_dict.get("best_mean_return", float("-inf"))),
     )
+    checkpoint_args = checkpoint.get("args") if isinstance(checkpoint.get("args"), dict) else {}
+    return train_state, checkpoint_args
 
 
 def zero_eval_metrics() -> dict[str, float]:
@@ -834,6 +884,31 @@ def main() -> None:
         optimizer = torch.optim.Adam(model.parameters(), lr=args_cli.lr)
         policy_optimizer = None
     model.eval()
+
+    train_state = TrainState()
+    resume_checkpoint_args: dict[str, object] = {}
+    if args_cli.resume_checkpoint:
+        train_state, resume_checkpoint_args = load_training_checkpoint(
+            args_cli.resume_checkpoint,
+            model,
+            optimizer,
+            policy_optimizer,
+            device=device,
+            load_optim=bool(args_cli.resume_load_optim),
+        )
+        if train_state.env_steps >= args_cli.train_steps:
+            raise ValueError(
+                f"--train_steps={args_cli.train_steps} is not greater than resumed env_steps={train_state.env_steps}. "
+                "--train_steps is the total target step count; raise it to continue training."
+            )
+        print(
+            "[MBRL] Resumed training checkpoint "
+            f"path={os.path.abspath(os.path.expanduser(args_cli.resume_checkpoint))} "
+            f"env_steps={train_state.env_steps} gradient_updates={train_state.gradient_updates} "
+            f"episodes_finished={train_state.episodes_finished} load_optim={int(bool(args_cli.resume_load_optim))}",
+            flush=True,
+        )
+
     planner = build_planner(
         planner_name=args_cli.planner,
         model=model,
@@ -982,7 +1057,6 @@ def main() -> None:
         flush=True,
     )
 
-    train_state = TrainState()
     episode_returns = torch.zeros(num_envs, dtype=torch.float32, device=device)
     episode_lengths = torch.zeros(num_envs, dtype=torch.float32, device=device)
     recent_returns: list[float] = []
@@ -1042,15 +1116,15 @@ def main() -> None:
         "planner_prior_fallback_fraction": 0.0,
     }
     train_start_time = time.monotonic()
-    early_stop_best_metric = float("-inf")
-    early_stop_best_step = 0
+    early_stop_best_metric = float(train_state.best_mean_return)
+    early_stop_best_step = int(train_state.env_steps) if train_state.best_mean_return != float("-inf") else 0
     early_stop_reason: str | None = None
     planner_disabled_until = 0
     planner_start_steps = args_cli.planner_start_steps if args_cli.planner_start_steps is not None else args_cli.seed_steps
     planner_min_length = args_cli.planner_min_length_fraction * episode_horizon_steps
     planner_active = False
     planner_was_active = False
-    best_checkpoint_metric = float("-inf")
+    best_checkpoint_metric = float(train_state.best_mean_return)
     latest_eval_metrics = zero_eval_metrics()
     online_eval_min_steps = (
         args_cli.online_eval_min_steps
@@ -1063,6 +1137,10 @@ def main() -> None:
         for key, value in sorted(vars(args_cli).items()):
             f.write(f"{key}: {value}\n")
         f.write(f"resolved_online_eval_min_steps: {online_eval_min_steps}\n")
+        if resume_checkpoint_args:
+            f.write("[resume_checkpoint_args]\n")
+            for key, value in sorted(resume_checkpoint_args.items()):
+                f.write(f"{key}: {value}\n")
     if args_cli.online_eval:
         print(
             "[MBRL] Online eval schedule "
