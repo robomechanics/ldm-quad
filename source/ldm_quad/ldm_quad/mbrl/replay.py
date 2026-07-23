@@ -26,6 +26,54 @@ class ReplayBuffer:
     def __len__(self) -> int:
         return self.size
 
+    def state_dict(self) -> dict[str, object]:
+        """Return a CPU checkpoint payload for exact replay-buffer resume."""
+        return {
+            "capacity": self.capacity,
+            "obs_dim": int(self.obs.shape[-1]),
+            "action_dim": int(self.actions.shape[-1]),
+            "obs": self.obs,
+            "actions": self.actions,
+            "next_obs": self.next_obs,
+            "rewards": self.rewards,
+            "continues": self.continues,
+            "env_ids": self.env_ids,
+            "episode_ids": self.episode_ids,
+            "step_ids": self.step_ids,
+            "ptr": self.ptr,
+            "size": self.size,
+            "last_batch_size": self._last_batch_size,
+            "env_episode_ids": self._env_episode_ids,
+            "env_step_ids": self._env_step_ids,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, object]) -> None:
+        """Restore a replay buffer saved by :meth:`state_dict`."""
+        capacity = int(state_dict.get("capacity", -1))
+        obs_dim = int(state_dict.get("obs_dim", -1))
+        action_dim = int(state_dict.get("action_dim", -1))
+        if capacity != self.capacity or obs_dim != self.obs.shape[-1] or action_dim != self.actions.shape[-1]:
+            raise ValueError(
+                "Replay checkpoint shape mismatch: "
+                f"checkpoint capacity={capacity} obs_dim={obs_dim} action_dim={action_dim}, "
+                f"current capacity={self.capacity} obs_dim={self.obs.shape[-1]} action_dim={self.actions.shape[-1]}"
+            )
+
+        self.obs.copy_(state_dict["obs"])
+        self.actions.copy_(state_dict["actions"])
+        self.next_obs.copy_(state_dict["next_obs"])
+        self.rewards.copy_(state_dict["rewards"])
+        self.continues.copy_(state_dict["continues"])
+        self.env_ids.copy_(state_dict["env_ids"])
+        self.episode_ids.copy_(state_dict["episode_ids"])
+        self.step_ids.copy_(state_dict["step_ids"])
+        self.ptr = int(state_dict["ptr"])
+        self.size = int(state_dict["size"])
+        self._last_batch_size = int(state_dict.get("last_batch_size", 1))
+        self._env_episode_ids = state_dict["env_episode_ids"].clone().to(dtype=torch.long)
+        self._env_step_ids = state_dict["env_step_ids"].clone().to(dtype=torch.long)
+        self._valid_start_cache.clear()
+
     def add_batch(
         self,
         obs: torch.Tensor,

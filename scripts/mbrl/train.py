@@ -11,6 +11,7 @@ import os
 import random
 import sys
 import time
+import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime
 
@@ -41,6 +42,42 @@ parser.add_argument(
     action=argparse.BooleanOptionalAction,
     default=True,
     help="Restore optimizer state when --resume_checkpoint is set.",
+)
+parser.add_argument(
+    "--resume_replay",
+    type=str,
+    default=None,
+    help="Optional replay checkpoint saved by --save_replay. Defaults to replay_latest.pt next to --resume_checkpoint when present.",
+)
+parser.add_argument(
+    "--auto_resume_replay",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Automatically load replay_latest.pt from the resume checkpoint directory when it exists.",
+)
+parser.add_argument(
+    "--save_replay",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Save replay_latest.pt separately from model checkpoints so resumed runs keep replay and rolling metrics.",
+)
+parser.add_argument(
+    "--resume_warmup_steps",
+    type=int,
+    default=0,
+    help=(
+        "On cold replay resume, collect this many env steps before enabling planner updates. "
+        "Useful when resuming a model checkpoint without replay_latest.pt."
+    ),
+)
+parser.add_argument(
+    "--seed_with_model_policy",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help=(
+        "Use the learned model policy for bootstrap actions when planner/prior are unavailable. "
+        "Defaults to on for --resume_checkpoint runs without --prior_checkpoint, off otherwise."
+    ),
 )
 parser.add_argument("--seed_steps", type=int, default=50, help="Initial random environment steps before planning.")
 parser.add_argument(
@@ -554,6 +591,16 @@ def command_tracking_metrics(obs: torch.Tensor) -> dict[str, float]:
     return metrics
 
 
+def model_policy_actions(model: torch.nn.Module, obs: torch.Tensor, action_low: torch.Tensor, action_high: torch.Tensor) -> torch.Tensor | None:
+    if not hasattr(model, "encode") or not hasattr(model, "pi"):
+        return None
+    z = model.encode(obs)
+    actions = model.pi(z, deterministic=True)
+    if torch.isfinite(action_low).all() and torch.isfinite(action_high).all():
+        actions = clip_actions(actions, action_low, action_high)
+    return actions
+
+
 def infer_episode_horizon_steps(env: gym.Env, env_cfg: object) -> float:
     """Infer the max episode length so dense step rewards can be shown on a return scale."""
     max_episode_length = getattr(env.unwrapped, "max_episode_length", None)
@@ -614,6 +661,50 @@ def save_checkpoint(
     os.replace(tmp_path, path)
 
 
+def save_replay_checkpoint(
+    path: str,
+    replay: ReplayBuffer,
+    recent_returns: list[float],
+    recent_lengths: list[float],
+    recent_step_rewards: list[float],
+) -> None:
+    payload = {
+        "replay": replay.state_dict(),
+        "recent_returns": recent_returns,
+        "recent_lengths": recent_lengths,
+        "recent_step_rewards": recent_step_rewards,
+    }
+    tmp_path = f"{path}.tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def load_replay_checkpoint(
+    path: str,
+    replay: ReplayBuffer,
+) -> tuple[list[float], list[float], list[float]]:
+    checkpoint = torch.load(os.path.expanduser(path), map_location="cpu")
+    if not isinstance(checkpoint, dict) or "replay" not in checkpoint:
+        raise ValueError(f"Unsupported replay checkpoint format: {path}")
+
+    replay_state = checkpoint["replay"]
+    if not isinstance(replay_state, dict):
+        raise ValueError(f"Replay checkpoint state is not a dictionary: {path}")
+    replay.load_state_dict(replay_state)
+    recent_returns = list(checkpoint.get("recent_returns") or [])
+    recent_lengths = list(checkpoint.get("recent_lengths") or [])
+    recent_step_rewards = list(checkpoint.get("recent_step_rewards") or [])
+    return recent_returns, recent_lengths, recent_step_rewards
+
+
+def infer_replay_checkpoint_path(resume_checkpoint: str | None) -> str | None:
+    if not resume_checkpoint:
+        return None
+    checkpoint_dir = os.path.dirname(os.path.abspath(os.path.expanduser(resume_checkpoint)))
+    replay_path = os.path.join(checkpoint_dir, "replay_latest.pt")
+    return replay_path if os.path.exists(replay_path) else None
+
+
 def load_training_checkpoint(
     path: str,
     model: torch.nn.Module,
@@ -623,18 +714,30 @@ def load_training_checkpoint(
     device: torch.device,
     load_optim: bool,
 ) -> tuple[TrainState, dict[str, object]]:
-    checkpoint = torch.load(os.path.expanduser(path), map_location=device)
+    expanded_path = os.path.expanduser(path)
+    if not zipfile.is_zipfile(expanded_path):
+        raise ValueError(f"Checkpoint archive is invalid or incomplete: {path}")
+    load_start_time = time.monotonic()
+    checkpoint = torch.load(expanded_path, map_location="cpu")
     if not isinstance(checkpoint, dict) or "model" not in checkpoint:
         raise ValueError(f"Unsupported MBRL checkpoint format: {path}")
+    print(f"[MBRL] Checkpoint file loaded to CPU in {time.monotonic() - load_start_time:.2f}s", flush=True)
 
+    model_load_start_time = time.monotonic()
     model.load_state_dict(checkpoint["model"])
+    print(f"[MBRL] Model weights restored in {time.monotonic() - model_load_start_time:.2f}s", flush=True)
     if load_optim:
+        optim_load_start_time = time.monotonic()
         optimizer_state = checkpoint.get("optimizer")
         if optimizer_state is not None:
             optimizer.load_state_dict(optimizer_state)
         policy_optimizer_state = checkpoint.get("policy_optimizer")
         if policy_optimizer is not None and policy_optimizer_state is not None:
             policy_optimizer.load_state_dict(policy_optimizer_state)
+        print(f"[MBRL] Optimizer state restored in {time.monotonic() - optim_load_start_time:.2f}s", flush=True)
+    else:
+        checkpoint.pop("optimizer", None)
+        checkpoint.pop("policy_optimizer", None)
 
     state_dict = checkpoint.get("train_state") or {}
     if not isinstance(state_dict, dict):
@@ -766,6 +869,13 @@ def run_heldout_eval(
 
 def main() -> None:
     set_seed(args_cli.seed)
+    print(
+        "[MBRL] Startup "
+        f"task={args_cli.task} num_envs={args_cli.num_envs} "
+        f"resume_checkpoint={args_cli.resume_checkpoint or 'none'} "
+        f"resume_load_optim={int(bool(args_cli.resume_load_optim))}",
+        flush=True,
+    )
     if args_cli.save_best_metric == "eval_return" and not args_cli.online_eval:
         raise ValueError("--save_best_metric eval_return requires --online_eval.")
     if args_cli.early_stop_metric == "eval_return" and not args_cli.online_eval:
@@ -782,12 +892,14 @@ def main() -> None:
     apply_fixed_velocity_command(env_cfg)
     env = gym.make(args_cli.task, cfg=env_cfg)
     device = torch.device(env.unwrapped.device)
+    print(f"[MBRL] Environment created device={device}", flush=True)
     log_dir = make_log_dir()
     metrics_path = os.path.join(log_dir, "metrics.csv")
     writer = SummaryWriter(log_dir=log_dir)
     wandb_run = init_wandb(log_dir)
     episode_horizon_steps = infer_episode_horizon_steps(env, env_cfg)
 
+    print("[MBRL] Resetting environment", flush=True)
     obs, _ = env.reset()
     obs = flatten_obs(obs, device)
     num_envs = obs.shape[0]
@@ -796,6 +908,7 @@ def main() -> None:
     action_shape = env.action_space.shape
     action_dim = int(action_shape[-1]) if len(action_shape) > 0 else int(np.prod(action_shape))
     obs_dim = obs.shape[-1]
+    print(f"[MBRL] Environment reset complete obs_dim={obs_dim} action_dim={action_dim}", flush=True)
 
     action_low, action_high, action_bounds_finite = get_action_bounds(env.action_space, device, action_dim)
     setattr(args_cli, "action_bounds_finite", action_bounds_finite)
@@ -814,11 +927,15 @@ def main() -> None:
         print(f"[MBRL] Loaded locomotion prior ({args_cli.prior_type}): {os.path.abspath(args_cli.prior_checkpoint)}", flush=True)
 
     replay = ReplayBuffer(args_cli.buffer_capacity, obs_dim=obs_dim, action_dim=action_dim)
+    recent_returns: list[float] = []
+    recent_lengths: list[float] = []
+    recent_step_rewards: list[float] = []
     latent_physical_indices = parse_index_list(args_cli.latent_physical_indices)
     if any(index < 0 or index >= obs_dim for index in latent_physical_indices):
         raise ValueError(
             f"--latent_physical_indices must be within observation dim {obs_dim}: {latent_physical_indices}"
         )
+    print(f"[MBRL] Building {args_cli.model_type} world model", flush=True)
     if args_cli.model_type == "latent":
         model = LatentWorldModel(
             obs_dim=obs_dim,
@@ -884,10 +1001,13 @@ def main() -> None:
         optimizer = torch.optim.Adam(model.parameters(), lr=args_cli.lr)
         policy_optimizer = None
     model.eval()
+    print("[MBRL] World model built", flush=True)
 
     train_state = TrainState()
     resume_checkpoint_args: dict[str, object] = {}
+    replay_restored = False
     if args_cli.resume_checkpoint:
+        print(f"[MBRL] Loading training checkpoint path={os.path.abspath(os.path.expanduser(args_cli.resume_checkpoint))}", flush=True)
         train_state, resume_checkpoint_args = load_training_checkpoint(
             args_cli.resume_checkpoint,
             model,
@@ -908,7 +1028,47 @@ def main() -> None:
             f"episodes_finished={train_state.episodes_finished} load_optim={int(bool(args_cli.resume_load_optim))}",
             flush=True,
         )
+        replay_checkpoint_path = args_cli.resume_replay
+        if replay_checkpoint_path is None and args_cli.auto_resume_replay:
+            replay_checkpoint_path = infer_replay_checkpoint_path(args_cli.resume_checkpoint)
+        if replay_checkpoint_path is not None:
+            recent_returns, recent_lengths, recent_step_rewards = load_replay_checkpoint(replay_checkpoint_path, replay)
+            replay_restored = True
+            print(
+                "[MBRL] Resumed replay checkpoint "
+                f"path={os.path.abspath(os.path.expanduser(replay_checkpoint_path))} "
+                f"buffer={len(replay)} recent_returns={len(recent_returns)} "
+                f"recent_lengths={len(recent_lengths)} recent_step_rewards={len(recent_step_rewards)}",
+                flush=True,
+            )
+        elif args_cli.resume_replay is not None:
+            raise FileNotFoundError(f"Replay checkpoint not found: {args_cli.resume_replay}")
+        elif args_cli.auto_resume_replay:
+            print("[MBRL] No replay checkpoint found next to resume checkpoint; starting with empty replay.", flush=True)
 
+    resolved_seed_with_model_policy = (
+        bool(args_cli.resume_checkpoint and action_prior is None)
+        if args_cli.seed_with_model_policy is None
+        else bool(args_cli.seed_with_model_policy)
+    )
+    setattr(args_cli, "resolved_seed_with_model_policy", resolved_seed_with_model_policy)
+    cold_replay_resume = bool(args_cli.resume_checkpoint and not replay_restored and len(replay) == 0)
+    resume_warmup_until = (
+        train_state.env_steps + max(0, int(args_cli.resume_warmup_steps))
+        if cold_replay_resume
+        else train_state.env_steps
+    )
+    setattr(args_cli, "resolved_resume_warmup_until", resume_warmup_until)
+    if cold_replay_resume:
+        print(
+            "[MBRL] Cold replay resume "
+            f"seed_with_model_policy={int(resolved_seed_with_model_policy)} "
+            f"resume_warmup_steps={max(0, int(args_cli.resume_warmup_steps))} "
+            f"warmup_until={resume_warmup_until}",
+            flush=True,
+        )
+
+    print("[MBRL] Building planner", flush=True)
     planner = build_planner(
         planner_name=args_cli.planner,
         model=model,
@@ -951,6 +1111,7 @@ def main() -> None:
         disagreement_penalty=args_cli.state_disagreement_penalty if args_cli.model_type == "state" else 0.0,
         model_policy_candidate_count=args_cli.num_pi_trajs if args_cli.model_type == "state" else 0,
     )
+    print("[MBRL] Planner built", flush=True)
     eval_env = None
     eval_planner = None
     if args_cli.online_eval:
@@ -1059,9 +1220,6 @@ def main() -> None:
 
     episode_returns = torch.zeros(num_envs, dtype=torch.float32, device=device)
     episode_lengths = torch.zeros(num_envs, dtype=torch.float32, device=device)
-    recent_returns: list[float] = []
-    recent_lengths: list[float] = []
-    recent_step_rewards: list[float] = []
     if args_cli.model_type == "latent":
         latest_losses = {
             "loss": 0.0,
@@ -1124,6 +1282,7 @@ def main() -> None:
     planner_min_length = args_cli.planner_min_length_fraction * episode_horizon_steps
     planner_active = False
     planner_was_active = False
+    latest_control_mode = "init"
     best_checkpoint_metric = float(train_state.best_mean_return)
     latest_eval_metrics = zero_eval_metrics()
     online_eval_min_steps = (
@@ -1165,6 +1324,7 @@ def main() -> None:
             )
             planner_ready = (
                 train_state.env_steps >= planner_start_steps
+                and train_state.env_steps >= resume_warmup_until
                 and replay_ready
                 and (not prior_policy_available or recent_mean_length >= planner_min_length)
                 and train_state.env_steps >= planner_disabled_until
@@ -1181,9 +1341,24 @@ def main() -> None:
                         actions = actions + args_cli.seed_policy_noise * torch.randn_like(actions)
                     if action_bounds_finite:
                         actions = clip_actions(actions, action_low, action_high)
+                    latest_control_mode = "prior"
+                elif resolved_seed_with_model_policy:
+                    model_policy_action = model_policy_actions(model, obs, action_low, action_high)
+                    if model_policy_action is not None:
+                        actions = model_policy_action
+                        if args_cli.seed_policy_noise > 0.0:
+                            actions = actions + args_cli.seed_policy_noise * torch.randn_like(actions)
+                        if action_bounds_finite:
+                            actions = clip_actions(actions, action_low, action_high)
+                        latest_control_mode = "model_pi"
+                    else:
+                        actions = random_actions(obs.shape[0], action_low, action_high)
+                        latest_control_mode = "random"
                 else:
                     actions = random_actions(obs.shape[0], action_low, action_high)
+                    latest_control_mode = "random"
             else:
+                latest_control_mode = "planner"
                 if not planner_was_active:
                     print(
                         f"[MBRL] planner starting at step={train_state.env_steps} "
@@ -1247,6 +1422,7 @@ def main() -> None:
             if args_cli.model_type in {"latent", "state"}
             else len(replay) >= args_cli.batch_size
         )
+        train_ready = train_ready and train_state.env_steps >= resume_warmup_until
         if train_ready:
             model.train()
             for _ in range(args_cli.updates_per_step):
@@ -1361,6 +1537,8 @@ def main() -> None:
                 "best_mean_return": train_state.best_mean_return,
                 "planner_active": int(planner_active),
                 "planner_disabled_until": planner_disabled_until,
+                "resume_warmup_until": resume_warmup_until,
+                "seed_with_model_policy": int(resolved_seed_with_model_policy),
                 "action_bounds_finite": int(action_bounds_finite),
                 "wall_time_s": elapsed_s,
                 "steps_per_second": steps_per_second,
@@ -1384,6 +1562,8 @@ def main() -> None:
             writer.add_scalar("Train / episodes_finished", train_state.episodes_finished, train_state.env_steps)
             writer.add_scalar("Train / planner_active", int(planner_active), train_state.env_steps)
             writer.add_scalar("Train / planner_disabled_until", planner_disabled_until, train_state.env_steps)
+            writer.add_scalar("Train / resume_warmup_until", resume_warmup_until, train_state.env_steps)
+            writer.add_scalar("Train / seed_with_model_policy", int(resolved_seed_with_model_policy), train_state.env_steps)
             writer.add_scalar("Train / action_bounds_finite", int(action_bounds_finite), train_state.env_steps)
             writer.add_scalar("Time / wall_time_s", elapsed_s, train_state.env_steps)
             writer.add_scalar("Time / steps_per_second", steps_per_second, train_state.env_steps)
@@ -1406,7 +1586,7 @@ def main() -> None:
                 f"estimated_return100={estimated_return_100:.3f} "
                 f"step_reward100={mean_step_reward_100:.3f} "
                 f"len100={mean_length:.2f} "
-                f"planner={'on' if planner_active else 'prior'} "
+                f"control={latest_control_mode} "
                 f"residual_norm={latest_planner_diagnostics['planner_residual_norm_mean']:.3f} "
                 f"fallback={latest_planner_diagnostics['planner_prior_fallback_fraction']:.2f} "
                 f"model_margin={latest_planner_diagnostics['planner_predicted_return_margin_mean']:.3f} "
@@ -1495,9 +1675,15 @@ def main() -> None:
         if train_state.env_steps % args_cli.save_interval == 0:
             checkpoint_path = os.path.join(log_dir, "checkpoints", f"model_{train_state.env_steps:05d}.pt")
             save_checkpoint(checkpoint_path, model, optimizer, policy_optimizer, train_state, args_cli)
+            if args_cli.save_replay:
+                replay_path = os.path.join(log_dir, "checkpoints", "replay_latest.pt")
+                save_replay_checkpoint(replay_path, replay, recent_returns, recent_lengths, recent_step_rewards)
 
     final_path = os.path.join(log_dir, "checkpoints", "model_final.pt")
     save_checkpoint(final_path, model, optimizer, policy_optimizer, train_state, args_cli)
+    if args_cli.save_replay:
+        replay_path = os.path.join(log_dir, "checkpoints", "replay_latest.pt")
+        save_replay_checkpoint(replay_path, replay, recent_returns, recent_lengths, recent_step_rewards)
     if early_stop_reason is not None:
         early_stop_path = os.path.join(log_dir, "early_stop.txt")
         with open(early_stop_path, "w", encoding="utf-8") as f:
