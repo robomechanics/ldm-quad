@@ -325,7 +325,13 @@ parser.add_argument(
     default=False,
     help="Create a separate eval env. Disabled by default because Isaac can hang when constructing a second env in one process.",
 )
-parser.add_argument("--save_interval", type=int, default=50, help="Steps between checkpoints.")
+parser.add_argument("--save_interval", type=int, default=1000, help="Steps between periodic checkpoints.")
+parser.add_argument(
+    "--max_checkpoints",
+    type=int,
+    default=5,
+    help="Maximum numbered model_*.pt checkpoints to keep. Set <0 to keep all periodic checkpoints.",
+)
 parser.add_argument(
     "--save_best_metric",
     type=str,
@@ -659,6 +665,25 @@ def save_checkpoint(
     tmp_path = f"{path}.tmp"
     torch.save(payload, tmp_path)
     os.replace(tmp_path, path)
+
+
+def prune_numbered_checkpoints(checkpoint_dir: str, max_checkpoints: int) -> None:
+    if max_checkpoints < 0:
+        return
+    numbered: list[tuple[int, str]] = []
+    for filename in os.listdir(checkpoint_dir):
+        if not filename.startswith("model_") or not filename.endswith(".pt"):
+            continue
+        step_text = filename[len("model_") : -len(".pt")]
+        if not step_text.isdigit():
+            continue
+        numbered.append((int(step_text), os.path.join(checkpoint_dir, filename)))
+
+    excess = len(numbered) - max_checkpoints
+    if excess <= 0:
+        return
+    for _, path in sorted(numbered)[:excess]:
+        os.remove(path)
 
 
 def save_replay_checkpoint(
@@ -1673,10 +1698,12 @@ def main() -> None:
                     break
 
         if train_state.env_steps % args_cli.save_interval == 0:
-            checkpoint_path = os.path.join(log_dir, "checkpoints", f"model_{train_state.env_steps:05d}.pt")
+            checkpoint_dir = os.path.join(log_dir, "checkpoints")
+            checkpoint_path = os.path.join(checkpoint_dir, f"model_{train_state.env_steps:05d}.pt")
             save_checkpoint(checkpoint_path, model, optimizer, policy_optimizer, train_state, args_cli)
+            prune_numbered_checkpoints(checkpoint_dir, args_cli.max_checkpoints)
             if args_cli.save_replay:
-                replay_path = os.path.join(log_dir, "checkpoints", "replay_latest.pt")
+                replay_path = os.path.join(checkpoint_dir, "replay_latest.pt")
                 save_replay_checkpoint(replay_path, replay, recent_returns, recent_lengths, recent_step_rewards)
 
     final_path = os.path.join(log_dir, "checkpoints", "model_final.pt")
