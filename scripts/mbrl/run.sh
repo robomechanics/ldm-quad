@@ -47,4 +47,4 @@ python3 scripts/mbrl/train.py \
   --eval_interval 10 \
   --wandb \
   --wandb_project ldm-quad-mbrl \
-  --wandb_name tdmpc_wander_resume_221k_modelpi_warmup_safe_checkpoints
+  --wandb_name tdmpc_wander_resume_221k_modelpi_warmup_disk_metrics

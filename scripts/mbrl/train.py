@@ -9,6 +9,7 @@ import argparse
 import csv
 import os
 import random
+import shutil
 import sys
 import time
 import zipfile
@@ -684,6 +685,36 @@ def prune_numbered_checkpoints(checkpoint_dir: str, max_checkpoints: int) -> Non
         return
     for _, path in sorted(numbered)[:excess]:
         os.remove(path)
+
+
+def disk_usage_metrics(log_dir: str) -> dict[str, float]:
+    total_bytes = 0
+    checkpoint_count = 0
+    replay_bytes = 0
+    checkpoint_dir = os.path.join(log_dir, "checkpoints")
+    for root, _, files in os.walk(log_dir):
+        for filename in files:
+            path = os.path.join(root, filename)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            total_bytes += size
+            if root == checkpoint_dir and filename.startswith("model_") and filename.endswith(".pt"):
+                checkpoint_count += 1
+            if root == checkpoint_dir and filename.startswith("replay_latest.pt"):
+                replay_bytes += size
+
+    disk = shutil.disk_usage(log_dir)
+    gib = 1024.0**3
+    mib = 1024.0**2
+    return {
+        "log_dir_size_gb": total_bytes / gib,
+        "disk_free_gb": disk.free / gib,
+        "disk_used_percent": 100.0 * (disk.used / max(disk.total, 1)),
+        "model_checkpoint_count": float(checkpoint_count),
+        "replay_checkpoint_mb": replay_bytes / mib,
+    }
 
 
 def save_replay_checkpoint(
@@ -1545,6 +1576,7 @@ def main() -> None:
             remaining_steps = max(args_cli.train_steps - train_state.env_steps, 0)
             steps_per_second = train_state.env_steps / max(elapsed_s, 1e-6)
             eta_s = remaining_steps / max(steps_per_second, 1e-6)
+            system_metrics = disk_usage_metrics(log_dir)
             row = {
                 "env_steps": train_state.env_steps,
                 "gradient_updates": train_state.gradient_updates,
@@ -1568,6 +1600,7 @@ def main() -> None:
                 "wall_time_s": elapsed_s,
                 "steps_per_second": steps_per_second,
                 "eta_s": eta_s,
+                **system_metrics,
                 **tracking_metrics,
                 **latest_eval_metrics,
                 **latest_planner_diagnostics,
@@ -1593,6 +1626,8 @@ def main() -> None:
             writer.add_scalar("Time / wall_time_s", elapsed_s, train_state.env_steps)
             writer.add_scalar("Time / steps_per_second", steps_per_second, train_state.env_steps)
             writer.add_scalar("Time / eta_s", eta_s, train_state.env_steps)
+            for system_name, system_value in system_metrics.items():
+                writer.add_scalar(f"System / {system_name}", system_value, train_state.env_steps)
             for tracking_name, tracking_value in tracking_metrics.items():
                 writer.add_scalar(f"Tracking / {tracking_name}", tracking_value, train_state.env_steps)
             for eval_name, eval_value in latest_eval_metrics.items():
