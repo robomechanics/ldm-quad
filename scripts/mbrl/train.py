@@ -337,7 +337,7 @@ parser.add_argument(
     "--save_best_metric",
     type=str,
     default="mean_return",
-    choices=["mean_return", "estimated_return", "eval_return"],
+    choices=["mean_return", "estimated_return", "eval_return", "eval_tracking"],
     help="Metric used to save checkpoints/model_best.pt.",
 )
 parser.add_argument(
@@ -366,8 +366,14 @@ parser.add_argument(
     "--early_stop_metric",
     type=str,
     default="mean_return",
-    choices=["mean_return", "estimated_return", "eval_return"],
+    choices=["mean_return", "estimated_return", "eval_return", "eval_tracking"],
     help="Metric used for early-stop plateau detection.",
+)
+parser.add_argument(
+    "--eval_tracking_yaw_weight",
+    type=float,
+    default=0.25,
+    help="Yaw tracking weight used by --save_best_metric eval_tracking and --early_stop_metric eval_tracking.",
 )
 parser.add_argument(
     "--early_stop_return",
@@ -821,6 +827,7 @@ def zero_eval_metrics() -> dict[str, float]:
         "eval_tracking_x_abs_error": 0.0,
         "eval_tracking_y_abs_error": 0.0,
         "eval_tracking_yaw_abs_error": 0.0,
+        "eval_tracking_score": 0.0,
     }
 
 
@@ -920,6 +927,11 @@ def run_heldout_eval(
         metrics["eval_tracking_x_abs_error"] = float(tracking_error[0].item())
         metrics["eval_tracking_y_abs_error"] = float(tracking_error[1].item())
         metrics["eval_tracking_yaw_abs_error"] = float(tracking_error[2].item())
+        metrics["eval_tracking_score"] = -float(
+            tracking_error[0].item()
+            + tracking_error[1].item()
+            + args_cli.eval_tracking_yaw_weight * tracking_error[2].item()
+        )
     return metrics
 
 
@@ -932,10 +944,10 @@ def main() -> None:
         f"resume_load_optim={int(bool(args_cli.resume_load_optim))}",
         flush=True,
     )
-    if args_cli.save_best_metric == "eval_return" and not args_cli.online_eval:
-        raise ValueError("--save_best_metric eval_return requires --online_eval.")
-    if args_cli.early_stop_metric == "eval_return" and not args_cli.online_eval:
-        raise ValueError("--early_stop_metric eval_return requires --online_eval.")
+    if args_cli.save_best_metric in {"eval_return", "eval_tracking"} and not args_cli.online_eval:
+        raise ValueError(f"--save_best_metric {args_cli.save_best_metric} requires --online_eval.")
+    if args_cli.early_stop_metric in {"eval_return", "eval_tracking"} and not args_cli.online_eval:
+        raise ValueError(f"--early_stop_metric {args_cli.early_stop_metric} requires --online_eval.")
     if args_cli.online_eval and args_cli.online_eval_interval <= 0:
         raise ValueError("--online_eval_interval must be positive when --online_eval is enabled.")
     env_cfg = parse_env_cfg(
@@ -1570,6 +1582,8 @@ def main() -> None:
                 save_best_value = mean_return
             elif args_cli.save_best_metric == "estimated_return":
                 save_best_value = estimated_return_100
+            elif args_cli.save_best_metric == "eval_tracking":
+                save_best_value = latest_eval_metrics["eval_tracking_score"]
             else:
                 save_best_value = latest_eval_metrics["eval_mean_return"]
             elapsed_s = time.monotonic() - train_start_time
@@ -1674,6 +1688,9 @@ def main() -> None:
             if args_cli.save_best_metric == "eval_return":
                 best_has_metric = latest_eval_metrics["eval_completed_episodes"] > 0
                 best_planner_ok = True
+            elif args_cli.save_best_metric == "eval_tracking":
+                best_has_metric = bool(latest_eval_metrics["eval_ran"])
+                best_planner_ok = True
             else:
                 best_has_metric = recent_returns or args_cli.save_best_metric == "estimated_return"
                 best_planner_ok = planner_active or not args_cli.save_best_requires_planner
@@ -1691,6 +1708,10 @@ def main() -> None:
                     stop_metric = estimated_return_100
                     stop_metric_ready = True
                     stop_length = mean_length
+                elif args_cli.early_stop_metric == "eval_tracking":
+                    stop_metric = latest_eval_metrics["eval_tracking_score"]
+                    stop_metric_ready = bool(latest_eval_metrics["eval_ran"])
+                    stop_length = latest_eval_metrics["eval_mean_length"] or current_length_mean
                 else:
                     stop_metric = latest_eval_metrics["eval_mean_return"]
                     stop_metric_ready = (

@@ -19,7 +19,7 @@ class UnitreeGo2RandFlatEnvCfg(UnitreeGo2RoughEnvCfg):
         super().__post_init__()
 
         # override rewards
-        self.rewards.flat_orientation_l2.weight = -2.5
+        self.rewards.flat_orientation_l2.weight = -5.0
         self.rewards.feet_air_time.weight = 0.25
 
         # change terrain to flat
@@ -37,11 +37,11 @@ class UnitreeGo2RandFlatEnvCfg(UnitreeGo2RoughEnvCfg):
         self.terminations.base_contact = None
         self.terminations.base_height = DoneTerm(
             func=base_mdp.root_height_below_minimum,
-            params={"minimum_height": 0.18},
+            params={"minimum_height": 0.25},
         )
         self.terminations.bad_orientation = DoneTerm(
             func=base_mdp.bad_orientation,
-            params={"limit_angle": math.radians(60.0)},
+            params={"limit_angle": math.radians(35.0)},
         )
         # no height scan
         self.scene.height_scanner = None
