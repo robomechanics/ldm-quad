@@ -22,7 +22,7 @@ python3 scripts/mbrl/train.py \
   --planner mppi \
   --planner_iterations 6 \
   --planner_start_steps 5000 \
-  --planner_min_length_fraction 0.9 \
+  --planner_min_length_fraction 0.0 \
   --planner_recovery_steps 1000 \
   --planner_recent_episodes 100 \
   --planner_temperature 0.5 \
@@ -43,18 +43,8 @@ python3 scripts/mbrl/train.py \
   --save_interval 5000 \
   --max_checkpoints 5 \
   --save_replay \
-  --online_eval \
-  --online_eval_interval 5000 \
-  --online_eval_min_steps 10000 \
-  --online_eval_episodes 8 \
-  --online_eval_max_steps 1000 \
-  --online_eval_max_seconds 180 \
-  --online_eval_candidates 128 \
-  --online_eval_elites 16 \
-  --online_eval_iterations 2 \
-  --online_eval_num_pi_trajs 4 \
-  --save_best_metric eval_tracking \
+  --save_best_metric tracking \
   --eval_interval 50 \
   --wandb \
   --wandb_project ldm-quad-mbrl \
-  --wandb_name tdmpc_wander_noprior_strict_evaltracking_fast
+  --wandb_name tdmpc_wander_noprior_strict_tracking_fast

@@ -337,7 +337,7 @@ parser.add_argument(
     "--save_best_metric",
     type=str,
     default="mean_return",
-    choices=["mean_return", "estimated_return", "eval_return", "eval_tracking"],
+    choices=["mean_return", "estimated_return", "tracking", "eval_return", "eval_tracking"],
     help="Metric used to save checkpoints/model_best.pt.",
 )
 parser.add_argument(
@@ -366,14 +366,14 @@ parser.add_argument(
     "--early_stop_metric",
     type=str,
     default="mean_return",
-    choices=["mean_return", "estimated_return", "eval_return", "eval_tracking"],
+    choices=["mean_return", "estimated_return", "tracking", "eval_return", "eval_tracking"],
     help="Metric used for early-stop plateau detection.",
 )
 parser.add_argument(
     "--eval_tracking_yaw_weight",
     type=float,
     default=0.25,
-    help="Yaw tracking weight used by --save_best_metric eval_tracking and --early_stop_metric eval_tracking.",
+    help="Yaw tracking weight used by tracking/eval_tracking best-checkpoint and early-stop metrics.",
 )
 parser.add_argument(
     "--early_stop_return",
@@ -575,6 +575,7 @@ def command_tracking_metrics(obs: torch.Tensor) -> dict[str, float]:
         "tracking_x_abs_error": 0.0,
         "tracking_y_abs_error": 0.0,
         "tracking_yaw_abs_error": 0.0,
+        "tracking_score": 0.0,
     }
     if obs.ndim != 2 or obs.shape[-1] < 6:
         return metrics
@@ -601,6 +602,11 @@ def command_tracking_metrics(obs: torch.Tensor) -> dict[str, float]:
     metrics["tracking_x_abs_error"] = float(error[:, 0].mean().item())
     metrics["tracking_y_abs_error"] = float(error[:, 1].mean().item())
     metrics["tracking_yaw_abs_error"] = float(error[:, 2].mean().item())
+    metrics["tracking_score"] = -float(
+        error[:, 0].mean().item()
+        + error[:, 1].mean().item()
+        + args_cli.eval_tracking_yaw_weight * error[:, 2].mean().item()
+    )
     return metrics
 
 
@@ -652,6 +658,50 @@ def init_wandb(log_dir: str) -> object | None:
     except Exception as exc:
         print(f"[MBRL] Failed to initialize W&B logging: {exc}", flush=True)
         return None
+
+
+class SafeSummaryWriter:
+    """TensorBoard writer that disables itself instead of crashing training on I/O errors."""
+
+    def __init__(self, log_dir: str):
+        self.writer: SummaryWriter | None = SummaryWriter(log_dir=log_dir)
+        self.disabled = False
+
+    def _disable(self, exc: Exception) -> None:
+        if self.disabled:
+            return
+        self.disabled = True
+        print(f"[MBRL] Disabling TensorBoard logging after writer error: {exc}", flush=True)
+        if self.writer is not None:
+            try:
+                self.writer.close()
+            except Exception:
+                pass
+        self.writer = None
+
+    def add_scalar(self, *args: object, **kwargs: object) -> None:
+        if self.writer is None:
+            return
+        try:
+            self.writer.add_scalar(*args, **kwargs)
+        except (OSError, RuntimeError) as exc:
+            self._disable(exc)
+
+    def flush(self) -> None:
+        if self.writer is None:
+            return
+        try:
+            self.writer.flush()
+        except (OSError, RuntimeError) as exc:
+            self._disable(exc)
+
+    def close(self) -> None:
+        if self.writer is None:
+            return
+        try:
+            self.writer.close()
+        except (OSError, RuntimeError) as exc:
+            self._disable(exc)
 
 
 def save_checkpoint(
@@ -963,7 +1013,7 @@ def main() -> None:
     print(f"[MBRL] Environment created device={device}", flush=True)
     log_dir = make_log_dir()
     metrics_path = os.path.join(log_dir, "metrics.csv")
-    writer = SummaryWriter(log_dir=log_dir)
+    writer = SafeSummaryWriter(log_dir=log_dir)
     wandb_run = init_wandb(log_dir)
     episode_horizon_steps = infer_episode_horizon_steps(env, env_cfg)
 
@@ -1582,6 +1632,8 @@ def main() -> None:
                 save_best_value = mean_return
             elif args_cli.save_best_metric == "estimated_return":
                 save_best_value = estimated_return_100
+            elif args_cli.save_best_metric == "tracking":
+                save_best_value = tracking_metrics["tracking_score"]
             elif args_cli.save_best_metric == "eval_tracking":
                 save_best_value = latest_eval_metrics["eval_tracking_score"]
             else:
@@ -1691,6 +1743,9 @@ def main() -> None:
             elif args_cli.save_best_metric == "eval_tracking":
                 best_has_metric = bool(latest_eval_metrics["eval_ran"])
                 best_planner_ok = True
+            elif args_cli.save_best_metric == "tracking":
+                best_has_metric = True
+                best_planner_ok = planner_active or not args_cli.save_best_requires_planner
             else:
                 best_has_metric = recent_returns or args_cli.save_best_metric == "estimated_return"
                 best_planner_ok = planner_active or not args_cli.save_best_requires_planner
@@ -1708,6 +1763,10 @@ def main() -> None:
                     stop_metric = estimated_return_100
                     stop_metric_ready = True
                     stop_length = mean_length
+                elif args_cli.early_stop_metric == "tracking":
+                    stop_metric = tracking_metrics["tracking_score"]
+                    stop_metric_ready = True
+                    stop_length = mean_length or current_length_mean
                 elif args_cli.early_stop_metric == "eval_tracking":
                     stop_metric = latest_eval_metrics["eval_tracking_score"]
                     stop_metric_ready = bool(latest_eval_metrics["eval_ran"])
