@@ -337,7 +337,7 @@ parser.add_argument(
     "--save_best_metric",
     type=str,
     default="mean_return",
-    choices=["mean_return", "estimated_return", "tracking", "eval_return", "eval_tracking"],
+    choices=["mean_return", "estimated_return", "tracking", "stable_tracking", "eval_return", "eval_tracking"],
     help="Metric used to save checkpoints/model_best.pt.",
 )
 parser.add_argument(
@@ -366,7 +366,7 @@ parser.add_argument(
     "--early_stop_metric",
     type=str,
     default="mean_return",
-    choices=["mean_return", "estimated_return", "tracking", "eval_return", "eval_tracking"],
+    choices=["mean_return", "estimated_return", "tracking", "stable_tracking", "eval_return", "eval_tracking"],
     help="Metric used for early-stop plateau detection.",
 )
 parser.add_argument(
@@ -1227,7 +1227,7 @@ def main() -> None:
         use_best_candidate=args_cli.planner_use_best_candidate,
         terminal_value=args_cli.model_type == "state" and args_cli.state_terminal_value,
         disagreement_penalty=args_cli.state_disagreement_penalty if args_cli.model_type == "state" else 0.0,
-        model_policy_candidate_count=args_cli.num_pi_trajs if args_cli.model_type == "state" else 0,
+        model_policy_candidate_count=args_cli.num_pi_trajs if args_cli.model_type in {"state", "latent"} else 0,
     )
     print("[MBRL] Planner built", flush=True)
     eval_env = None
@@ -1313,7 +1313,7 @@ def main() -> None:
             disagreement_penalty=args_cli.state_disagreement_penalty if args_cli.model_type == "state" else 0.0,
             model_policy_candidate_count=(
                 min(args_cli.online_eval_num_pi_trajs, args_cli.online_eval_candidates)
-                if args_cli.model_type == "state"
+                if args_cli.model_type in {"state", "latent"}
                 else 0
             ),
         )
@@ -1401,7 +1401,10 @@ def main() -> None:
     planner_active = False
     planner_was_active = False
     latest_control_mode = "init"
-    best_checkpoint_metric = float(train_state.best_mean_return)
+    if args_cli.save_best_metric in {"tracking", "stable_tracking", "eval_tracking"}:
+        best_checkpoint_metric = float("-inf")
+    else:
+        best_checkpoint_metric = float(train_state.best_mean_return)
     latest_eval_metrics = zero_eval_metrics()
     online_eval_min_steps = (
         args_cli.online_eval_min_steps
@@ -1590,6 +1593,7 @@ def main() -> None:
             estimated_return_100 = mean_step_reward_100 * episode_horizon_steps
             train_state.best_mean_return = max(train_state.best_mean_return, mean_return)
             tracking_metrics = command_tracking_metrics(obs)
+            stable_tracking_score = tracking_metrics["tracking_score"] + min(mean_length / max(episode_horizon_steps, 1.0), 1.0)
             eval_due = (
                 args_cli.online_eval
                 and eval_env is not None
@@ -1634,6 +1638,8 @@ def main() -> None:
                 save_best_value = estimated_return_100
             elif args_cli.save_best_metric == "tracking":
                 save_best_value = tracking_metrics["tracking_score"]
+            elif args_cli.save_best_metric == "stable_tracking":
+                save_best_value = stable_tracking_score
             elif args_cli.save_best_metric == "eval_tracking":
                 save_best_value = latest_eval_metrics["eval_tracking_score"]
             else:
@@ -1668,6 +1674,7 @@ def main() -> None:
                 "eta_s": eta_s,
                 **system_metrics,
                 **tracking_metrics,
+                "stable_tracking_score": stable_tracking_score,
                 **latest_eval_metrics,
                 **latest_planner_diagnostics,
                 **latest_losses,
@@ -1696,6 +1703,7 @@ def main() -> None:
                 writer.add_scalar(f"System / {system_name}", system_value, train_state.env_steps)
             for tracking_name, tracking_value in tracking_metrics.items():
                 writer.add_scalar(f"Tracking / {tracking_name}", tracking_value, train_state.env_steps)
+            writer.add_scalar("Tracking / stable_tracking_score", stable_tracking_score, train_state.env_steps)
             for eval_name, eval_value in latest_eval_metrics.items():
                 writer.add_scalar(f"Eval / {eval_name}", eval_value, train_state.env_steps)
             for diagnostic_name, diagnostic_value in latest_planner_diagnostics.items():
@@ -1746,6 +1754,9 @@ def main() -> None:
             elif args_cli.save_best_metric == "tracking":
                 best_has_metric = True
                 best_planner_ok = planner_active or not args_cli.save_best_requires_planner
+            elif args_cli.save_best_metric == "stable_tracking":
+                best_has_metric = True
+                best_planner_ok = planner_active or not args_cli.save_best_requires_planner
             else:
                 best_has_metric = recent_returns or args_cli.save_best_metric == "estimated_return"
                 best_planner_ok = planner_active or not args_cli.save_best_requires_planner
@@ -1765,6 +1776,10 @@ def main() -> None:
                     stop_length = mean_length
                 elif args_cli.early_stop_metric == "tracking":
                     stop_metric = tracking_metrics["tracking_score"]
+                    stop_metric_ready = True
+                    stop_length = mean_length or current_length_mean
+                elif args_cli.early_stop_metric == "stable_tracking":
+                    stop_metric = stable_tracking_score
                     stop_metric_ready = True
                     stop_length = mean_length or current_length_mean
                 elif args_cli.early_stop_metric == "eval_tracking":
