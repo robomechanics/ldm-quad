@@ -6,9 +6,11 @@
 import math
 
 import isaaclab.envs.mdp as base_mdp
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 
+from . import mdp
 from .rough_env_cfg import UnitreeGo2RoughEnvCfg
 
 
@@ -19,8 +21,23 @@ class UnitreeGo2RandFlatEnvCfg(UnitreeGo2RoughEnvCfg):
         super().__post_init__()
 
         # override rewards
-        self.rewards.flat_orientation_l2.weight = -5.0
+        self.rewards.alive.weight = 0.5
+        self.rewards.terminating.weight = -8.0
+        self.rewards.flat_orientation_l2.weight = -2.5
         self.rewards.feet_air_time.weight = 0.25
+
+        # proprioceptive gait shaping: contact-sensor-free so it runs on both the
+        # PhysX and Newton backends. Command-gated, so it is inert while standing.
+        self.rewards.feet_swing_gait = RewTerm(
+            func=mdp.feet_swing_gait,
+            weight=0.5,
+            params={
+                "command_name": "base_velocity",
+                "foot_pattern": ".*_foot",
+                "target_height": 0.08,
+                "command_threshold": 0.1,
+            },
+        )
 
         # change terrain to flat
         self.scene.terrain.terrain_type = "plane"

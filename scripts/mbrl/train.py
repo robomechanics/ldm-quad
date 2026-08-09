@@ -82,6 +82,31 @@ parser.add_argument(
 )
 parser.add_argument("--seed_steps", type=int, default=50, help="Initial random environment steps before planning.")
 parser.add_argument(
+    "--seed_action_mode",
+    type=str,
+    default="uniform",
+    choices=["uniform", "smooth_zero"],
+    help="Bootstrap exploration before planner/model-policy control. smooth_zero samples temporally correlated joint targets around the default pose.",
+)
+parser.add_argument(
+    "--seed_action_noise_std",
+    type=float,
+    default=0.10,
+    help="Per-step Gaussian noise std for --seed_action_mode smooth_zero before action clipping.",
+)
+parser.add_argument(
+    "--seed_action_smoothing",
+    type=float,
+    default=0.90,
+    help="AR(1) smoothing factor for --seed_action_mode smooth_zero.",
+)
+parser.add_argument(
+    "--seed_pretrain_updates",
+    type=int,
+    default=0,
+    help="One-time model update burst after --seed_steps transitions are available, matching TD-MPC2's seed pretraining pattern.",
+)
+parser.add_argument(
     "--planner_start_steps",
     type=int,
     default=None,
@@ -487,6 +512,18 @@ def get_action_bounds(action_space: gym.Space, device: torch.device, action_dim:
 
 def random_actions(batch_size: int, action_low: torch.Tensor, action_high: torch.Tensor) -> torch.Tensor:
     return action_low + torch.rand((batch_size, action_low.numel()), device=action_low.device) * (action_high - action_low)
+
+
+def smooth_zero_actions(
+    previous_actions: torch.Tensor,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+    noise_std: float,
+    smoothing: float,
+) -> torch.Tensor:
+    smoothing = max(0.0, min(float(smoothing), 0.999))
+    actions = smoothing * previous_actions + float(noise_std) * torch.randn_like(previous_actions)
+    return clip_actions(actions, action_low, action_high)
 
 
 def clip_actions(actions: torch.Tensor, action_low: torch.Tensor, action_high: torch.Tensor) -> torch.Tensor:
@@ -1338,6 +1375,7 @@ def main() -> None:
 
     episode_returns = torch.zeros(num_envs, dtype=torch.float32, device=device)
     episode_lengths = torch.zeros(num_envs, dtype=torch.float32, device=device)
+    seed_actions = torch.zeros((num_envs, action_dim), dtype=torch.float32, device=device)
     if args_cli.model_type == "latent":
         latest_losses = {
             "loss": 0.0,
@@ -1400,6 +1438,7 @@ def main() -> None:
     planner_min_length = args_cli.planner_min_length_fraction * episode_horizon_steps
     planner_active = False
     planner_was_active = False
+    seed_pretrain_done = args_cli.resume_checkpoint is not None
     latest_control_mode = "init"
     if args_cli.save_best_metric in {"tracking", "stable_tracking", "eval_tracking"}:
         best_checkpoint_metric = float("-inf")
@@ -1473,11 +1512,33 @@ def main() -> None:
                             actions = clip_actions(actions, action_low, action_high)
                         latest_control_mode = "model_pi"
                     else:
+                        if args_cli.seed_action_mode == "smooth_zero":
+                            actions = smooth_zero_actions(
+                                seed_actions,
+                                action_low,
+                                action_high,
+                                args_cli.seed_action_noise_std,
+                                args_cli.seed_action_smoothing,
+                            )
+                            seed_actions = actions.detach()
+                            latest_control_mode = "smooth_seed"
+                        else:
+                            actions = random_actions(obs.shape[0], action_low, action_high)
+                            latest_control_mode = "random"
+                else:
+                    if args_cli.seed_action_mode == "smooth_zero":
+                        actions = smooth_zero_actions(
+                            seed_actions,
+                            action_low,
+                            action_high,
+                            args_cli.seed_action_noise_std,
+                            args_cli.seed_action_smoothing,
+                        )
+                        seed_actions = actions.detach()
+                        latest_control_mode = "smooth_seed"
+                    else:
                         actions = random_actions(obs.shape[0], action_low, action_high)
                         latest_control_mode = "random"
-                else:
-                    actions = random_actions(obs.shape[0], action_low, action_high)
-                    latest_control_mode = "random"
             else:
                 latest_control_mode = "planner"
                 if not planner_was_active:
@@ -1524,6 +1585,7 @@ def main() -> None:
                 train_state.episodes_finished += int(done_mask.sum().item())
                 episode_returns[done_mask] = 0.0
                 episode_lengths[done_mask] = 0.0
+                seed_actions[done_mask] = 0.0
                 planner.reset(done_mask)
                 if planner_active:
                     recent_length_window = recent_lengths[-args_cli.planner_recent_episodes :]
@@ -1546,7 +1608,20 @@ def main() -> None:
         train_ready = train_ready and train_state.env_steps >= resume_warmup_until
         if train_ready:
             model.train()
-            for _ in range(args_cli.updates_per_step):
+            update_count = args_cli.updates_per_step
+            if (
+                not seed_pretrain_done
+                and args_cli.seed_pretrain_updates > 0
+                and train_state.env_steps >= args_cli.seed_steps
+            ):
+                update_count = max(update_count, args_cli.seed_pretrain_updates)
+                seed_pretrain_done = True
+                print(
+                    f"[MBRL] seed pretrain burst updates={update_count} "
+                    f"at step={train_state.env_steps} buffer={len(replay)}",
+                    flush=True,
+                )
+            for _ in range(update_count):
                 if args_cli.model_type in {"latent", "state"}:
                     batch = replay.sample_sequences(args_cli.batch_size, args_cli.horizon, device=device)
                     loss, metrics, rollout_states = model.loss(batch)
