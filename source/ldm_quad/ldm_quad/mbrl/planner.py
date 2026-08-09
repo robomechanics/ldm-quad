@@ -817,6 +817,7 @@ class LatentMPPIPlanner:
         self.prior_command_start = prior_command_start
         self.prior_command_dim = prior_command_dim
         self._prev_mean: torch.Tensor | None = None
+        self._context: torch.Tensor | None = None
         self.last_diagnostics: dict[str, float] = {}
         # TD-M(PC)^2: Gaussian mu ~ pi_H of the action actually executed this step,
         # exposed so the collection loop can stash it in the replay buffer. Set by
@@ -828,6 +829,17 @@ class LatentMPPIPlanner:
     @property
     def control_horizon(self) -> int:
         return self.action_spline_knots or self.horizon
+
+    def _encode(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.model.encode(obs, context=self._context)
+
+    def _ctx(self, num_repeat: int) -> torch.Tensor | None:
+        """Expand the stored [B, ctx] context to match a latent tensor that was expanded
+        to [B * num_repeat, latent] (per-candidate / per-policy-trajectory rollouts)."""
+        if self._context is None:
+            return None
+        ctx = self._context
+        return ctx.unsqueeze(1).expand(-1, num_repeat, -1).reshape(-1, ctx.shape[-1])
 
     def reset(self, done: torch.Tensor | None = None) -> None:
         if self._prev_mean is None:
@@ -905,12 +917,12 @@ class LatentMPPIPlanner:
 
     @torch.no_grad()
     def _rollout_policy_actions(self, obs: torch.Tensor, deterministic: bool) -> torch.Tensor:
-        z = self.model.encode(obs)
+        z = self._encode(obs)
         actions = []
         for _ in range(self.horizon):
-            action = self._clip_actions(self.model.pi(z, deterministic=deterministic))
+            action = self._clip_actions(self.model.pi(z, deterministic=deterministic, context=self._context))
             actions.append(action)
-            z = self.model.next(z, action)
+            z = self.model.next(z, action, context=self._context)
         return torch.stack(actions, dim=1)
 
     def _policy_candidate_controls(self, obs: torch.Tensor, z0: torch.Tensor | None = None) -> torch.Tensor:
@@ -932,13 +944,14 @@ class LatentMPPIPlanner:
 
         stochastic_count = self.num_pi_trajs - next_index
         if stochastic_count > 0:
-            z = self.model.encode(obs) if z0 is None else z0
+            z = self._encode(obs) if z0 is None else z0
             z = z.unsqueeze(1).expand(-1, stochastic_count, -1).reshape(obs.shape[0] * stochastic_count, -1)
+            ctx = self._ctx(stochastic_count)
             actions = []
             for _ in range(self.horizon):
-                action = self._clip_actions(self.model.pi(z, deterministic=False))
+                action = self._clip_actions(self.model.pi(z, deterministic=False, context=ctx))
                 actions.append(action.view(obs.shape[0], stochastic_count, self.action_dim))
-                z = self.model.next(z, action)
+                z = self.model.next(z, action, context=ctx)
             action_sequences = torch.stack(actions, dim=2)
             controls[:, next_index:] = self._controls_from_actions(action_sequences)
         return controls
@@ -1041,16 +1054,17 @@ class LatentMPPIPlanner:
         z0: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, candidates, _, action_dim = action_sequences.shape
-        z = self.model.encode(obs) if z0 is None else z0
+        z = self._encode(obs) if z0 is None else z0
         z = z.unsqueeze(1).expand(-1, candidates, -1).reshape(batch_size * candidates, -1)
+        ctx = self._ctx(candidates)
         returns = torch.zeros(batch_size * candidates, device=obs.device, dtype=obs.dtype)
         discounts = torch.ones_like(returns)
         alive = torch.ones_like(returns)
 
         for t in range(self.horizon):
             actions_t = action_sequences[:, :, t, :].reshape(batch_size * candidates, action_dim)
-            reward = self.model.reward(z, actions_t).squeeze(-1)
-            z_next = self.model.next(z, actions_t)
+            reward = self.model.reward(z, actions_t, context=ctx).squeeze(-1)
+            z_next = self.model.next(z, actions_t, context=ctx)
             reward = reward + self._latent_velocity_objective_reward(z_next, obs, batch_size, candidates)
             z = z_next
             returns = returns + discounts * alive * reward
@@ -1062,12 +1076,12 @@ class LatentMPPIPlanner:
                     alive = alive * continue_prob
             discounts = discounts * self.discount
 
-        terminal_action = self.model.pi(z, deterministic=False)
+        terminal_action = self.model.pi(z, deterministic=False, context=ctx)
         # Pessimistic terminal bootstrap (min over sampled Q heads), matching the
         # training TD target in world_model.py. Using "avg" here made planning MORE
         # optimistic than training, so MPPI selected the model's most over-optimistic
         # value errors (predicted plan return >> actual return).
-        terminal_value = self.model.Q(z, terminal_action, return_type="min").squeeze(-1)
+        terminal_value = self.model.Q(z, terminal_action, return_type="min", context=ctx).squeeze(-1)
         returns = returns + discounts * alive * terminal_value
         return returns.view(batch_size, candidates)
 
@@ -1097,7 +1111,7 @@ class LatentMPPIPlanner:
             "planner_prior_fallback_fraction": 0.0,
         }
 
-    def policy_action(self, obs: torch.Tensor) -> torch.Tensor:
+    def policy_action(self, obs: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
         """Act with the learned policy pi_phi ALONE -- no MPPI search, no world-model rollout.
 
         Diagnostic for world-model quality: MPPI exists to beat pi_phi by planning through the
@@ -1105,13 +1119,20 @@ class LatentMPPIPlanner:
         Mirrors this class's own encode->pi idiom (see _rollout_policy_actions).
         """
         with torch.no_grad():
-            z = self.model.encode(obs)
-            return self._clip_actions(self.model.pi(z, deterministic=True))
+            z = self.model.encode(obs, context=context)
+            return self._clip_actions(self.model.pi(z, deterministic=True, context=context))
 
-    def plan(self, obs: torch.Tensor, eval_mode: bool = False, t0: bool = False) -> torch.Tensor:
+    def plan(
+        self,
+        obs: torch.Tensor,
+        eval_mode: bool = False,
+        t0: bool = False,
+        context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if t0:
             self.reset()
-        z0 = self.model.encode(obs)
+        self._context = context
+        z0 = self._encode(obs)
         mean = self._warm_start_mean(obs)
         std = torch.full_like(mean, self.max_std).clamp_(self.min_std, self.max_std)
         policy_controls = self._policy_candidate_controls(obs, z0)
