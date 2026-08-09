@@ -172,6 +172,21 @@ parser.add_argument(
     help="Comma-separated observation indices decoded from latent state, defaulting to body vx, vy, yaw rate.",
 )
 parser.add_argument("--simnorm_dim", type=int, default=8, help="SimNorm group size for latent encoder/dynamics outputs. Set <=1 to disable.")
+parser.add_argument(
+    "--history_context_dim",
+    type=int,
+    default=0,
+    help=(
+        "Enable the payAttentionDrift-style system-id history encoder for --model_type latent. "
+        "Sets the context vector dim concatenated to the latent encoder input. 0 disables it."
+    ),
+)
+parser.add_argument("--history_len", type=int, default=16, help="Number of preceding transitions fed to the history encoder.")
+parser.add_argument("--history_d_model", type=int, default=64, help="History transformer embedding dimension.")
+parser.add_argument("--history_nhead", type=int, default=4, help="History transformer attention heads.")
+parser.add_argument("--history_layers", type=int, default=1, help="History transformer encoder layers.")
+parser.add_argument("--history_ff", type=int, default=256, help="History transformer feedforward dimension.")
+parser.add_argument("--history_dropout", type=float, default=0.1, help="History transformer dropout probability.")
 parser.add_argument("--hidden_dim", type=int, default=512, help="Model hidden dimension.")
 parser.add_argument("--model_depth", type=int, default=3, help="Number of hidden layers per ensemble member.")
 parser.add_argument("--ensemble_size", type=int, default=5, help="Number of dynamics models in the ensemble.")
@@ -647,14 +662,55 @@ def command_tracking_metrics(obs: torch.Tensor) -> dict[str, float]:
     return metrics
 
 
-def model_policy_actions(model: torch.nn.Module, obs: torch.Tensor, action_low: torch.Tensor, action_high: torch.Tensor) -> torch.Tensor | None:
+def model_policy_actions(
+    model: torch.nn.Module,
+    obs: torch.Tensor,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+    context: torch.Tensor | None = None,
+) -> torch.Tensor | None:
     if not hasattr(model, "encode") or not hasattr(model, "pi"):
         return None
-    z = model.encode(obs)
-    actions = model.pi(z, deterministic=True)
+    z = model.encode(obs, context=context)
+    actions = model.pi(z, deterministic=True, context=context)
     if torch.isfinite(action_low).all() and torch.isfinite(action_high).all():
         actions = clip_actions(actions, action_low, action_high)
     return actions
+
+
+class RollingHistory:
+    """Per-env ring buffer of recent (action, obs-transition) tokens for the history encoder.
+
+    Fed one vectorized step at a time during rollout/eval, cleared per-env on episode
+    reset. Provides the ``(actions, transitions, pad_mask)`` window the history encoder
+    consumes. Order within the window does not matter (the encoder is permutation
+    invariant and mean-pools valid steps).
+    """
+
+    def __init__(self, num_envs: int, history_len: int, action_dim: int, obs_dim: int, device: torch.device):
+        self.history_len = history_len
+        self.actions = torch.zeros((num_envs, history_len, action_dim), device=device)
+        self.transitions = torch.zeros((num_envs, history_len, obs_dim), device=device)
+        self.valid = torch.zeros((num_envs, history_len), dtype=torch.bool, device=device)
+        self.ptr = 0
+
+    def clear(self) -> None:
+        self.valid.zero_()
+        self.ptr = 0
+
+    def append(self, actions: torch.Tensor, transitions: torch.Tensor, done: torch.Tensor | None = None) -> None:
+        self.actions[:, self.ptr] = actions.detach()
+        self.transitions[:, self.ptr] = transitions.detach()
+        self.valid[:, self.ptr] = True
+        self.ptr = (self.ptr + 1) % self.history_len
+        if done is not None and done.any():
+            # A finished episode starts fresh; drop its (now cross-boundary) history.
+            self.valid[done.view(-1)] = False
+
+    def context(self, model: torch.nn.Module) -> torch.Tensor | None:
+        if not hasattr(model, "encode_context"):
+            return None
+        return model.encode_context(self.actions, self.transitions, ~self.valid)
 
 
 def infer_episode_horizon_steps(env: gym.Env, env_cfg: object) -> float:
@@ -927,10 +983,17 @@ def run_heldout_eval(
     max_steps: int,
     progress_interval: int = 0,
     max_seconds: float = 0.0,
+    model: torch.nn.Module | None = None,
 ) -> dict[str, float]:
     obs_raw, _ = env.reset()
     obs = flatten_obs(obs_raw, device)
     planner.reset()
+
+    eval_history = None
+    if model is not None and getattr(model, "context_dim", 0) > 0:
+        eval_history = RollingHistory(
+            obs.shape[0], int(model.history_len), int(model.action_dim), obs.shape[-1], device
+        )
 
     episode_returns = torch.zeros(obs.shape[0], dtype=torch.float32, device=device)
     episode_lengths = torch.zeros(obs.shape[0], dtype=torch.float32, device=device)
@@ -957,7 +1020,8 @@ def run_heldout_eval(
                 f"step={steps}/{max_steps} completed={min(len(completed_returns), num_episodes)}/{num_episodes}",
                 flush=True,
             )
-        actions = planner.plan(obs, eval_mode=True, t0=steps == 0)
+        eval_context = eval_history.context(model) if eval_history is not None and model is not None else None
+        actions = planner.plan(obs, eval_mode=True, t0=steps == 0, context=eval_context)
         next_obs_raw, rewards, terminated, truncated, _ = env.step(actions)
         next_obs = flatten_obs(next_obs_raw, device)
         rewards = to_tensor(rewards, device).float().view(-1)
@@ -984,6 +1048,9 @@ def run_heldout_eval(
             episode_returns[done_mask] = 0.0
             episode_lengths[done_mask] = 0.0
             planner.reset(done_mask)
+
+        if eval_history is not None:
+            eval_history.append(actions, next_obs - obs, done)
 
         obs = next_obs
         steps += 1
@@ -1109,6 +1176,13 @@ def main() -> None:
             simnorm_dim=args_cli.simnorm_dim,
             q_dropout=args_cli.q_dropout,
             physical_feature_indices=latent_physical_indices,
+            context_dim=args_cli.history_context_dim,
+            history_len=args_cli.history_len,
+            history_d_model=args_cli.history_d_model,
+            history_nhead=args_cli.history_nhead,
+            history_layers=args_cli.history_layers,
+            history_ff=args_cli.history_ff,
+            history_dropout=args_cli.history_dropout,
             loss_weights=WorldModelLossWeights(
                 consistency=args_cli.consistency_coef,
                 reward=args_cli.reward_coef,
@@ -1373,6 +1447,19 @@ def main() -> None:
         flush=True,
     )
 
+    use_history = args_cli.model_type == "latent" and args_cli.history_context_dim > 0
+    history_sampling_len = args_cli.history_len if use_history else 0
+    history = (
+        RollingHistory(num_envs, args_cli.history_len, action_dim, obs_dim, device) if use_history else None
+    )
+    if use_history:
+        print(
+            "[MBRL] System-id history encoder enabled "
+            f"context_dim={args_cli.history_context_dim} history_len={args_cli.history_len} "
+            f"d_model={args_cli.history_d_model} heads={args_cli.history_nhead} layers={args_cli.history_layers}",
+            flush=True,
+        )
+
     episode_returns = torch.zeros(num_envs, dtype=torch.float32, device=device)
     episode_lengths = torch.zeros(num_envs, dtype=torch.float32, device=device)
     seed_actions = torch.zeros((num_envs, action_dim), dtype=torch.float32, device=device)
@@ -1493,6 +1580,8 @@ def main() -> None:
             )
             planner_active = planner_ready
 
+            history_context = history.context(model) if history is not None else None
+
             if not planner_ready:
                 if planner_was_active:
                     planner.reset()
@@ -1505,7 +1594,7 @@ def main() -> None:
                         actions = clip_actions(actions, action_low, action_high)
                     latest_control_mode = "prior"
                 elif resolved_seed_with_model_policy:
-                    model_policy_action = model_policy_actions(model, obs, action_low, action_high)
+                    model_policy_action = model_policy_actions(model, obs, action_low, action_high, context=history_context)
                     if model_policy_action is not None:
                         actions = model_policy_action
                         if args_cli.seed_policy_noise > 0.0:
@@ -1551,7 +1640,7 @@ def main() -> None:
                         flush=True,
                     )
                     planner_start_time = time.time()
-                actions = planner.plan(obs, t0=not planner_was_active)
+                actions = planner.plan(obs, t0=not planner_was_active, context=history_context)
                 if not planner_was_active:
                     print(
                         f"[MBRL] first planner action computed in {time.time() - planner_start_time:.2f}s",
@@ -1599,6 +1688,9 @@ def main() -> None:
                         )
                         planner.reset()
 
+            if history is not None:
+                history.append(actions, next_obs - obs, done.squeeze(-1))
+
             obs = next_obs
             train_state.env_steps += 1
 
@@ -1625,7 +1717,9 @@ def main() -> None:
                 )
             for _ in range(update_count):
                 if args_cli.model_type in {"latent", "state"}:
-                    batch = replay.sample_sequences(args_cli.batch_size, args_cli.horizon, device=device)
+                    batch = replay.sample_sequences(
+                        args_cli.batch_size, args_cli.horizon, device=device, history_len=history_sampling_len
+                    )
                     loss, metrics, rollout_states = model.loss(batch)
                 else:
                     batch = replay.sample(args_cli.batch_size, device=device)
@@ -1693,6 +1787,7 @@ def main() -> None:
                     env=eval_env,
                     planner=eval_planner,
                     device=device,
+                    model=model,
                     num_episodes=args_cli.online_eval_episodes,
                     max_steps=args_cli.online_eval_max_steps,
                     progress_interval=args_cli.online_eval_progress_interval,

@@ -138,6 +138,81 @@ class RunningScale(nn.Module):
         return x / self.value.to(device=x.device, dtype=x.dtype)
 
 
+class HistoryEncoder(nn.Module):
+    """Permutation-invariant set-transformer over recent transitions.
+
+    Ported from robomechanics/payAttentionDrift's system-identification transformer.
+    Each history token concatenates the applied action with the *observed* one-step
+    transition ``next_obs - obs`` (the sysid cue: "this action in this regime produced
+    this change"). Tokens are embedded, passed through a small TransformerEncoder with
+    no causal mask, mean-pooled over valid steps, and compressed to a fixed context
+    vector. Empty histories fall back to a learned ``null_context``.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        transition_dim: int,
+        context_dim: int,
+        d_model: int = 64,
+        nhead: int = 4,
+        dim_feedforward: int = 256,
+        num_layers: int = 1,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.input_fc = nn.Linear(action_dim + transition_dim, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model,
+            nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=False,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers, nn.LayerNorm(d_model))
+        self.final_fc = nn.Linear(d_model, context_dim)
+        self.null_context = nn.Parameter(torch.zeros(context_dim))
+
+    def forward(
+        self,
+        actions: torch.Tensor,
+        transitions: torch.Tensor,
+        pad_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """actions ``[B, K, action_dim]``, transitions ``[B, K, transition_dim]``,
+        pad_mask ``[B, K]`` with ``True`` marking padded (invalid) history steps.
+        Returns the context vector ``[B, context_dim]``."""
+        tokens = self.input_fc(torch.cat([actions, transitions], dim=-1))
+        if pad_mask is None:
+            encoded = self.encoder(tokens)
+            pooled = encoded.mean(dim=1)
+            return self._project(self.final_fc(pooled))
+
+        # Attend only over valid steps. A fully padded row masks every key and makes
+        # TransformerEncoder emit NaNs, so feed those rows an all-valid mask and
+        # overwrite their output with the learned null context afterwards.
+        all_pad = pad_mask.all(dim=1, keepdim=True)
+        safe_mask = pad_mask & ~all_pad
+        encoded = self.encoder(tokens, src_key_padding_mask=safe_mask)
+        keep = (~pad_mask).unsqueeze(-1).to(encoded.dtype)
+        pooled = (encoded * keep).sum(dim=1) / keep.sum(dim=1).clamp_min(1.0)
+        context = self.final_fc(pooled)
+        context = torch.where(all_pad, self.null_context.to(context.dtype), context)
+        return self._project(context)
+
+    @staticmethod
+    def _project(context: torch.Tensor) -> torch.Tensor:
+        """Project onto the unit ball (TD-MPC2 constrains the conditioning vector to
+        ``||c|| <= 1`` for stable conditioning)."""
+        return context / context.norm(dim=-1, keepdim=True).clamp_min(1.0)
+
+    def null(self) -> torch.Tensor:
+        """Normalized empty-history context, used when no history is available."""
+        return self._project(self.null_context)
+
+
 @dataclass
 class WorldModelLossWeights:
     consistency: float = 20.0
@@ -173,11 +248,22 @@ class LatentWorldModel(nn.Module):
         log_std_max: float = 2.0,
         physical_feature_indices: list[int] | tuple[int, ...] | None = None,
         loss_weights: WorldModelLossWeights | None = None,
+        context_dim: int = 0,
+        history_len: int = 0,
+        history_d_model: int = 64,
+        history_nhead: int = 4,
+        history_layers: int = 1,
+        history_ff: int = 256,
+        history_dropout: float = 0.1,
     ):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.latent_dim = latent_dim
+        self.context_dim = max(0, int(context_dim))
+        self.history_len = max(0, int(history_len))
+        if self.context_dim > 0 and self.history_len <= 0:
+            raise ValueError("context_dim > 0 requires history_len > 0.")
         self.num_q = num_q
         self.discount = discount
         self.tau = tau
@@ -190,21 +276,40 @@ class LatentWorldModel(nn.Module):
         self.log_std_max = log_std_max
         self.physical_feature_indices = tuple(physical_feature_indices or ())
         self.loss_weights = loss_weights or WorldModelLossWeights()
+        self._last_context: torch.Tensor | None = None
         head_dim = max(num_bins, 1)
         self.q_scale = RunningScale(tau)
 
-        self.encoder = latent_mlp(obs_dim, hidden_dim, latent_dim, depth, simnorm_dim)
-        self.dynamics = latent_mlp(latent_dim + action_dim, hidden_dim, latent_dim, depth, simnorm_dim)
-        self.reward_head = mlp(latent_dim + action_dim, hidden_dim, head_dim, depth)
+        self.history_encoder = (
+            HistoryEncoder(
+                action_dim=action_dim,
+                transition_dim=obs_dim,
+                context_dim=self.context_dim,
+                d_model=history_d_model,
+                nhead=history_nhead,
+                dim_feedforward=history_ff,
+                num_layers=history_layers,
+                dropout=history_dropout,
+            )
+            if self.context_dim > 0
+            else None
+        )
+        # The system-id context is concatenated to every conditioned component, mirroring
+        # TD-MPC2's learnable task embedding e = h(s,e), d(z,a,e), R(z,a,e), Q(z,a,e), p(z,e).
+        # continue/physical heads read the (already context-aware) latent directly.
+        ctx = self.context_dim
+        self.encoder = latent_mlp(obs_dim + ctx, hidden_dim, latent_dim, depth, simnorm_dim)
+        self.dynamics = latent_mlp(latent_dim + action_dim + ctx, hidden_dim, latent_dim, depth, simnorm_dim)
+        self.reward_head = mlp(latent_dim + action_dim + ctx, hidden_dim, head_dim, depth)
         self.continue_head = mlp(latent_dim, hidden_dim, 1, depth)
-        self.policy_head = mlp(latent_dim, hidden_dim, 2 * action_dim, depth)
+        self.policy_head = mlp(latent_dim + ctx, hidden_dim, 2 * action_dim, depth)
         self.physical_head = (
             mlp(latent_dim, hidden_dim, len(self.physical_feature_indices), depth)
             if self.physical_feature_indices
             else None
         )
         self.q_heads = nn.ModuleList(
-            mlp(latent_dim + action_dim, hidden_dim, head_dim, depth, dropout=q_dropout) for _ in range(num_q)
+            mlp(latent_dim + action_dim + ctx, hidden_dim, head_dim, depth, dropout=q_dropout) for _ in range(num_q)
         )
         self._zero_init_distribution_heads()
 
@@ -244,19 +349,47 @@ class LatentWorldModel(nn.Module):
         for detach_param, param in zip(self.detach_q_heads.parameters(), self.q_heads.parameters(), strict=True):
             detach_param.copy_(param)
 
-    def encode(self, obs: torch.Tensor, target: bool = False) -> torch.Tensor:
+    def _apply_context(self, x: torch.Tensor, context: torch.Tensor | None) -> torch.Tensor:
+        """Concatenate the system-id context onto a component input.
+
+        No-op when the history encoder is disabled. When ``context`` is ``None`` the
+        learned (normalized) null context is broadcast over ``x``'s leading dims;
+        otherwise ``context`` must already match those leading dims (callers that
+        expand the latent per candidate expand the context the same way)."""
+        if self.context_dim == 0:
+            return x
+        if context is None:
+            assert self.history_encoder is not None
+            null = self.history_encoder.null().to(dtype=x.dtype, device=x.device)
+            context = null.expand(*x.shape[:-1], self.context_dim)
+        return torch.cat([x, context], dim=-1)
+
+    def encode(self, obs: torch.Tensor, context: torch.Tensor | None = None, target: bool = False) -> torch.Tensor:
         encoder = self.target_encoder if target else self.encoder
-        return encoder(obs)
+        return encoder(self._apply_context(obs, context))
 
-    def next(self, z: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        return self.dynamics(torch.cat([z, actions], dim=-1))
+    def encode_context(
+        self,
+        history_actions: torch.Tensor,
+        history_transitions: torch.Tensor,
+        history_pad_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        """Encode a window of recent transitions into the system-id context vector.
 
-    def reward(self, z: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        logits = self.reward_logits(z, actions)
+        Returns ``None`` when the history encoder is disabled (``context_dim == 0``)."""
+        if self.history_encoder is None:
+            return None
+        return self.history_encoder(history_actions, history_transitions, history_pad_mask)
+
+    def next(self, z: torch.Tensor, actions: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
+        return self.dynamics(self._apply_context(torch.cat([z, actions], dim=-1), context))
+
+    def reward(self, z: torch.Tensor, actions: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
+        logits = self.reward_logits(z, actions, context=context)
         return two_hot_inv(logits, self.dreg)
 
-    def reward_logits(self, z: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        return self.reward_head(torch.cat([z, actions], dim=-1))
+    def reward_logits(self, z: torch.Tensor, actions: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
+        return self.reward_head(self._apply_context(torch.cat([z, actions], dim=-1), context))
 
     def continue_logits(self, z: torch.Tensor) -> torch.Tensor:
         return self.continue_head(z)
@@ -266,14 +399,14 @@ class LatentWorldModel(nn.Module):
             raise RuntimeError("LatentWorldModel was created without physical feature prediction.")
         return self.physical_head(z)
 
-    def _policy_stats(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        mean, log_std = self.policy_head(z).chunk(2, dim=-1)
+    def _policy_stats(self, z: torch.Tensor, context: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        mean, log_std = self.policy_head(self._apply_context(z, context)).chunk(2, dim=-1)
         log_std = torch.tanh(log_std)
         log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (log_std + 1.0)
         return mean, log_std
 
-    def pi(self, z: torch.Tensor, deterministic: bool = True, return_info: bool = False):
-        mean, log_std = self._policy_stats(z)
+    def pi(self, z: torch.Tensor, deterministic: bool = True, return_info: bool = False, context: torch.Tensor | None = None):
+        mean, log_std = self._policy_stats(z, context=context)
         if deterministic:
             pre_tanh = mean
         else:
@@ -308,8 +441,9 @@ class LatentWorldModel(nn.Module):
         return_all: bool = False,
         return_type: str = "min",
         detach: bool = False,
+        context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        qs = self.Q_logits(z, actions, target=target, detach=detach)
+        qs = self.Q_logits(z, actions, target=target, detach=detach, context=context)
         if return_all:
             return two_hot_inv(qs, self.dreg)
         values = two_hot_inv(qs, self.dreg)
@@ -324,18 +458,27 @@ class LatentWorldModel(nn.Module):
             return values.mean(dim=0)
         raise ValueError(f"Unsupported Q return_type: {return_type}")
 
-    def Q_logits(self, z: torch.Tensor, actions: torch.Tensor, target: bool = False, detach: bool = False) -> torch.Tensor:
+    def Q_logits(
+        self,
+        z: torch.Tensor,
+        actions: torch.Tensor,
+        target: bool = False,
+        detach: bool = False,
+        context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if target:
             heads = self.target_q_heads
         elif detach:
             heads = self.detach_q_heads
         else:
             heads = self.q_heads
-        inputs = torch.cat([z, actions], dim=-1)
+        inputs = self._apply_context(torch.cat([z, actions], dim=-1), context)
         return torch.stack([head(inputs) for head in heads], dim=0)
 
     def encoder_parameters(self):
         yield from self.encoder.parameters()
+        if self.history_encoder is not None:
+            yield from self.history_encoder.parameters()
 
     def non_encoder_model_parameters(self):
         modules = (self.dynamics, self.reward_head, self.continue_head, self.q_heads)
@@ -348,15 +491,22 @@ class LatentWorldModel(nn.Module):
         modules = (self.encoder, self.dynamics, self.reward_head, self.continue_head, self.q_heads)
         for module in modules:
             yield from module.parameters()
+        if self.history_encoder is not None:
+            yield from self.history_encoder.parameters()
         if self.physical_head is not None:
             yield from self.physical_head.parameters()
 
     def policy_parameters(self):
         yield from self.policy_head.parameters()
 
-    def policy_loss(self, zs: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
-        actions, info = self.pi(zs.detach(), deterministic=False, return_info=True)
-        q = self.Q(zs.detach(), actions, return_type="avg", detach=True)
+    def policy_loss(self, zs: torch.Tensor, context: torch.Tensor | None = None) -> tuple[torch.Tensor, dict[str, float]]:
+        if context is None:
+            context = getattr(self, "_last_context", None)
+        if context is not None:
+            # zs is [H+1, B, latent]; broadcast the per-segment context over the horizon.
+            context = context.unsqueeze(0).expand(zs.shape[0], -1, -1)
+        actions, info = self.pi(zs.detach(), deterministic=False, return_info=True, context=context)
+        q = self.Q(zs.detach(), actions, return_type="avg", detach=True, context=context)
         self.q_scale.update(q[0])
         scaled_q = self.q_scale(q)
         rho = torch.pow(
@@ -384,10 +534,27 @@ class LatentWorldModel(nn.Module):
             raise ValueError("LatentWorldModel.loss expects sequence batches shaped [H+1, B, dim].")
 
         horizon = actions.shape[0]
-        with torch.no_grad():
-            target_zs = self.encode(obs[1:].reshape(-1, self.obs_dim), target=False).view(horizon, obs.shape[1], -1)
+        batch_dim = obs.shape[1]
 
-        z = self.encode(obs[0])
+        # One system-id context per sampled segment, held fixed across the horizon
+        # (payAttentionDrift assumes a locally constant dynamics regime).
+        context = None
+        context_seq = None
+        if self.context_dim > 0:
+            context = self.encode_context(
+                batch["history_actions"],
+                batch["history_transitions"],
+                batch.get("history_pad_mask"),
+            )
+            assert context is not None
+            context_seq = context.unsqueeze(0).expand(horizon, -1, -1).reshape(-1, self.context_dim)
+
+        with torch.no_grad():
+            target_zs = self.encode(
+                obs[1:].reshape(-1, self.obs_dim), context=context_seq, target=False
+            ).view(horizon, batch_dim, -1)
+
+        z = self.encode(obs[0], context=context)
         consistency_loss = torch.zeros((), device=obs.device)
         reward_loss = torch.zeros((), device=obs.device)
         value_loss = torch.zeros((), device=obs.device)
@@ -405,18 +572,19 @@ class LatentWorldModel(nn.Module):
             continue_t = continues[t]
             z_target = target_zs[t]
 
-            q_logits = self.Q_logits(z, action_t)
-            reward_logits = self.reward_logits(z, action_t)
-            z_next = self.next(z, action_t)
+            q_logits = self.Q_logits(z, action_t, context=context)
+            reward_logits = self.reward_logits(z, action_t, context=context)
+            z_next = self.next(z, action_t, context=context)
             continue_pred = self.continue_logits(z_next)
 
             with torch.no_grad():
-                target_action = self.pi(z_target, deterministic=False)
+                target_action = self.pi(z_target, deterministic=False, context=context)
                 target_q = reward_t + self.discount * continue_t * self.Q(
                     z_target,
                     target_action,
                     target=True,
                     return_type="min",
+                    context=context,
                 )
 
             consistency_loss = consistency_loss + weight * F.mse_loss(z_next, z_target)
@@ -453,4 +621,7 @@ class LatentWorldModel(nn.Module):
             "continue_loss": float(continue_loss.detach().item()),
             "physical_loss": float(physical_loss.detach().item()),
         }
+        # Cached so the immediately following policy_loss() call conditions the actor/critic
+        # on the same segment context (the training update runs loss -> policy_loss serially).
+        self._last_context = context.detach() if context is not None else None
         return total, metrics, torch.stack(rollout_zs, dim=0).detach()

@@ -195,11 +195,17 @@ class ReplayBuffer:
         batch_size: int,
         horizon: int,
         device: torch.device | str,
+        history_len: int = 0,
     ) -> dict[str, torch.Tensor]:
         """Sample strict same-env, same-episode contiguous transition sequences.
 
         The buffer is filled by vectorized env steps, so transition `i + num_envs`
         is the next transition for the same environment as transition `i`.
+
+        When ``history_len > 0`` the batch also carries the ``history_len`` transitions
+        that immediately precede each sampled start (same env and episode), for the
+        system-id history encoder. History steps that fall before the episode start or
+        outside the filled buffer are zeroed and flagged via ``history_pad_mask``.
         """
 
         stride = max(int(self._last_batch_size), 1)
@@ -213,9 +219,44 @@ class ReplayBuffer:
         start_t = starts[torch.randint(0, starts.numel(), (batch_size,))]
         indices = (start_t.unsqueeze(0) + torch.arange(horizon + 1).unsqueeze(1) * stride) % self.capacity
         transition_indices = indices[:-1]
-        return {
+        batch = {
             "obs": self.obs[indices].to(device),
             "actions": self.actions[transition_indices].to(device),
             "rewards": self.rewards[transition_indices].to(device),
             "continues": self.continues[transition_indices].to(device),
+        }
+        if history_len > 0:
+            batch.update(self._gather_history(start_t, history_len, stride, device))
+        return batch
+
+    def _gather_history(
+        self,
+        start_t: torch.Tensor,
+        history_len: int,
+        stride: int,
+        device: torch.device | str,
+    ) -> dict[str, torch.Tensor]:
+        """Collect the ``history_len`` transitions preceding each start index.
+
+        Token order is chronological (oldest first); ``history_pad_mask`` is ``True``
+        for steps that are not a valid same-env/same-episode predecessor.
+        """
+        # Relative step offsets [-history_len, ..., -1] (chronological, most recent last).
+        rel = torch.arange(history_len) - history_len
+        hist_idx = (start_t.unsqueeze(1) + rel.unsqueeze(0) * stride) % self.capacity
+
+        transitions = (self.next_obs[hist_idx] - self.obs[hist_idx]).to(device)
+        actions = self.actions[hist_idx].to(device)
+
+        start_env = self.env_ids[start_t].unsqueeze(1)
+        start_episode = self.episode_ids[start_t].unsqueeze(1)
+        expected_step = self.step_ids[start_t].unsqueeze(1) + rel.unsqueeze(0)
+        valid = self.env_ids[hist_idx] == start_env
+        valid &= self.episode_ids[hist_idx] == start_episode
+        valid &= self.step_ids[hist_idx] == expected_step
+        valid &= self.step_ids[hist_idx] >= 0
+        return {
+            "history_actions": actions,
+            "history_transitions": transitions,
+            "history_pad_mask": (~valid).to(device),
         }
