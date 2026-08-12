@@ -5,12 +5,45 @@ cd "$(dirname "$0")/../.."
 
 SEED="${SEED:-43}"
 PROJECT="${WANDB_PROJECT:-ldm-quad-mbrl}"
+WANDB_UPLOAD_VIDEOS="${WANDB_UPLOAD_VIDEOS:-1}"
+WANDB_VIDEO_LENGTH="${WANDB_VIDEO_LENGTH:-300}"
+WANDB_VIDEO_MAX_STEPS="${WANDB_VIDEO_MAX_STEPS:-300}"
 
 latest_run_dir() {
   find logs/mbrl -maxdepth 1 -type d -name 'go2_walk_*' -printf '%T@ %p\n' \
     | sort -n \
     | tail -1 \
     | cut -d' ' -f2-
+}
+
+upload_stage_video() {
+  local run_dir="$1"
+  local command_x="$2"
+  local stage_name="$3"
+  if [[ "$WANDB_UPLOAD_VIDEOS" != "1" ]]; then
+    return
+  fi
+
+  local checkpoint="${run_dir}/checkpoints/model_best.pt"
+  if [[ ! -f "$checkpoint" ]]; then
+    checkpoint="${run_dir}/checkpoints/model_final.pt"
+  fi
+  if [[ ! -f "$checkpoint" ]]; then
+    echo "[WARN] Skipping W&B video; checkpoint not found for ${stage_name}" >&2
+    return
+  fi
+
+  echo "[RUN] Recording/uploading W&B video for ${stage_name}: ${checkpoint}"
+  python3 scripts/mbrl/wandb_record_video.py \
+    --checkpoint "$checkpoint" \
+    --project "$PROJECT" \
+    --command_x "$command_x" \
+    --command_y 0.0 \
+    --command_yaw 0.0 \
+    --video_length "$WANDB_VIDEO_LENGTH" \
+    --max_steps "$WANDB_VIDEO_MAX_STEPS" \
+    --media_name "Videos / ${stage_name}" \
+    || echo "[WARN] W&B video upload failed for ${stage_name}; continuing." >&2
 }
 
 common_args=(
@@ -69,6 +102,7 @@ if [[ ! -f "$STAGE1_CKPT" ]]; then
   echo "[ERROR] Stage 1 checkpoint not found: $STAGE1_CKPT" >&2
   exit 1
 fi
+upload_stage_video "$STAGE1_RUN" 0.0 "stage1_stand"
 
 echo "[RUN] Stage 2/3: resume no-prior TD-MPC, slow forward command x=0.20"
 echo "[RUN] Resuming from: $STAGE1_CKPT"
@@ -87,6 +121,7 @@ if [[ ! -f "$STAGE2_CKPT" ]]; then
   echo "[ERROR] Stage 2 checkpoint not found: $STAGE2_CKPT" >&2
   exit 1
 fi
+upload_stage_video "$STAGE2_RUN" 0.2 "stage2_x0p2"
 
 echo "[RUN] Stage 3/3: resume no-prior TD-MPC, target forward command x=0.40"
 echo "[RUN] Resuming from: $STAGE2_CKPT"
@@ -100,6 +135,7 @@ python3 scripts/mbrl/train.py \
   --wandb_name "tdmpc_noprior_full_s${SEED}_stage3_x0p4"
 
 STAGE3_RUN="$(latest_run_dir)"
+upload_stage_video "$STAGE3_RUN" 0.4 "stage3_x0p4"
 echo "[RUN] Done. Final run: $STAGE3_RUN"
 echo "[RUN] Play final:"
 echo "python -u scripts/mbrl/play.py --checkpoint ${STAGE3_RUN}/checkpoints/model_final.pt --num_envs 1 --num_episodes 1 --max_steps 300 --command_x 0.4 --command_y 0.0 --command_yaw 0.0"
