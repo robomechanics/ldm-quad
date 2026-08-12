@@ -181,7 +181,7 @@ parser.add_argument(
         "Sets the context vector dim concatenated to the latent encoder input. 0 disables it."
     ),
 )
-parser.add_argument("--history_len", type=int, default=16, help="Number of preceding transitions fed to the history encoder.")
+parser.add_argument("--history_len", type=int, default=48, help="Number of preceding transitions fed to the history encoder (~1s of control at 50Hz, RMA-style window).")
 parser.add_argument("--history_d_model", type=int, default=64, help="History transformer embedding dimension.")
 parser.add_argument("--history_nhead", type=int, default=4, help="History transformer attention heads.")
 parser.add_argument("--history_layers", type=int, default=1, help="History transformer encoder layers.")
