@@ -1451,6 +1451,7 @@ def main() -> None:
         else planner_start_steps + args_cli.online_eval_interval
     )
     next_online_eval_step = online_eval_min_steps if args_cli.online_eval else None
+    wandb_log_disabled = False
 
     with open(os.path.join(log_dir, "config.txt"), "w", encoding="utf-8") as f:
         for key, value in sorted(vars(args_cli).items()):
@@ -1786,6 +1787,39 @@ def main() -> None:
             for loss_name, loss_value in latest_losses.items():
                 writer.add_scalar(f"Loss / {loss_name}", loss_value, train_state.env_steps)
             writer.flush()
+            if wandb_run is not None and not wandb_log_disabled:
+                wandb_metrics = {
+                    "Reward / total_reward_mean": estimated_return_100,
+                    "Reward / completed_total_reward_mean": mean_return,
+                    "Reward / step_reward_mean": mean_step_reward_100,
+                    "Episode / episode_length_mean": mean_length,
+                    "Episode / current_episode_return_mean": current_return_mean,
+                    "Episode / current_episode_length_mean": current_length_mean,
+                    "Train / gradient_updates": train_state.gradient_updates,
+                    "Train / buffer_size": len(replay),
+                    "Train / episodes_finished": train_state.episodes_finished,
+                    "Train / planner_active": int(planner_active),
+                    "Train / planner_disabled_until": planner_disabled_until,
+                    "Train / resume_warmup_until": resume_warmup_until,
+                    "Train / seed_with_model_policy": int(resolved_seed_with_model_policy),
+                    "Train / action_bounds_finite": int(action_bounds_finite),
+                    "Time / wall_time_s": elapsed_s,
+                    "Time / steps_per_second": steps_per_second,
+                    "Time / eta_s": eta_s,
+                }
+                if args_cli.model_type in {"latent", "state"}:
+                    wandb_metrics["Train / valid_sequence_count"] = row["valid_sequence_count"]
+                wandb_metrics.update({f"System / {name}": value for name, value in system_metrics.items()})
+                wandb_metrics.update({f"Tracking / {name}": value for name, value in tracking_metrics.items()})
+                wandb_metrics["Tracking / stable_tracking_score"] = stable_tracking_score
+                wandb_metrics.update({f"Eval / {name}": value for name, value in latest_eval_metrics.items()})
+                wandb_metrics.update({f"Planner / {name}": value for name, value in latest_planner_diagnostics.items()})
+                wandb_metrics.update({f"Loss / {name}": value for name, value in latest_losses.items()})
+                try:
+                    wandb_run.log(wandb_metrics, step=train_state.env_steps)
+                except Exception as exc:
+                    wandb_log_disabled = True
+                    print(f"[MBRL] Disabling direct W&B logging after error: {exc}", flush=True)
             print(
                 "[MBRL] "
                 f"step={train_state.env_steps} "

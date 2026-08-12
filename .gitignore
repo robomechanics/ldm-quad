@@ -1,5 +1,6 @@
 logs/
 outputs/
+wandb/
 *.log
 **/__pycache__/
 *.pyc
