@@ -1430,6 +1430,7 @@ def main() -> None:
         "planner_prior_fallback_fraction": 0.0,
     }
     train_start_time = time.monotonic()
+    start_env_steps = int(train_state.env_steps)
     early_stop_best_metric = float(train_state.best_mean_return)
     early_stop_best_step = int(train_state.env_steps) if train_state.best_mean_return != float("-inf") else 0
     early_stop_reason: str | None = None
@@ -1722,8 +1723,13 @@ def main() -> None:
                 save_best_value = latest_eval_metrics["eval_mean_return"]
             elapsed_s = time.monotonic() - train_start_time
             remaining_steps = max(args_cli.train_steps - train_state.env_steps, 0)
-            steps_per_second = train_state.env_steps / max(elapsed_s, 1e-6)
-            eta_s = remaining_steps / max(steps_per_second, 1e-6)
+            # Rate/ETA must reflect steps taken THIS session; on a resumed run
+            # train_state.env_steps starts at the resumed offset (e.g. 150000),
+            # so dividing the absolute count by session elapsed time wildly
+            # overstates steps/s and understates ETA. Use session-local progress.
+            session_steps = max(train_state.env_steps - start_env_steps, 0)
+            steps_per_second = session_steps / max(elapsed_s, 1e-6)
+            eta_s = remaining_steps / steps_per_second if steps_per_second > 0.0 else 0.0
             system_metrics = disk_usage_metrics(log_dir)
             row = {
                 "env_steps": train_state.env_steps,
