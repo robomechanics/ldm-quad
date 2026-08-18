@@ -29,6 +29,13 @@ class UnitreeGo2RandFlatEnvCfg(UnitreeGo2RoughEnvCfg):
         self.rewards.terminating.weight = -2.0
         self.rewards.flat_orientation_l2.weight = -1.0
         self.rewards.lin_vel_z_l2.weight = -1.0
+        # Sharpen + strengthen forward-speed tracking so the policy actually pursues
+        # the commanded velocity instead of standing still. The original std=0.5 was so
+        # forgiving it paid ~79% reward at near-zero speed (vs a 0.3 command); a lower
+        # std tightens the tracking gradient and a higher weight makes speed matter
+        # more relative to the +0.5/step alive reward.
+        self.rewards.track_lin_vel_xy_exp.weight = 2.0
+        self.rewards.track_lin_vel_xy_exp.params["std"] = 0.3
         self.rewards.feet_air_time.weight = 0.25
 
         # proprioceptive gait shaping: contact-sensor-free so it runs on both the
