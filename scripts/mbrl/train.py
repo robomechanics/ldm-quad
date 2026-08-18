@@ -30,6 +30,17 @@ parser.add_argument("--task", type=str, default="Flat-Unitree-Go2-train-v0", hel
 parser.add_argument("--seed", type=int, default=42, help="Seed used for training.")
 parser.add_argument("--buffer_capacity", type=int, default=300000, help="Replay buffer capacity.")
 parser.add_argument(
+    "--replay_device",
+    type=str,
+    default="auto",
+    choices=["auto", "cpu", "cuda"],
+    help=(
+        "Where to store the replay buffer. 'auto' keeps it on the training device (GPU when available), "
+        "which removes the per-update host<->device copy and CPU/swap pressure at the cost of a few hundred MB "
+        "of VRAM. Use 'cpu' for very large buffers that would not fit in VRAM."
+    ),
+)
+parser.add_argument(
     "--resume_checkpoint",
     type=str,
     default=None,
@@ -1081,7 +1092,9 @@ def main() -> None:
         )
         print(f"[MBRL] Loaded locomotion prior ({args_cli.prior_type}): {os.path.abspath(args_cli.prior_checkpoint)}", flush=True)
 
-    replay = ReplayBuffer(args_cli.buffer_capacity, obs_dim=obs_dim, action_dim=action_dim)
+    replay_device = device if args_cli.replay_device == "auto" else torch.device(args_cli.replay_device)
+    replay = ReplayBuffer(args_cli.buffer_capacity, obs_dim=obs_dim, action_dim=action_dim, device=replay_device)
+    print(f"[MBRL] Replay buffer device={replay_device} capacity={args_cli.buffer_capacity}", flush=True)
     recent_returns: list[float] = []
     recent_lengths: list[float] = []
     recent_step_rewards: list[float] = []
@@ -1569,12 +1582,12 @@ def main() -> None:
             continues = (~terminated).float()
 
             replay.add_batch(
-                obs.detach().cpu(),
-                actions.detach().cpu(),
-                rewards.detach().cpu(),
-                next_obs.detach().cpu(),
-                continues.detach().cpu(),
-                done.detach().cpu(),
+                obs.detach(),
+                actions.detach(),
+                rewards.detach(),
+                next_obs.detach(),
+                continues.detach(),
+                done.detach(),
             )
 
             recent_step_rewards.append(float(rewards.mean().item()))

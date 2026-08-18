@@ -4,23 +4,30 @@ import torch
 
 
 class ReplayBuffer:
-    """Simple replay buffer storing vectorized transitions on CPU."""
+    """Vectorized transition replay buffer.
 
-    def __init__(self, capacity: int, obs_dim: int, action_dim: int):
+    Storage lives on ``device`` (default CPU). Keeping it on the training GPU
+    avoids a host<->device copy on every sampled batch and removes the swap
+    pressure of a large CPU-resident buffer, at the cost of a few hundred MB of
+    VRAM. Checkpoints are always written on CPU for portability.
+    """
+
+    def __init__(self, capacity: int, obs_dim: int, action_dim: int, device: torch.device | str = "cpu"):
         self.capacity = capacity
-        self.obs = torch.zeros((capacity, obs_dim), dtype=torch.float32)
-        self.actions = torch.zeros((capacity, action_dim), dtype=torch.float32)
-        self.next_obs = torch.zeros((capacity, obs_dim), dtype=torch.float32)
-        self.rewards = torch.zeros((capacity, 1), dtype=torch.float32)
-        self.continues = torch.zeros((capacity, 1), dtype=torch.float32)
-        self.env_ids = -torch.ones(capacity, dtype=torch.long)
-        self.episode_ids = -torch.ones(capacity, dtype=torch.long)
-        self.step_ids = -torch.ones(capacity, dtype=torch.long)
+        self.device = torch.device(device)
+        self.obs = torch.zeros((capacity, obs_dim), dtype=torch.float32, device=self.device)
+        self.actions = torch.zeros((capacity, action_dim), dtype=torch.float32, device=self.device)
+        self.next_obs = torch.zeros((capacity, obs_dim), dtype=torch.float32, device=self.device)
+        self.rewards = torch.zeros((capacity, 1), dtype=torch.float32, device=self.device)
+        self.continues = torch.zeros((capacity, 1), dtype=torch.float32, device=self.device)
+        self.env_ids = -torch.ones(capacity, dtype=torch.long, device=self.device)
+        self.episode_ids = -torch.ones(capacity, dtype=torch.long, device=self.device)
+        self.step_ids = -torch.ones(capacity, dtype=torch.long, device=self.device)
         self.ptr = 0
         self.size = 0
         self._last_batch_size = 1
-        self._env_episode_ids = torch.zeros(1, dtype=torch.long)
-        self._env_step_ids = torch.zeros(1, dtype=torch.long)
+        self._env_episode_ids = torch.zeros(1, dtype=torch.long, device=self.device)
+        self._env_step_ids = torch.zeros(1, dtype=torch.long, device=self.device)
         self._valid_start_cache: dict[int, torch.Tensor] = {}
 
     def __len__(self) -> int:
@@ -32,23 +39,27 @@ class ReplayBuffer:
             "capacity": self.capacity,
             "obs_dim": int(self.obs.shape[-1]),
             "action_dim": int(self.actions.shape[-1]),
-            "obs": self.obs,
-            "actions": self.actions,
-            "next_obs": self.next_obs,
-            "rewards": self.rewards,
-            "continues": self.continues,
-            "env_ids": self.env_ids,
-            "episode_ids": self.episode_ids,
-            "step_ids": self.step_ids,
+            "obs": self.obs.cpu(),
+            "actions": self.actions.cpu(),
+            "next_obs": self.next_obs.cpu(),
+            "rewards": self.rewards.cpu(),
+            "continues": self.continues.cpu(),
+            "env_ids": self.env_ids.cpu(),
+            "episode_ids": self.episode_ids.cpu(),
+            "step_ids": self.step_ids.cpu(),
             "ptr": self.ptr,
             "size": self.size,
             "last_batch_size": self._last_batch_size,
-            "env_episode_ids": self._env_episode_ids,
-            "env_step_ids": self._env_step_ids,
+            "env_episode_ids": self._env_episode_ids.cpu(),
+            "env_step_ids": self._env_step_ids.cpu(),
         }
 
     def load_state_dict(self, state_dict: dict[str, object]) -> None:
-        """Restore a replay buffer saved by :meth:`state_dict`."""
+        """Restore a replay buffer saved by :meth:`state_dict`.
+
+        ``copy_`` handles the CPU-checkpoint -> current-device transfer, so a
+        buffer restored onto the GPU loads transparently from a CPU checkpoint.
+        """
         capacity = int(state_dict.get("capacity", -1))
         obs_dim = int(state_dict.get("obs_dim", -1))
         action_dim = int(state_dict.get("action_dim", -1))
@@ -70,8 +81,8 @@ class ReplayBuffer:
         self.ptr = int(state_dict["ptr"])
         self.size = int(state_dict["size"])
         self._last_batch_size = int(state_dict.get("last_batch_size", 1))
-        self._env_episode_ids = state_dict["env_episode_ids"].clone().to(dtype=torch.long)
-        self._env_step_ids = state_dict["env_step_ids"].clone().to(dtype=torch.long)
+        self._env_episode_ids = state_dict["env_episode_ids"].clone().to(device=self.device, dtype=torch.long)
+        self._env_step_ids = state_dict["env_step_ids"].clone().to(device=self.device, dtype=torch.long)
         self._valid_start_cache.clear()
 
     def add_batch(
@@ -83,11 +94,19 @@ class ReplayBuffer:
         continues: torch.Tensor,
         resets: torch.Tensor | None = None,
     ) -> None:
+        obs = obs.to(self.device, non_blocking=True)
+        actions = actions.to(self.device, non_blocking=True)
+        rewards = rewards.to(self.device, non_blocking=True)
+        next_obs = next_obs.to(self.device, non_blocking=True)
+        continues = continues.to(self.device, non_blocking=True)
+        if resets is not None:
+            resets = resets.to(self.device, non_blocking=True)
+
         batch_size = obs.shape[0]
         self._last_batch_size = batch_size
         if self._env_episode_ids.numel() != batch_size:
-            self._env_episode_ids = torch.zeros(batch_size, dtype=torch.long)
-            self._env_step_ids = torch.zeros(batch_size, dtype=torch.long)
+            self._env_episode_ids = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+            self._env_step_ids = torch.zeros(batch_size, dtype=torch.long, device=self.device)
         if batch_size > self.capacity:
             obs = obs[-self.capacity :]
             actions = actions[-self.capacity :]
@@ -96,7 +115,7 @@ class ReplayBuffer:
             continues = continues[-self.capacity :]
             batch_size = self.capacity
 
-        env_ids = torch.arange(batch_size, dtype=torch.long)
+        env_ids = torch.arange(batch_size, dtype=torch.long, device=self.device)
         episode_ids = self._env_episode_ids[:batch_size].clone()
         step_ids = self._env_step_ids[:batch_size].clone()
         start = self.ptr
@@ -142,7 +161,7 @@ class ReplayBuffer:
             self._env_step_ids[done_indices] = 0
 
     def sample(self, batch_size: int, device: torch.device | str) -> dict[str, torch.Tensor]:
-        indices = torch.randint(0, self.size, (batch_size,))
+        indices = torch.randint(0, self.size, (batch_size,), device=self.device)
         return {
             "obs": self.obs[indices].to(device),
             "actions": self.actions[indices].to(device),
@@ -159,23 +178,23 @@ class ReplayBuffer:
             return cached
 
         if horizon <= 0 or self.size < horizon * stride + 1 or self.episode_ids[: self.size].min().item() < 0:
-            starts = torch.empty(0, dtype=torch.long)
+            starts = torch.empty(0, dtype=torch.long, device=self.device)
             self._valid_start_cache[horizon] = starts
             return starts
 
         valid_limit = self.capacity if self.size == self.capacity else self.size
-        starts = torch.arange(valid_limit, dtype=torch.long)
-        offsets = torch.arange(horizon + 1, dtype=torch.long) * stride
+        starts = torch.arange(valid_limit, dtype=torch.long, device=self.device)
+        offsets = torch.arange(horizon + 1, dtype=torch.long, device=self.device) * stride
         indices = (starts.unsqueeze(1) + offsets.unsqueeze(0)) % self.capacity
 
-        valid = torch.ones(starts.shape[0], dtype=torch.bool)
+        valid = torch.ones(starts.shape[0], dtype=torch.bool, device=self.device)
         if self.size < self.capacity:
             valid &= (indices < self.size).all(dim=1)
 
         first = indices[:, 0]
         valid &= (self.env_ids[indices] == self.env_ids[first].unsqueeze(1)).all(dim=1)
         valid &= (self.episode_ids[indices] == self.episode_ids[first].unsqueeze(1)).all(dim=1)
-        expected_steps = self.step_ids[first].unsqueeze(1) + torch.arange(horizon + 1)
+        expected_steps = self.step_ids[first].unsqueeze(1) + torch.arange(horizon + 1, device=self.device)
         valid &= (self.step_ids[indices] == expected_steps).all(dim=1)
         if horizon > 1:
             valid &= (self.continues[indices[:, :-2]].squeeze(-1) > 0.0).all(dim=1)
@@ -210,8 +229,9 @@ class ReplayBuffer:
                 f"with vectorized stride={stride}. valid_sequences={starts.numel()}."
             )
 
-        start_t = starts[torch.randint(0, starts.numel(), (batch_size,))]
-        indices = (start_t.unsqueeze(0) + torch.arange(horizon + 1).unsqueeze(1) * stride) % self.capacity
+        start_t = starts[torch.randint(0, starts.numel(), (batch_size,), device=self.device)]
+        offsets = torch.arange(horizon + 1, device=self.device).unsqueeze(1) * stride
+        indices = (start_t.unsqueeze(0) + offsets) % self.capacity
         transition_indices = indices[:-1]
         return {
             "obs": self.obs[indices].to(device),
