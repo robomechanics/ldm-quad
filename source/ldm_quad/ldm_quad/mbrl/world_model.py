@@ -423,7 +423,19 @@ class LatentWorldModel(nn.Module):
             reward_loss = reward_loss + weight * soft_ce(reward_logits, reward_t, self.dreg).mean()
             value_target = target_q.unsqueeze(0).expand(q_logits.shape[0], *target_q.shape)
             value_loss = value_loss + weight * soft_ce(q_logits.reshape(-1, q_logits.shape[-1]), value_target.reshape(-1, 1), self.dreg).mean()
-            continue_loss = continue_loss + weight * F.binary_cross_entropy_with_logits(continue_pred, continue_t)
+            # Class-balance the continuation/termination BCE. Terminations
+            # (continue_t == 0) are only ~1% of transitions, so unweighted BCE
+            # collapses to "always alive": the continue head saturates near 1 and
+            # the planner never sees a predicted fall, feeding the over-optimism.
+            # Up-weight the rare terminal transitions so falls are actually learned.
+            continue_bce_weight = torch.where(
+                continue_t < 0.5,
+                continue_t.new_tensor(10.0),
+                continue_t.new_tensor(1.0),
+            )
+            continue_loss = continue_loss + weight * F.binary_cross_entropy_with_logits(
+                continue_pred, continue_t, weight=continue_bce_weight
+            )
             if physical_indices is not None:
                 physical_target = obs[t + 1].index_select(-1, physical_indices)
                 physical_loss = physical_loss + weight * F.mse_loss(self.physical_features(z_next), physical_target)

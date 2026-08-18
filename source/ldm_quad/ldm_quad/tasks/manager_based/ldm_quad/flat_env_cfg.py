@@ -22,8 +22,13 @@ class UnitreeGo2RandFlatEnvCfg(UnitreeGo2RoughEnvCfg):
 
         # override rewards
         self.rewards.alive.weight = 0.5
-        self.rewards.terminating.weight = -8.0
-        self.rewards.flat_orientation_l2.weight = -2.5
+        # Soften the fall cliff and the anti-motion penalties so a faster gait (needed
+        # for higher command_x, e.g. 0.4 m/s) is not catastrophically punished. The
+        # old -8.0 terminating + -2.5 tilt + -2.0 vertical penalties made every
+        # speed-induced stumble a large negative, collapsing the policy at x=0.4.
+        self.rewards.terminating.weight = -2.0
+        self.rewards.flat_orientation_l2.weight = -1.0
+        self.rewards.lin_vel_z_l2.weight = -1.0
         self.rewards.feet_air_time.weight = 0.25
 
         # proprioceptive gait shaping: contact-sensor-free so it runs on both the
@@ -52,13 +57,17 @@ class UnitreeGo2RandFlatEnvCfg(UnitreeGo2RoughEnvCfg):
         self.rewards.feet_air_time = None
         self.rewards.undesired_contacts = None
         self.terminations.base_contact = None
+        # Loosen the early-fall thresholds: the 0.40 m spawn left only 0.15 m of
+        # height margin and 35 deg of tilt, which a dynamic 0.4 m/s gait crosses on
+        # normal stride dips/pitch, ending episodes at ~90/1000 steps. Give the
+        # faster gait room before it counts as a fall.
         self.terminations.base_height = DoneTerm(
             func=base_mdp.root_height_below_minimum,
-            params={"minimum_height": 0.25},
+            params={"minimum_height": 0.20},
         )
         self.terminations.bad_orientation = DoneTerm(
             func=base_mdp.bad_orientation,
-            params={"limit_angle": math.radians(35.0)},
+            params={"limit_angle": math.radians(45.0)},
         )
         # no height scan
         self.scene.height_scanner = None

@@ -967,7 +967,11 @@ class LatentMPPIPlanner:
             discounts = discounts * self.discount
 
         terminal_action = self.model.pi(z, deterministic=False)
-        terminal_value = self.model.Q(z, terminal_action, return_type="avg").squeeze(-1)
+        # Pessimistic terminal bootstrap (min over sampled Q heads), matching the
+        # training TD target in world_model.py. Using "avg" here made planning MORE
+        # optimistic than training, so MPPI selected the model's most over-optimistic
+        # value errors (predicted plan return >> actual return).
+        terminal_value = self.model.Q(z, terminal_action, return_type="min").squeeze(-1)
         returns = returns + discounts * alive * terminal_value
         return returns.view(batch_size, candidates)
 
