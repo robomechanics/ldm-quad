@@ -424,6 +424,9 @@ parser.add_argument(
     help="Required fraction of max episode length before early stopping can trigger.",
 )
 parser.add_argument("--command_x", type=float, default=None, help="Fixed forward velocity command in m/s.")
+parser.add_argument("--reward_track_weight", type=float, default=None, help="Override track_lin_vel_xy_exp reward weight (speed-tracking strength).")
+parser.add_argument("--reward_track_std", type=float, default=None, help="Override track_lin_vel_xy_exp reward std (lower = sharper speed tracking).")
+parser.add_argument("--reward_alive_weight", type=float, default=None, help="Override the alive reward weight.")
 parser.add_argument("--command_y", type=float, default=None, help="Fixed lateral velocity command in m/s.")
 parser.add_argument("--command_yaw", type=float, default=None, help="Fixed yaw velocity command in rad/s.")
 parser.add_argument(
@@ -570,6 +573,25 @@ def apply_fixed_velocity_command(env_cfg: object) -> None:
     command_cfg.heading_command = False
     command_cfg.rel_heading_envs = 0.0
     command_cfg.rel_standing_envs = 0.0
+
+
+def apply_reward_overrides(env_cfg: object) -> None:
+    """Optionally override reward weights/std from CLI, for reward-tuning sweeps."""
+    rewards = getattr(env_cfg, "rewards", None)
+    if rewards is None:
+        return
+    applied = {}
+    if args_cli.reward_track_weight is not None:
+        rewards.track_lin_vel_xy_exp.weight = args_cli.reward_track_weight
+        applied["track_weight"] = args_cli.reward_track_weight
+    if args_cli.reward_track_std is not None:
+        rewards.track_lin_vel_xy_exp.params["std"] = args_cli.reward_track_std
+        applied["track_std"] = args_cli.reward_track_std
+    if args_cli.reward_alive_weight is not None:
+        rewards.alive.weight = args_cli.reward_alive_weight
+        applied["alive_weight"] = args_cli.reward_alive_weight
+    if applied:
+        print(f"[MBRL] reward overrides applied: {applied}", flush=True)
 
 
 def append_metrics(csv_path: str, row: dict[str, float | int]) -> None:
@@ -1056,6 +1078,7 @@ def main() -> None:
     )
     env_cfg.seed = args_cli.seed
     apply_fixed_velocity_command(env_cfg)
+    apply_reward_overrides(env_cfg)
     env = gym.make(args_cli.task, cfg=env_cfg)
     device = torch.device(env.unwrapped.device)
     print(f"[MBRL] Environment created device={device}", flush=True)
@@ -1298,6 +1321,7 @@ def main() -> None:
             )
             eval_env_cfg.seed = args_cli.seed + 10000
             apply_fixed_velocity_command(eval_env_cfg)
+            apply_reward_overrides(eval_env_cfg)
             eval_env = gym.make(eval_task, cfg=eval_env_cfg)
             eval_obs_sample, _ = eval_env.reset()
             eval_obs_dim = flatten_obs(eval_obs_sample, device).shape[-1]
