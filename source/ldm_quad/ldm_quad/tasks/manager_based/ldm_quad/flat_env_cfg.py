@@ -21,7 +21,7 @@ class UnitreeGo2RandFlatEnvCfg(UnitreeGo2RoughEnvCfg):
         super().__post_init__()
 
         # override rewards
-        self.rewards.alive.weight = 0.5
+        self.rewards.alive.weight = 0.10  # tuned (x=0.4 sweep best): lower alive so speed-tracking dominates
         # Soften the fall cliff and the anti-motion penalties so a faster gait (needed
         # for higher command_x, e.g. 0.4 m/s) is not catastrophically punished. The
         # old -8.0 terminating + -2.5 tilt + -2.0 vertical penalties made every
@@ -34,8 +34,8 @@ class UnitreeGo2RandFlatEnvCfg(UnitreeGo2RoughEnvCfg):
         # forgiving it paid ~79% reward at near-zero speed (vs a 0.3 command); a lower
         # std tightens the tracking gradient and a higher weight makes speed matter
         # more relative to the +0.5/step alive reward.
-        self.rewards.track_lin_vel_xy_exp.weight = 2.0
-        self.rewards.track_lin_vel_xy_exp.params["std"] = 0.3
+        self.rewards.track_lin_vel_xy_exp.weight = 8.0   # tuned (x=0.4 sweep best): peak vel ~0.31 m/s
+        self.rewards.track_lin_vel_xy_exp.params["std"] = 0.11  # tuned: sharper tracking
         self.rewards.feet_air_time.weight = 0.25
 
         # proprioceptive gait shaping: contact-sensor-free so it runs on both the
