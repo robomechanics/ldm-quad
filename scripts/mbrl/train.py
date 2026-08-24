@@ -395,13 +395,13 @@ parser.add_argument(
 )
 parser.add_argument("--wandb_alert", action="store_true", default=False, help="Send a W&B alert when training completes.")
 parser.add_argument("--early_stop", action="store_true", default=False, help="Stop training once performance has plateaued.")
-parser.add_argument("--early_stop_min_steps", type=int, default=3000, help="Minimum environment steps before early stopping.")
-parser.add_argument("--early_stop_patience", type=int, default=1500, help="Steps without metric improvement before stopping.")
-parser.add_argument("--early_stop_min_delta", type=float, default=0.05, help="Minimum metric gain counted as improvement.")
+parser.add_argument("--early_stop_min_steps", type=int, default=10000, help="Minimum steps INTO THE CURRENT RUN before early stopping can fire (resume-grace; measured from run start, not absolute).")
+parser.add_argument("--early_stop_patience", type=int, default=10000, help="Steps without metric improvement before stopping. Large = conservative: avoids cutting off a late breakthrough.")
+parser.add_argument("--early_stop_min_delta", type=float, default=0.02, help="Minimum metric gain counted as improvement. Smaller = more forgiving = harder to trigger a premature stop.")
 parser.add_argument(
     "--early_stop_metric",
     type=str,
-    default="mean_return",
+    default="stable_tracking",
     choices=["mean_return", "estimated_return", "tracking", "stable_tracking", "eval_return", "eval_tracking"],
     help="Metric used for early-stop plateau detection.",
 )
@@ -420,7 +420,7 @@ parser.add_argument(
 parser.add_argument(
     "--early_stop_length_fraction",
     type=float,
-    default=0.98,
+    default=0.9,
     help="Required fraction of max episode length before early stopping can trigger.",
 )
 parser.add_argument("--command_x", type=float, default=None, help="Fixed forward velocity command in m/s.")
@@ -1468,8 +1468,13 @@ def main() -> None:
     }
     train_start_time = time.monotonic()
     start_env_steps = int(train_state.env_steps)
-    early_stop_best_metric = float(train_state.best_mean_return)
-    early_stop_best_step = int(train_state.env_steps) if train_state.best_mean_return != float("-inf") else 0
+    # Early-stop baseline must be metric-agnostic: start at -inf so the first ready
+    # eval seeds it with the *current* stop_metric (whatever --early_stop_metric is),
+    # and plateau is measured within this run. Seeding from best_mean_return broke
+    # non-mean_return metrics on resume (e.g. stable_tracking ~0.7 can never beat a
+    # restored return ~83, triggering a spurious plateau stop after `patience` steps).
+    early_stop_best_metric = float("-inf")
+    early_stop_best_step = int(train_state.env_steps)
     early_stop_reason: str | None = None
     planner_disabled_until = 0
     planner_start_steps = args_cli.planner_start_steps if args_cli.planner_start_steps is not None else args_cli.seed_steps
@@ -1947,7 +1952,7 @@ def main() -> None:
                     stop_length = latest_eval_metrics["eval_mean_length"]
 
                 full_length_ready = stop_length >= args_cli.early_stop_length_fraction * episode_horizon_steps
-                min_steps_ready = train_state.env_steps >= args_cli.early_stop_min_steps
+                min_steps_ready = (train_state.env_steps - start_env_steps) >= args_cli.early_stop_min_steps
                 has_completed_episodes = train_state.episodes_finished > 0
 
                 if stop_metric_ready and early_stop_best_metric == float("-inf"):

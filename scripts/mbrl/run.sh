@@ -6,6 +6,9 @@
 # (reward-tuning ceiling; see scripts/mbrl/TUNING_RESULTS.md). This script resumes the
 # tuned checkpoint and runs a full-length x=0.4 stage at planner_iterations=6 (final
 # quality, vs the sweep's speed-oriented 3) to consolidate a robust walker.
+# It early-stops on a genuine stable plateau (conservative defaults: stable_tracking
+# metric, 10k patience, 10k resume-grace, >=90% episode length) so it won't burn
+# compute past convergence -- but only ever stops a stable, plateaued policy.
 set -uo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -42,6 +45,8 @@ echo "[$(ts)] [RUN] Final x=0.4 consolidation: resume $BASE_CKPT -> train_steps=
   --save_best_metric stable_tracking --eval_interval 50 \
   --wandb --wandb_project "$PROJECT" \
   --resume_checkpoint "$BASE_CKPT" \
+  --early_stop --early_stop_metric stable_tracking --early_stop_patience 10000 \
+  --early_stop_min_steps 10000 --early_stop_length_fraction 0.9 \
   --train_steps "$TRAIN_STEPS" --command_x 0.4 --command_y 0.0 --command_yaw 0.0 \
   --wandb_name "tdmpc_final_s${SEED}_x0p4_w8"
 RC=$?
