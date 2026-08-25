@@ -427,6 +427,7 @@ parser.add_argument("--command_x", type=float, default=None, help="Fixed forward
 parser.add_argument("--reward_track_weight", type=float, default=None, help="Override track_lin_vel_xy_exp reward weight (speed-tracking strength).")
 parser.add_argument("--reward_track_std", type=float, default=None, help="Override track_lin_vel_xy_exp reward std (lower = sharper speed tracking).")
 parser.add_argument("--reward_alive_weight", type=float, default=None, help="Override the alive reward weight.")
+parser.add_argument("--action_scale", type=float, default=None, help="Override the joint-position action scale (env_cfg.actions.joint_pos.scale). Higher = larger joint motions per step = enables faster gaits.")
 parser.add_argument("--command_y", type=float, default=None, help="Fixed lateral velocity command in m/s.")
 parser.add_argument("--command_yaw", type=float, default=None, help="Fixed yaw velocity command in rad/s.")
 parser.add_argument(
@@ -590,8 +591,11 @@ def apply_reward_overrides(env_cfg: object) -> None:
     if args_cli.reward_alive_weight is not None:
         rewards.alive.weight = args_cli.reward_alive_weight
         applied["alive_weight"] = args_cli.reward_alive_weight
+    if args_cli.action_scale is not None:
+        env_cfg.actions.joint_pos.scale = args_cli.action_scale
+        applied["action_scale"] = args_cli.action_scale
     if applied:
-        print(f"[MBRL] reward overrides applied: {applied}", flush=True)
+        print(f"[MBRL] env overrides applied: {applied}", flush=True)
 
 
 def append_metrics(csv_path: str, row: dict[str, float | int]) -> None:
