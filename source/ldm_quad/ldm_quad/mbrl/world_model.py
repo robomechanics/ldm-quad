@@ -164,6 +164,7 @@ class LatentWorldModel(nn.Module):
         tau: float = 0.01,
         rho: float = 0.5,
         entropy_coef: float = 1e-4,
+        bc_coef: float = 0.0,
         num_bins: int = 101,
         vmin: float = -10.0,
         vmax: float = 10.0,
@@ -183,6 +184,10 @@ class LatentWorldModel(nn.Module):
         self.tau = tau
         self.rho = rho
         self.entropy_coef = entropy_coef
+        # TD-M(PC)^2 (arXiv 2502.03550) behavior-cloning coefficient (beta). When
+        # 0.0 the actor loss is identical to vanilla TD-MPC2: the BC term below is
+        # skipped entirely, so this is a no-op unless explicitly enabled.
+        self.bc_coef = bc_coef
         self.dreg = DistributionalRegressionCfg(num_bins=num_bins, vmin=vmin, vmax=vmax)
         self.simnorm_dim = simnorm_dim
         self.q_dropout = q_dropout
@@ -354,7 +359,12 @@ class LatentWorldModel(nn.Module):
     def policy_parameters(self):
         yield from self.policy_head.parameters()
 
-    def policy_loss(self, zs: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
+    def policy_loss(
+        self,
+        zs: torch.Tensor,
+        planner_mean: torch.Tensor | None = None,
+        planner_std: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         actions, info = self.pi(zs.detach(), deterministic=False, return_info=True)
         q = self.Q(zs.detach(), actions, return_type="avg", detach=True)
         self.q_scale.update(q[0])
@@ -365,6 +375,35 @@ class LatentWorldModel(nn.Module):
         )
         per_step_loss = -(scaled_q + self.entropy_coef * info["scaled_entropy"]).mean(dim=(1, 2))
         loss = (per_step_loss * rho).mean()
+
+        # TD-M(PC)^2 behavior-cloning term: pull the freshly-sampled actor action
+        # toward the MPC planner's stored Gaussian mu ~ pi_H (arXiv 2502.03550).
+        # mu is a Gaussian defined directly over the (already tanh-squashed) action
+        # space, so log_mu is a plain diagonal-Gaussian log-density -- no tanh
+        # Jacobian correction (that correction only applies to pi's own density).
+        # rollout state t aligns 1:1 with real transition t, so planner_mean/std
+        # (H steps) match actions[:H]. Steps with no stored planner Gaussian (seed
+        # phase, model-bootstrap, or legacy buffers) carry a NaN sentinel and are
+        # masked out. bc_coef == 0.0 makes this a no-op.
+        bc_logmu_mean = 0.0
+        if self.bc_coef > 0.0 and planner_mean is not None and planner_std is not None:
+            horizon = planner_mean.shape[0]
+            a_bc = actions[:horizon]
+            std = planner_std.clamp_min(1e-3)
+            two_pi = torch.log(torch.tensor(2.0 * torch.pi, device=zs.device, dtype=zs.dtype))
+            log_mu = -0.5 * (((a_bc - planner_mean) / std).square() + 2.0 * std.log() + two_pi)
+            log_mu = log_mu.sum(dim=-1, keepdim=True)
+            valid = torch.isfinite(planner_mean).all(dim=-1, keepdim=True) & torch.isfinite(std).all(dim=-1, keepdim=True)
+            log_mu = torch.where(valid, log_mu, torch.zeros_like(log_mu))
+            # Normalize by S_q (same running scale as the Q term) without updating it.
+            scaled_log_mu = self.q_scale(log_mu)
+            valid_f = valid.to(scaled_log_mu.dtype)
+            denom = valid_f.sum(dim=(1, 2)).clamp_min(1.0)
+            bc_per_step = (scaled_log_mu * valid_f).sum(dim=(1, 2)) / denom
+            bc_loss = -(self.bc_coef * bc_per_step * rho[:horizon]).mean()
+            loss = loss + bc_loss
+            bc_logmu_mean = float((log_mu * valid_f).sum().detach().item() / denom.sum().clamp_min(1.0).item())
+
         metrics = {
             "policy_loss": float(loss.detach().item()),
             "policy_q": float(q.detach().mean().item()),
@@ -372,6 +411,7 @@ class LatentWorldModel(nn.Module):
             "policy_entropy": float(info["entropy"].detach().mean().item()),
             "policy_scaled_entropy": float(info["scaled_entropy"].detach().mean().item()),
             "policy_q_scale": float(self.q_scale.value.detach().mean().item()),
+            "policy_bc_logmu": bc_logmu_mean,
         }
         return loss, metrics
 

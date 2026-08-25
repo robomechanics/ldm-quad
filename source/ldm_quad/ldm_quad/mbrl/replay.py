@@ -17,6 +17,11 @@ class ReplayBuffer:
         self.device = torch.device(device)
         self.obs = torch.zeros((capacity, obs_dim), dtype=torch.float32, device=self.device)
         self.actions = torch.zeros((capacity, action_dim), dtype=torch.float32, device=self.device)
+        # TD-M(PC)^2: per-transition MPC planner Gaussian mu ~ pi_H. NaN is the
+        # "no planner Gaussian here" sentinel (seed/bootstrap steps, or legacy
+        # buffers), which the actor BC term masks out.
+        self.planner_mean = torch.full((capacity, action_dim), float("nan"), dtype=torch.float32, device=self.device)
+        self.planner_std = torch.full((capacity, action_dim), float("nan"), dtype=torch.float32, device=self.device)
         self.next_obs = torch.zeros((capacity, obs_dim), dtype=torch.float32, device=self.device)
         self.rewards = torch.zeros((capacity, 1), dtype=torch.float32, device=self.device)
         self.continues = torch.zeros((capacity, 1), dtype=torch.float32, device=self.device)
@@ -41,6 +46,8 @@ class ReplayBuffer:
             "action_dim": int(self.actions.shape[-1]),
             "obs": self.obs.cpu(),
             "actions": self.actions.cpu(),
+            "planner_mean": self.planner_mean.cpu(),
+            "planner_std": self.planner_std.cpu(),
             "next_obs": self.next_obs.cpu(),
             "rewards": self.rewards.cpu(),
             "continues": self.continues.cpu(),
@@ -72,6 +79,15 @@ class ReplayBuffer:
 
         self.obs.copy_(state_dict["obs"])
         self.actions.copy_(state_dict["actions"])
+        # Backward-compatible: legacy checkpoints predate the planner Gaussian.
+        # Missing keys leave the NaN sentinel, so the BC term is simply skipped
+        # for those transitions.
+        if "planner_mean" in state_dict and "planner_std" in state_dict:
+            self.planner_mean.copy_(state_dict["planner_mean"])
+            self.planner_std.copy_(state_dict["planner_std"])
+        else:
+            self.planner_mean.fill_(float("nan"))
+            self.planner_std.fill_(float("nan"))
         self.next_obs.copy_(state_dict["next_obs"])
         self.rewards.copy_(state_dict["rewards"])
         self.continues.copy_(state_dict["continues"])
@@ -93,6 +109,8 @@ class ReplayBuffer:
         next_obs: torch.Tensor,
         continues: torch.Tensor,
         resets: torch.Tensor | None = None,
+        planner_mean: torch.Tensor | None = None,
+        planner_std: torch.Tensor | None = None,
     ) -> None:
         obs = obs.to(self.device, non_blocking=True)
         actions = actions.to(self.device, non_blocking=True)
@@ -103,6 +121,16 @@ class ReplayBuffer:
             resets = resets.to(self.device, non_blocking=True)
 
         batch_size = obs.shape[0]
+        # TD-M(PC)^2: planner Gaussian for this batch, NaN where unavailable.
+        if planner_mean is None:
+            planner_mean = torch.full_like(self.planner_mean[:batch_size], float("nan"))
+        else:
+            planner_mean = planner_mean.to(self.device, non_blocking=True)
+        if planner_std is None:
+            planner_std = torch.full_like(self.planner_std[:batch_size], float("nan"))
+        else:
+            planner_std = planner_std.to(self.device, non_blocking=True)
+
         self._last_batch_size = batch_size
         if self._env_episode_ids.numel() != batch_size:
             self._env_episode_ids = torch.zeros(batch_size, dtype=torch.long, device=self.device)
@@ -113,6 +141,8 @@ class ReplayBuffer:
             rewards = rewards[-self.capacity :]
             next_obs = next_obs[-self.capacity :]
             continues = continues[-self.capacity :]
+            planner_mean = planner_mean[-self.capacity :]
+            planner_std = planner_std[-self.capacity :]
             batch_size = self.capacity
 
         env_ids = torch.arange(batch_size, dtype=torch.long, device=self.device)
@@ -124,6 +154,8 @@ class ReplayBuffer:
         if end <= self.capacity:
             self.obs[start:end] = obs
             self.actions[start:end] = actions
+            self.planner_mean[start:end] = planner_mean
+            self.planner_std[start:end] = planner_std
             self.rewards[start:end] = rewards
             self.next_obs[start:end] = next_obs
             self.continues[start:end] = continues
@@ -135,6 +167,8 @@ class ReplayBuffer:
             second = end - self.capacity
             self.obs[start:] = obs[:first]
             self.actions[start:] = actions[:first]
+            self.planner_mean[start:] = planner_mean[:first]
+            self.planner_std[start:] = planner_std[:first]
             self.rewards[start:] = rewards[:first]
             self.next_obs[start:] = next_obs[:first]
             self.continues[start:] = continues[:first]
@@ -143,6 +177,8 @@ class ReplayBuffer:
             self.step_ids[start:] = step_ids[:first]
             self.obs[:second] = obs[first:]
             self.actions[:second] = actions[first:]
+            self.planner_mean[:second] = planner_mean[first:]
+            self.planner_std[:second] = planner_std[first:]
             self.rewards[:second] = rewards[first:]
             self.next_obs[:second] = next_obs[first:]
             self.continues[:second] = continues[first:]
@@ -236,6 +272,8 @@ class ReplayBuffer:
         return {
             "obs": self.obs[indices].to(device),
             "actions": self.actions[transition_indices].to(device),
+            "planner_mean": self.planner_mean[transition_indices].to(device),
+            "planner_std": self.planner_std[transition_indices].to(device),
             "rewards": self.rewards[transition_indices].to(device),
             "continues": self.continues[transition_indices].to(device),
         }

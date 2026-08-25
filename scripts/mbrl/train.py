@@ -162,6 +162,17 @@ parser.add_argument("--num_q", type=int, default=5, help="Number of Q heads for 
 parser.add_argument("--target_tau", type=float, default=0.01, help="Soft-update rate for latent target encoder/Q heads.")
 parser.add_argument("--rho", type=float, default=0.5, help="Temporal loss discount for latent rollout losses.")
 parser.add_argument("--entropy_coef", type=float, default=1e-4, help="Entropy coefficient for the latent stochastic actor.")
+parser.add_argument(
+    "--tdmpc2_bc_coef",
+    type=float,
+    default=0.0,
+    help=(
+        "TD-M(PC)^2 (arXiv 2502.03550) behavior-cloning coefficient beta. Adds a "
+        "log-likelihood term to the actor loss regularizing the actor toward the "
+        "stored MPC planner Gaussian. 0.0 (default) = vanilla TD-MPC2 (no-op). "
+        "Only affects --model_type latent."
+    ),
+)
 parser.add_argument("--q_dropout", type=float, default=0.01, help="Dropout probability used inside latent Q heads.")
 parser.add_argument("--num_bins", type=int, default=101, help="Number of symlog two-hot bins for latent reward/value heads.")
 parser.add_argument("--vmin", type=float, default=-10.0, help="Minimum symlog bin value for latent distributional regression.")
@@ -1143,6 +1154,7 @@ def main() -> None:
             tau=args_cli.target_tau,
             rho=args_cli.rho,
             entropy_coef=args_cli.entropy_coef,
+            bc_coef=args_cli.tdmpc2_bc_coef,
             num_bins=args_cli.num_bins,
             vmin=args_cli.vmin,
             vmax=args_cli.vmax,
@@ -1614,6 +1626,15 @@ def main() -> None:
             done = terminated | truncated
             continues = (~terminated).float()
 
+            # TD-M(PC)^2: stash the planner Gaussian mu ~ pi_H only for
+            # planner-controlled steps; seed/bootstrap steps store the NaN
+            # sentinel so the actor BC term masks them out.
+            step_planner_mean = None
+            step_planner_std = None
+            if latest_control_mode == "planner" and planner.last_action_mean is not None:
+                step_planner_mean = planner.last_action_mean.detach()
+                step_planner_std = planner.last_action_std.detach()
+
             replay.add_batch(
                 obs.detach(),
                 actions.detach(),
@@ -1621,6 +1642,8 @@ def main() -> None:
                 next_obs.detach(),
                 continues.detach(),
                 done.detach(),
+                planner_mean=step_planner_mean,
+                planner_std=step_planner_std,
             )
 
             recent_step_rewards.append(float(rewards.mean().item()))
@@ -1687,7 +1710,11 @@ def main() -> None:
                 if args_cli.model_type == "latent":
                     assert policy_optimizer is not None
                     model.sync_detached_qs()
-                    policy_loss, policy_metrics = model.policy_loss(rollout_states)
+                    policy_loss, policy_metrics = model.policy_loss(
+                        rollout_states,
+                        planner_mean=batch.get("planner_mean"),
+                        planner_std=batch.get("planner_std"),
+                    )
                     policy_optimizer.zero_grad(set_to_none=True)
                     policy_loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.policy_parameters(), args_cli.grad_clip_norm)

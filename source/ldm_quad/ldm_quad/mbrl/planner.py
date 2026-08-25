@@ -766,6 +766,12 @@ class LatentMPPIPlanner:
         self.prior_command_dim = prior_command_dim
         self._prev_mean: torch.Tensor | None = None
         self.last_diagnostics: dict[str, float] = {}
+        # TD-M(PC)^2: Gaussian mu ~ pi_H of the action actually executed this step,
+        # exposed so the collection loop can stash it in the replay buffer. Set by
+        # plan(); consumers should treat these as valid only for planner-controlled
+        # steps (they are not updated during seed/bootstrap collection).
+        self.last_action_mean: torch.Tensor | None = None
+        self.last_action_std: torch.Tensor | None = None
 
     @property
     def control_horizon(self) -> int:
@@ -1050,6 +1056,10 @@ class LatentMPPIPlanner:
             selected_indices.view(-1, 1, 1, 1).expand(-1, 1, self.control_horizon, self.action_dim),
         ).squeeze(1)
         self._prev_mean = mean.detach()
+        # TD-M(PC)^2: record the first-step CEM Gaussian as mu ~ pi_H for the
+        # executed action, before any extra exploration noise is added.
+        self.last_action_mean = mean[:, 0].detach()
+        self.last_action_std = std[:, 0].detach()
         action = self._clip_actions(self._expand_controls(selected_controls)[:, 0])
         if self.action_noise and not eval_mode:
             action = self._clip_actions(action + std[:, 0] * torch.randn_like(action))

@@ -2,30 +2,32 @@
 # KEPT CURRICULUM RECORD + RUNNER -- Go2 latent-TD-MPC2 walker.
 #
 # Records the curriculum that is being KEPT (the good, reusable policies) AND carries the
-# full-parameter recipe to train/continue it. NOT for throwaway experiments/sweeps -- those
-# live in scratchpad drivers. Each stage's best policy is preserved standalone in
-# logs/mbrl/best_walker/ (see its README.md).
+# full-parameter recipe to train/continue it. NOT for throwaway experiments/sweeps.
+# Each stage's best policy is preserved standalone in logs/mbrl/best_walker/ (see README.md).
 #
-# Reward: the tuned best, baked into flat_env_cfg.py (track w=8.0, std=0.11, alive=0.10).
-# Tuning story + hyperparameters: scripts/mbrl/TUNING_RESULTS.md.
+# Reward: tuned best, baked into flat_env_cfg.py (track w=8.0, std=0.11, alive=0.10).
+# Action scale: baked to 0.40 in flat_env_cfg.py (action-scale sweep winner) -- clears the
+# reward-only ~0.33 ceiling to ~0.39 m/s at command 0.4. This is the FROZEN benchmark scale.
+# Tuning: scripts/mbrl/TUNING_RESULTS.md; sweep: logs/mbrl/action_scale_sweep_results.tsv.
 #
-# Curriculum lineage (each stage resumes the previous, raising command_x):
-#   0.0 stand -> x=0.2 -> x=0.3 -> x=0.4
+# Curriculum lineage (each stage resumes the previous):
+#   0.0 stand -> x=0.2 -> x=0.3 -> x=0.4 (v0p31, scale 0.25) -> x=0.4 fast (v0p39, scale 0.40)
 #
-#   Stage  cmd_x  Kept checkpoint (logs/mbrl/best_walker/)
-#   x=0.2  0.2    model_150000_x0p2_knowngood.pt , best_walker_x0p2_stabletrack.pt
-#   x=0.3  0.3    best_walker_x0p3.pt
-#   x=0.4  0.4    best_x0p4_reward_w8_v0p309.pt (~0.309) ,
-#                 final_x0p4_walker_v0p31.pt (~0.33 m/s, CURRENT BEST)
+#   Stage   cmd_x  scale  Kept checkpoint (logs/mbrl/best_walker/)          ~vel
+#   x0p2    0.2    0.25   best_walker_x0p2_stabletrack.pt / model_150000_*  --
+#   x0p3    0.3    0.25   best_walker_x0p3.pt                                --
+#   x0p4    0.4    0.25   final_x0p4_walker_v0p31.pt                         ~0.33
+#   x0p4f   0.4    0.40   best_x0p4_ascale0p40_v0p39.pt                      ~0.39  (CURRENT BEST)
+#
+# NOTE: x0.2/x0.3/x0.4 were trained at action scale 0.25; the env default is now 0.40, so
+# run.sh play passes the right --action_scale per stage to replay each one faithfully.
 #
 # Usage:
 #   ./run.sh                 # print the curriculum manifest
-#   ./run.sh play  [stage]   # play a kept walker (x0p2|x0p3|x0p4; default x0p4)
-#   ./run.sh train           # run the FULL training recipe (all params below) to
-#                            # continue the curriculum (defaults to x=0.4 from current best)
+#   ./run.sh play  [stage]   # play a kept walker (x0p2|x0p3|x0p4|x0p4f; default x0p4f)
+#   ./run.sh train           # full training recipe (all params) to continue the curriculum
+#                            # (defaults to command 0.4, baked action scale 0.40, from current best)
 #   Train overrides (env):   CMD_X= RESUME= TRAIN_STEPS= SEED= WANDB_NAME=
-#     e.g. continue x=0.3:   CMD_X=0.3 RESUME=logs/mbrl/best_walker/best_walker_x0p2_stabletrack.pt \
-#                            TRAIN_STEPS=200000 ./run.sh train
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -36,30 +38,32 @@ ACTION="${1:-manifest}"
 
 case "$ACTION" in
   play)
-    STAGE="${2:-x0p4}"
+    STAGE="${2:-x0p4f}"
     case "$STAGE" in
-      x0p2) CKPT=$BW/best_walker_x0p2_stabletrack.pt; CMD=0.2 ;;
-      x0p3) CKPT=$BW/best_walker_x0p3.pt;             CMD=0.3 ;;
-      x0p4) CKPT=$BW/final_x0p4_walker_v0p31.pt;      CMD=0.4 ;;
-      *) echo "unknown stage: $STAGE (use x0p2|x0p3|x0p4)"; exit 1 ;;
+      x0p2)  CKPT=$BW/best_walker_x0p2_stabletrack.pt; CMD=0.2; SCALE=0.25 ;;
+      x0p3)  CKPT=$BW/best_walker_x0p3.pt;             CMD=0.3; SCALE=0.25 ;;
+      x0p4)  CKPT=$BW/final_x0p4_walker_v0p31.pt;      CMD=0.4; SCALE=0.25 ;;
+      x0p4f) CKPT=$BW/best_x0p4_ascale0p40_v0p39.pt;   CMD=0.4; SCALE=0.40 ;;
+      *) echo "unknown stage: $STAGE (use x0p2|x0p3|x0p4|x0p4f)"; exit 1 ;;
     esac
     [[ -f "$CKPT" ]] || { echo "[run] ERROR: missing $CKPT"; exit 1; }
-    echo "[run] play $STAGE: $CKPT (command_x=$CMD)"
+    echo "[run] play $STAGE: $CKPT (command_x=$CMD, action_scale=$SCALE)"
     exec "$PY" -u scripts/mbrl/play.py --checkpoint "$CKPT" \
       --num_envs 1 --num_episodes 1 --max_steps 300 \
-      --command_x "$CMD" --command_y 0.0 --command_yaw 0.0
+      --command_x "$CMD" --command_y 0.0 --command_yaw 0.0 \
+      --action_scale "$SCALE"
     ;;
 
   train)
     # ---------- FULL curriculum training recipe (all parameters) ----------
     SEED="${SEED:-43}"
     CMD_X="${CMD_X:-0.4}"
-    RESUME="${RESUME:-$BW/final_x0p4_walker_v0p31.pt}"   # current best x=0.4 walker
-    TRAIN_STEPS="${TRAIN_STEPS:-260000}"                 # absolute target (base is ~231050)
+    RESUME="${RESUME:-$BW/best_x0p4_ascale0p40_v0p39.pt}"   # current best (action scale 0.40, ~0.39 m/s)
+    TRAIN_STEPS="${TRAIN_STEPS:-280000}"                    # absolute target (0.39 walker base ~251050)
     WANDB_NAME="${WANDB_NAME:-curriculum_x$(echo "$CMD_X" | tr . p)_s${SEED}}"
     [[ -f "$RESUME" ]] || { echo "[run] ERROR: resume checkpoint missing: $RESUME"; exit 1; }
     echo "[run] TRAIN curriculum: cmd_x=$CMD_X resume=$RESUME -> train_steps=$TRAIN_STEPS"
-    echo "[run]   (planner_iterations 6 = final quality; tuned reward baked into flat_env_cfg)"
+    echo "[run]   (action scale 0.40 + tuned reward baked into flat_env_cfg; planner_iterations 6)"
     exec "$PY" -u scripts/mbrl/train.py \
       --headless --task Flat-Unitree-Go2-train-v0 --num_envs 64 --seed "$SEED" \
       --buffer_capacity 1000000 --replay_device auto \
@@ -85,16 +89,18 @@ case "$ACTION" in
     cat <<'EOF'
 KEPT CURRICULUM -- Go2 latent-TD-MPC2 walker
 Reward: tuned best baked into flat_env_cfg.py (track w=8.0, std=0.11, alive=0.10)
+Action scale: baked to 0.40 (sweep winner) -- the FROZEN benchmark scale.
 Policies preserved standalone in logs/mbrl/best_walker/ (see its README.md).
 
-  Stage  cmd_x  Checkpoint
-  x=0.2  0.2    model_150000_x0p2_knowngood.pt / best_walker_x0p2_stabletrack.pt
-  x=0.3  0.3    best_walker_x0p3.pt
-  x=0.4  0.4    final_x0p4_walker_v0p31.pt   (~0.33 m/s, CURRENT BEST)
+  Stage   cmd_x  scale  Checkpoint                        ~vel
+  x0p2    0.2    0.25   best_walker_x0p2_stabletrack.pt   --
+  x0p3    0.3    0.25   best_walker_x0p3.pt               --
+  x0p4    0.4    0.25   final_x0p4_walker_v0p31.pt        ~0.33
+  x0p4f   0.4    0.40   best_x0p4_ascale0p40_v0p39.pt     ~0.39  (CURRENT BEST)
 
-  ./run.sh play  [x0p2|x0p3|x0p4]   # play a kept walker
-  ./run.sh train                    # full-param training recipe (continue x=0.4 from best)
-                                     # overrides: CMD_X= RESUME= TRAIN_STEPS= SEED= WANDB_NAME=
+  ./run.sh play  [x0p2|x0p3|x0p4|x0p4f]   # play a kept walker (default x0p4f)
+  ./run.sh train                          # full-param training recipe (continue from best)
+                                          # overrides: CMD_X= RESUME= TRAIN_STEPS= SEED= WANDB_NAME=
 EOF
     ;;
 esac

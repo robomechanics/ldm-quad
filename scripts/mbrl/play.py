@@ -39,6 +39,7 @@ parser.add_argument("--real-time", action="store_true", default=False, help="Run
 parser.add_argument("--command_x", type=float, default=None, help="Fixed forward velocity command in m/s.")
 parser.add_argument("--command_y", type=float, default=None, help="Fixed lateral velocity command in m/s.")
 parser.add_argument("--command_yaw", type=float, default=None, help="Fixed yaw velocity command in rad/s.")
+parser.add_argument("--action_scale", type=float, default=None, help="Override joint-position action scale. Default: the checkpoint's trained scale, else the env default.")
 parser.add_argument(
     "--mismatch",
     type=str,
@@ -813,6 +814,12 @@ def main() -> None:
     )
     env_cfg.seed = seed
     command_x, command_y, command_yaw = apply_fixed_velocity_command(env_cfg, checkpoint_args)
+    # Resolve joint action scale: explicit flag > checkpoint's trained scale > env default.
+    # (Older curriculum checkpoints were trained at 0.25; the current env default is 0.40.)
+    action_scale = args_cli.action_scale if args_cli.action_scale is not None else checkpoint_args.get("action_scale")
+    if action_scale is not None:
+        env_cfg.actions.joint_pos.scale = float(action_scale)
+        print(f"[INFO] action scale = {float(action_scale)}")
     apply_mismatch(env_cfg, args_cli.mismatch)
 
     render_mode = "rgb_array" if args_cli.video else None
