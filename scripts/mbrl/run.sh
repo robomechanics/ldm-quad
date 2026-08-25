@@ -8,7 +8,7 @@
 # Reward: tuned best, baked into flat_env_cfg.py (track w=8.0, std=0.11, alive=0.10).
 # Action scale: baked to 0.40 in flat_env_cfg.py (action-scale sweep winner) -- clears the
 # reward-only ~0.33 ceiling to ~0.39 m/s at command 0.4. This is the FROZEN benchmark scale.
-# Tuning: scripts/mbrl/TUNING_RESULTS.md; sweep: logs/mbrl/action_scale_sweep_results.tsv.
+# Tuning: scripts/mbrl/TUNING_RESULTS.md.
 #
 # Curriculum lineage (each stage resumes the previous):
 #   0.0 stand -> x=0.2 -> x=0.3 -> x=0.4 (v0p31, scale 0.25) -> x=0.4 fast (v0p39, scale 0.40)

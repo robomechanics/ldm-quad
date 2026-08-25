@@ -389,15 +389,22 @@ class LatentWorldModel(nn.Module):
         if self.bc_coef > 0.0 and planner_mean is not None and planner_std is not None:
             horizon = planner_mean.shape[0]
             a_bc = actions[:horizon]
-            std = planner_std.clamp_min(1e-3)
+            valid = torch.isfinite(planner_mean).all(dim=-1, keepdim=True) & torch.isfinite(planner_std).all(dim=-1, keepdim=True)
+            valid_f = valid.to(a_bc.dtype)
+            # CRITICAL: sanitize the sentinel NaNs BEFORE any math. Masking the
+            # forward with torch.where(valid, log_mu, 0) is NOT enough -- autograd
+            # backprops 0*NaN = NaN through the invalid (seed/bootstrap/legacy)
+            # steps, poisoning policy_head and, via self.pi(), the model loss and
+            # planner. nan_to_num keeps NaN out of the graph entirely; the
+            # multiplicative valid_f mask then zeroes invalid steps cleanly
+            # (finite*0 = 0, with 0 gradient).
+            safe_mean = torch.nan_to_num(planner_mean, nan=0.0)
+            safe_std = torch.nan_to_num(planner_std, nan=1.0).clamp_min(1e-3)
             two_pi = torch.log(torch.tensor(2.0 * torch.pi, device=zs.device, dtype=zs.dtype))
-            log_mu = -0.5 * (((a_bc - planner_mean) / std).square() + 2.0 * std.log() + two_pi)
-            log_mu = log_mu.sum(dim=-1, keepdim=True)
-            valid = torch.isfinite(planner_mean).all(dim=-1, keepdim=True) & torch.isfinite(std).all(dim=-1, keepdim=True)
-            log_mu = torch.where(valid, log_mu, torch.zeros_like(log_mu))
+            log_mu = -0.5 * (((a_bc - safe_mean) / safe_std).square() + 2.0 * safe_std.log() + two_pi)
+            log_mu = log_mu.sum(dim=-1, keepdim=True) * valid_f
             # Normalize by S_q (same running scale as the Q term) without updating it.
             scaled_log_mu = self.q_scale(log_mu)
-            valid_f = valid.to(scaled_log_mu.dtype)
             denom = valid_f.sum(dim=(1, 2)).clamp_min(1.0)
             bc_per_step = (scaled_log_mu * valid_f).sum(dim=(1, 2)) / denom
             bc_loss = -(self.bc_coef * bc_per_step * rho[:horizon]).mean()
