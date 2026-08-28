@@ -437,6 +437,8 @@ parser.add_argument(
 parser.add_argument("--command_x", type=float, default=None, help="Fixed forward velocity command in m/s.")
 parser.add_argument("--reward_track_weight", type=float, default=None, help="Override track_lin_vel_xy_exp reward weight (speed-tracking strength).")
 parser.add_argument("--reward_track_std", type=float, default=None, help="Override track_lin_vel_xy_exp reward std (lower = sharper speed tracking).")
+parser.add_argument("--reward_yaw_weight", type=float, default=None, help="Override track_ang_vel_z_exp reward weight (yaw/turn-tracking strength). Stock 0.5 is far weaker than the tuned linear term (8.0), so yaw is effectively untracked.")
+parser.add_argument("--reward_yaw_std", type=float, default=None, help="Override track_ang_vel_z_exp reward std (lower = sharper yaw tracking).")
 parser.add_argument("--reward_alive_weight", type=float, default=None, help="Override the alive reward weight.")
 parser.add_argument("--action_scale", type=float, default=None, help="Override the joint-position action scale (env_cfg.actions.joint_pos.scale). Higher = larger joint motions per step = enables faster gaits.")
 parser.add_argument("--command_y", type=float, default=None, help="Fixed lateral velocity command in m/s.")
@@ -599,6 +601,12 @@ def apply_reward_overrides(env_cfg: object) -> None:
     if args_cli.reward_track_std is not None:
         rewards.track_lin_vel_xy_exp.params["std"] = args_cli.reward_track_std
         applied["track_std"] = args_cli.reward_track_std
+    if args_cli.reward_yaw_weight is not None:
+        rewards.track_ang_vel_z_exp.weight = args_cli.reward_yaw_weight
+        applied["yaw_weight"] = args_cli.reward_yaw_weight
+    if args_cli.reward_yaw_std is not None:
+        rewards.track_ang_vel_z_exp.params["std"] = args_cli.reward_yaw_std
+        applied["yaw_std"] = args_cli.reward_yaw_std
     if args_cli.reward_alive_weight is not None:
         rewards.alive.weight = args_cli.reward_alive_weight
         applied["alive_weight"] = args_cli.reward_alive_weight
