@@ -164,6 +164,17 @@ parser.add_argument(
     help="Override using the best evaluated candidate as the final MPPI plan.",
 )
 parser.add_argument("--num_pi_trajs", type=int, default=None, help="Override TD-MPC2-style policy trajectories in latent planning.")
+parser.add_argument(
+    "--horizon",
+    type=int,
+    default=None,
+    help="Override the PLANNING horizon (env steps looked ahead). Default: the checkpoint's trained horizon. "
+    "The latent dynamics model can roll any number of steps, so this is safe to vary at play time. "
+    "At env step 0.02s, horizon 8 = 0.16s, which is under one Go2 trot cycle (~0.3-0.5s).",
+)
+parser.add_argument("--candidates", type=int, default=None, help="Override planner candidate count (search width). Default: checkpoint value.")
+parser.add_argument("--planner_iterations", type=int, default=None, help="Override planner refinement iterations (search depth). Default: checkpoint value.")
+parser.add_argument("--planner_temperature", type=float, default=None, help="Override planner elite-weighting temperature. Default: checkpoint value.")
 parser.add_argument("--min_std", type=float, default=None, help="Override minimum latent planner action std.")
 parser.add_argument("--max_std", type=float, default=None, help="Override maximum latent planner action std.")
 parser.add_argument(
@@ -928,12 +939,12 @@ def main() -> None:
             model=model,
             action_low=action_low,
             action_high=action_high,
-            horizon=checkpoint_args["horizon"],
-            candidates=checkpoint_args["candidates"],
+            horizon=(args_cli.horizon if args_cli.horizon is not None else checkpoint_args["horizon"]),
+            candidates=(args_cli.candidates if args_cli.candidates is not None else checkpoint_args["candidates"]),
             elites=checkpoint_args.get("elites", 32),
-            iterations=checkpoint_args.get("planner_iterations", checkpoint_args.get("cem_iterations", 4)),
+            iterations=(args_cli.planner_iterations if args_cli.planner_iterations is not None else checkpoint_args.get("planner_iterations", checkpoint_args.get("cem_iterations", 4))),
             discount=checkpoint_args["discount"],
-            temperature=checkpoint_args.get("planner_temperature", 0.5),
+            temperature=(args_cli.planner_temperature if args_cli.planner_temperature is not None else checkpoint_args.get("planner_temperature", 0.5)),
             lambda_=checkpoint_args.get("mppi_lambda", 1.0),
             min_std=args_cli.min_std if args_cli.min_std is not None else checkpoint_args.get("min_std", 0.05),
             max_std=args_cli.max_std if args_cli.max_std is not None else checkpoint_args.get("max_std", 2.0),
@@ -1091,6 +1102,8 @@ def main() -> None:
             flush=True,
         )
     print(f"[INFO] Planner={'prior_only' if args_cli.prior_only else planner_name}")
+    if args_cli.horizon is not None:
+        print(f"[INFO] planning horizon OVERRIDE = {args_cli.horizon} (checkpoint trained at {checkpoint_args.get('horizon')})")
     if args_cli.online_adapt:
         print(
             "[INFO] Online model adaptation enabled "

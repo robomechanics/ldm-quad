@@ -13,7 +13,9 @@
 # Curriculum lineage (each stage resumes the previous):
 #   0.0 stand -> x=0.2 -> x=0.3 -> x=0.4 (v0p31, scale 0.25) -> x=0.4 fast (v0p39, scale 0.40)
 #   -> omni O1 (wander x[-0.2,0.5] y[+-0.15] yaw[+-0.3])  -- xy learned, YAW NOT TRACKED
-#   -> omni O1a "Arm A" (same ranges + yaw reward 4.0/0.2)  <- CURRENT RUN
+#   -> omni O1a "Arm A" (same ranges + yaw reward 4.0/0.2)  -- inconclusive, yaw still dead
+#   -> Stage T (turning): arcs x[0.2,0.4], yaw +-0.8, yaw rew 4.0/0.5, lin std 0.20  <- CURRENT RUN
+#      (first Stage T launch used yaw std 0.2 -> gradient ~9x too weak at err 0.44; relaunched)
 #
 #   Stage   cmd_x  scale  Kept checkpoint (logs/mbrl/best_walker/)          ~vel
 #   x0p2    0.2    0.25   best_walker_x0p2_stabletrack.pt / model_150000_*  --
@@ -21,7 +23,8 @@
 #   x0p4    0.4    0.25   final_x0p4_walker_v0p31.pt                         ~0.33
 #   x0p4f   0.4    0.40   best_x0p4_ascale0p40_v0p39.pt                      ~0.39  (CURRENT BEST)
 #   o1      wander 0.40   omni_O1_265k_xyok_yawfail.pt                      tx=0.062, yaw FAIL
-#   o1a     wander 0.40   (training now; resumes o1 @265k, yaw rew 4.0/0.2)    --
+#   o1a     wander 0.40   armA_yaw4p0_270k.pt                                 yaw still dead
+#   T       arcs   0.40   (training now; resumes armA @272150, yaw rew 4.0/0.5)  --
 #
 # Omni command curriculum (Step 2 of the benchmark plan): O1 above; planned
 #   O2 x[+-0.5] y[+-0.3] yaw[+-0.6]; O3 (final frozen ranges) ~x[+-0.5..0.6] y[+-0.4] yaw[+-0.8].
@@ -77,22 +80,33 @@ case "$ACTION" in
     SEED="${SEED:-43}"
     WANDER="${WANDER:-1}"
     CMD_X="${CMD_X:-0.4}"
-    X_MIN="${X_MIN:--0.2}"; X_MAX="${X_MAX:-0.5}"       # O1 ranges (unchanged for Arm A)
-    Y_MIN="${Y_MIN:--0.15}"; Y_MAX="${Y_MAX:-0.15}"
-    YAW_MIN="${YAW_MIN:--0.3}"; YAW_MAX="${YAW_MAX:-0.3}"
-    YAW_W="${YAW_W:-4.0}"; YAW_STD="${YAW_STD:-0.2}"     # <-- the Arm A change
+    X_MIN="${X_MIN:-0.2}"; X_MAX="${X_MAX:-0.4}"        # Stage T: known-good forward -> turn in ARCS
+    Y_MIN="${Y_MIN:-0.0}"; Y_MAX="${Y_MAX:-0.0}"        # Stage T isolates yaw; lateral comes in Stage L
+    YAW_MIN="${YAW_MIN:--0.8}"; YAW_MAX="${YAW_MAX:-0.8}"  # E|yaw|=0.4 > the 0.18-0.58 involuntary drift
+    # Yaw tracking reward. std MUST be comparable to the CURRENT error, not the target error:
+    # the kernel is exp(-err^2/std^2), and yaw error starts at ~0.44 (the robot does not turn).
+    #   std 0.2 @ err 0.44 -> reward 0.008, gradient 0.17   (essentially flat / dead)
+    #   std 0.5 @ err 0.44 -> reward 0.461, gradient 1.62   (~9x more learning signal)
+    # Tighten std only AFTER turning exists, the same way the linear term was sharpened
+    # to 0.11 only after forward walking worked.
+    YAW_W="${YAW_W:-4.0}"; YAW_STD="${YAW_STD:-0.5}"
+    # Linear std MUST be loosened for turning stages. With std 0.11 (tuned when x was the
+    # ONLY error) the reward math is: ignore-yaw = 7.30 vs turn-costing-0.1m/s = 7.26, i.e.
+    # turning earns nothing and any bigger speed cost is a net LOSS. At std 0.20 it becomes
+    # 7.83 vs 9.99 -> turning clearly pays. Revisit when freezing the final task.
+    TRACK_STD="${TRACK_STD:-0.20}"
     # best-checkpoint metric: default yaw weight 0.25 would let a great-x/no-yaw policy win
     # again; 0.5 matches the new reward ratio (yaw 4.0 / linear 8.0).
     EVAL_YAW_W="${EVAL_YAW_W:-0.5}"
     BC_COEF="${BC_COEF:-0.1}"                            # TD-M(PC)^2 BC term (0 = vanilla)
-    RESUME="${RESUME:-$BW/omni_O1_265k_xyok_yawfail.pt}"    # O1 @265k (xy good, yaw untracked)
-    TRAIN_STEPS="${TRAIN_STEPS:-290000}"                    # absolute target (~25k new steps)
+    RESUME="${RESUME:-$BW/armA_yaw4p0_270k.pt}"             # Arm A @270k (fwd+strafe ok, NO turning)
+    TRAIN_STEPS="${TRAIN_STEPS:-310000}"                    # ~40k new steps; go/no-go on yaw at ~10k
     if [[ "$WANDER" == "1" ]]; then
       CMD_ARGS=(--wander --wander_x_min "$X_MIN" --wander_x_max "$X_MAX" \
                 --wander_y_min "$Y_MIN" --wander_y_max "$Y_MAX" \
                 --wander_yaw_min "$YAW_MIN" --wander_yaw_max "$YAW_MAX")
-      WANDB_NAME="${WANDB_NAME:-omni_O1a_yaw_s${SEED}}"
-      echo "[run] TRAIN omni O1a: x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
+      WANDB_NAME="${WANDB_NAME:-stageT_turn_s${SEED}}"
+      echo "[run] TRAIN Stage T (turning): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
     else
       CMD_ARGS=(--command_x "$CMD_X" --command_y 0.0 --command_yaw 0.0)
       WANDB_NAME="${WANDB_NAME:-curriculum_x$(echo "$CMD_X" | tr . p)_s${SEED}}"
@@ -113,6 +127,7 @@ case "$ACTION" in
       --q_dropout 0.1 --entropy_coef 0.0003 \
       --tdmpc2_bc_coef "$BC_COEF" \
       --reward_yaw_weight "$YAW_W" --reward_yaw_std "$YAW_STD" \
+      --reward_track_std "$TRACK_STD" \
       --eval_tracking_yaw_weight "$EVAL_YAW_W" \
       --seed_steps 2000 --seed_action_mode smooth_zero --seed_action_noise_std 0.08 --seed_action_smoothing 0.92 \
       --seed_pretrain_updates 5000 --seed_policy_noise 0.02 \
@@ -137,7 +152,8 @@ Policies preserved standalone in logs/mbrl/best_walker/ (see its README.md).
   x0p4    x=0.4                 0.25   final_x0p4_walker_v0p31.pt        ~0.33
   x0p4f   x=0.4                 0.40   best_x0p4_ascale0p40_v0p39.pt     ~0.39  (BEST forward)
   o1      wander x/y/yaw (O1)   0.40   omni_O1_265k_xyok_yawfail.pt      tx=.062 yaw FAIL
-  o1a     O1 + yaw rew 4.0/.2  0.40   (TRAINING NOW, resumes o1 @265k)   --
+  o1a     O1 + yaw rew 4.0/.2  0.40   armA_yaw4p0_270k.pt               yaw dead
+  T       arcs + yaw 4.0/0.5  0.40   (TRAINING NOW, resumes armA @272k)  --
 
   ./run.sh play  [x0p2|x0p3|x0p4|x0p4f]   # play a kept walker (default x0p4f)
   ./run.sh train                          # omni O1 recipe (WANDER=1 default; WANDER=0 CMD_X= for fixed)
