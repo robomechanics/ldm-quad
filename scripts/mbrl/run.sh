@@ -24,7 +24,9 @@
 #   x0p4f   0.4    0.40   best_x0p4_ascale0p40_v0p39.pt                      ~0.39  (CURRENT BEST)
 #   o1      wander 0.40   omni_O1_265k_xyok_yawfail.pt                      tx=0.062, yaw FAIL
 #   o1a     wander 0.40   armA_yaw4p0_270k.pt                                 yaw still dead
-#   T       arcs   0.40   (training now; resumes armA @272150, yaw rew 4.0/0.5)  --
+#   T       arcs   0.40   stageT_turning_301k.pt              TURNING WORKS (tyaw 0.17 vs 0.42 do-nothing)
+#   L       arcs+lat 0.40  stageL_omni_326k.pt        combo 94/97/98% (x,y,yaw simultaneously)
+#   M       full   0.40   (training now; resumes L @326k, x now [-0.3,0.5])  <- FROZEN TASK
 #
 # Omni command curriculum (Step 2 of the benchmark plan): O1 above; planned
 #   O2 x[+-0.5] y[+-0.3] yaw[+-0.6]; O3 (final frozen ranges) ~x[+-0.5..0.6] y[+-0.4] yaw[+-0.8].
@@ -80,8 +82,15 @@ case "$ACTION" in
     SEED="${SEED:-43}"
     WANDER="${WANDER:-1}"
     CMD_X="${CMD_X:-0.4}"
-    X_MIN="${X_MIN:-0.2}"; X_MAX="${X_MAX:-0.4}"        # Stage T: known-good forward -> turn in ARCS
-    Y_MIN="${Y_MIN:-0.0}"; Y_MAX="${Y_MAX:-0.0}"        # Stage T isolates yaw; lateral comes in Stage L
+    # Stage M (MIXING -> defines the frozen benchmark task). x now spans BACKWARD..STOP..FORWARD.
+    # Stage L trained x in [0.2,0.4] only, so x~0 was out-of-distribution: pure strafing from
+    # standstill scored 81% one way but 49% the other AND fell. Widening x is what makes
+    # standing / pure-lateral / near-stationary commands in-distribution at all.
+    X_MIN="${X_MIN:--0.3}"; X_MAX="${X_MAX:-0.5}"
+    # Stage L: lateral is the ONE new variable. y=0.4 fell over in the diagnostic, so 0.35
+    # is the honest ceiling. Yaw stays at the PROVEN +-0.8: dropping it to +-0.2 would put the
+    # command back under the +-0.2 sensor noise (the O1 failure) and let turning decay.
+    Y_MIN="${Y_MIN:--0.3}"; Y_MAX="${Y_MAX:-0.3}"       # frozen-task lateral range
     YAW_MIN="${YAW_MIN:--0.8}"; YAW_MAX="${YAW_MAX:-0.8}"  # E|yaw|=0.4 > the 0.18-0.58 involuntary drift
     # Yaw tracking reward. std MUST be comparable to the CURRENT error, not the target error:
     # the kernel is exp(-err^2/std^2), and yaw error starts at ~0.44 (the robot does not turn).
@@ -99,14 +108,14 @@ case "$ACTION" in
     # again; 0.5 matches the new reward ratio (yaw 4.0 / linear 8.0).
     EVAL_YAW_W="${EVAL_YAW_W:-0.5}"
     BC_COEF="${BC_COEF:-0.1}"                            # TD-M(PC)^2 BC term (0 = vanilla)
-    RESUME="${RESUME:-$BW/armA_yaw4p0_270k.pt}"             # Arm A @270k (fwd+strafe ok, NO turning)
-    TRAIN_STEPS="${TRAIN_STEPS:-310000}"                    # ~40k new steps; go/no-go on yaw at ~10k
+    RESUME="${RESUME:-$BW/stageL_omni_326k.pt}"             # Stage L @326k (combo 94/97/98% in-distribution)
+    TRAIN_STEPS="${TRAIN_STEPS:-356000}"                    # ~30k new steps to cover the widened x range
     if [[ "$WANDER" == "1" ]]; then
       CMD_ARGS=(--wander --wander_x_min "$X_MIN" --wander_x_max "$X_MAX" \
                 --wander_y_min "$Y_MIN" --wander_y_max "$Y_MAX" \
                 --wander_yaw_min "$YAW_MIN" --wander_yaw_max "$YAW_MAX")
-      WANDB_NAME="${WANDB_NAME:-stageT_turn_s${SEED}}"
-      echo "[run] TRAIN Stage T (turning): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
+      WANDB_NAME="${WANDB_NAME:-stageM_mixing_s${SEED}}"
+      echo "[run] TRAIN Stage M (mixing/frozen task): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
     else
       CMD_ARGS=(--command_x "$CMD_X" --command_y 0.0 --command_yaw 0.0)
       WANDB_NAME="${WANDB_NAME:-curriculum_x$(echo "$CMD_X" | tr . p)_s${SEED}}"
@@ -153,7 +162,9 @@ Policies preserved standalone in logs/mbrl/best_walker/ (see its README.md).
   x0p4f   x=0.4                 0.40   best_x0p4_ascale0p40_v0p39.pt     ~0.39  (BEST forward)
   o1      wander x/y/yaw (O1)   0.40   omni_O1_265k_xyok_yawfail.pt      tx=.062 yaw FAIL
   o1a     O1 + yaw rew 4.0/.2  0.40   armA_yaw4p0_270k.pt               yaw dead
-  T       arcs + yaw 4.0/0.5  0.40   (TRAINING NOW, resumes armA @272k)  --
+  T       arcs + yaw 4.0/0.5  0.40   stageT_turning_301k.pt            TURNING OK
+  L       T + lateral +-0.35   0.40   stageL_omni_326k.pt               combo 94/97/98%
+  M       full x[-0.3,0.5]      0.40   (TRAINING NOW, resumes L @326k)   <- frozen task
 
   ./run.sh play  [x0p2|x0p3|x0p4|x0p4f]   # play a kept walker (default x0p4f)
   ./run.sh train                          # omni O1 recipe (WANDER=1 default; WANDER=0 CMD_X= for fixed)
