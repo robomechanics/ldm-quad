@@ -23,6 +23,12 @@ if SOURCE_ROOT not in sys.path:
 
 from isaaclab.app import AppLauncher
 
+# Terrain transitions are what the adaptive model is evaluated under. Rigid/deformable
+# transitions run through scripts/mbrl/play_newton_mpm.py, which owns its own simulator.
+TERRAIN_MISMATCHES = ["nominal", "low_friction", "compliant", "rough", "slope"]
+SYSTEM_MISMATCHES = ["mass", "motor_weakness", "push"]   # retained, off the terrain suite
+ALL_MISMATCHES = TERRAIN_MISMATCHES + SYSTEM_MISMATCHES
+
 parser = argparse.ArgumentParser(description="Play or evaluate an MBRL checkpoint on an Isaac Lab task.")
 parser.add_argument("--video", action="store_true", default=False, help="Record a rollout video.")
 parser.add_argument("--video_length", type=int, default=1000, help="Length of the recorded video in steps.")
@@ -44,14 +50,17 @@ parser.add_argument(
     "--mismatch",
     type=str,
     default="nominal",
-    choices=["nominal", "low_friction", "mass", "motor_weakness", "rough", "push"],
-    help="Held-out system/terrain mismatch to apply for play/evaluation.",
+    choices=ALL_MISMATCHES,
+    help="Held-out terrain (or system) mismatch to apply for play/evaluation.",
 )
 parser.add_argument("--mismatch_friction", type=float, default=0.35, help="Static/dynamic friction used by --mismatch low_friction.")
 parser.add_argument("--mismatch_mass_add", type=float, default=3.0, help="Additional base mass in kg for --mismatch mass.")
 parser.add_argument("--mismatch_motor_scale", type=float, default=0.6, help="Action scale multiplier for --mismatch motor_weakness.")
 parser.add_argument("--mismatch_push_velocity", type=float, default=1.0, help="Max planar push velocity for --mismatch push.")
 parser.add_argument("--mismatch_push_interval", type=float, default=3.0, help="Push interval in seconds for --mismatch push.")
+parser.add_argument("--mismatch_compliant_stiffness", type=float, default=5000.0, help="Contact stiffness [N/m] used by --mismatch compliant. Lower is softer terrain.")
+parser.add_argument("--mismatch_compliant_damping", type=float, default=100.0, help="Contact damping used by --mismatch compliant.")
+parser.add_argument("--mismatch_slope", type=float, default=0.3, help="Max terrain slope (rise/run) for --mismatch slope.")
 parser.add_argument("--mismatch_rough_height", type=float, default=0.04, help="Max box height for --mismatch rough video terrain.")
 parser.add_argument("--mismatch_rough_noise", type=float, default=0.025, help="Max random roughness noise for --mismatch rough video terrain.")
 parser.add_argument(
@@ -367,6 +376,28 @@ def _set_physics_material_friction(env_cfg: object, static_friction: float, dyna
         env_cfg.sim.physics_material = material
 
 
+def _set_physics_material_compliance(env_cfg: object, stiffness: float, damping: float) -> None:
+    material = getattr(getattr(env_cfg, "scene", None), "terrain", None).physics_material
+    material.compliant_contact_stiffness = stiffness
+    material.compliant_contact_damping = damping
+    if getattr(env_cfg, "sim", None) is not None:
+        env_cfg.sim.physics_material = material
+
+
+def _use_generated_terrain(env_cfg: object) -> object:
+    """Switch the scene onto a fresh, uncurriculumed 5x5 terrain generator."""
+    env_cfg.scene.terrain.terrain_type = "generator"
+    env_cfg.scene.terrain.terrain_generator = deepcopy(ROUGH_TERRAINS_CFG)
+    env_cfg.scene.terrain.max_init_terrain_level = None
+    env_cfg.curriculum.terrain_levels = None
+    generator = env_cfg.scene.terrain.terrain_generator
+    if generator is not None:
+        generator.num_rows = 5
+        generator.num_cols = 5
+        generator.curriculum = False
+    return generator
+
+
 def apply_mismatch(env_cfg: object, mismatch: str) -> None:
     if mismatch == "nominal":
         return
@@ -382,6 +413,24 @@ def apply_mismatch(env_cfg: object, mismatch: str) -> None:
                 args_cli.mismatch_friction,
                 args_cli.mismatch_friction,
             )
+        return
+
+    if mismatch == "compliant":
+        _set_physics_material_compliance(
+            env_cfg, args_cli.mismatch_compliant_stiffness, args_cli.mismatch_compliant_damping
+        )
+        return
+
+    if mismatch == "slope":
+        generator = _use_generated_terrain(env_cfg)
+        if generator is not None:
+            slopes = {k: v for k, v in generator.sub_terrains.items() if "slope" in k}
+            if not slopes:
+                raise ValueError("ROUGH_TERRAINS_CFG has no sloped sub-terrain to isolate.")
+            for sub_terrain in slopes.values():
+                sub_terrain.proportion = 1.0 / len(slopes)
+                sub_terrain.slope_range = (0.0, args_cli.mismatch_slope)
+            generator.sub_terrains = slopes
         return
 
     if mismatch == "mass":
@@ -403,25 +452,13 @@ def apply_mismatch(env_cfg: object, mismatch: str) -> None:
         return
 
     if mismatch == "rough":
-        env_cfg.scene.terrain.terrain_type = "generator"
-        env_cfg.scene.terrain.terrain_generator = deepcopy(ROUGH_TERRAINS_CFG)
-        env_cfg.scene.terrain.max_init_terrain_level = None
-        env_cfg.curriculum.terrain_levels = None
-        if env_cfg.scene.terrain.terrain_generator is not None:
-            env_cfg.scene.terrain.terrain_generator.num_rows = 5
-            env_cfg.scene.terrain.terrain_generator.num_cols = 5
-            env_cfg.scene.terrain.terrain_generator.curriculum = False
-            if "boxes" in env_cfg.scene.terrain.terrain_generator.sub_terrains:
-                env_cfg.scene.terrain.terrain_generator.sub_terrains["boxes"].grid_height_range = (
-                    0.01,
-                    args_cli.mismatch_rough_height,
-                )
-            if "random_rough" in env_cfg.scene.terrain.terrain_generator.sub_terrains:
-                env_cfg.scene.terrain.terrain_generator.sub_terrains["random_rough"].noise_range = (
-                    0.005,
-                    args_cli.mismatch_rough_noise,
-                )
-                env_cfg.scene.terrain.terrain_generator.sub_terrains["random_rough"].noise_step = 0.01
+        generator = _use_generated_terrain(env_cfg)
+        if generator is not None:
+            if "boxes" in generator.sub_terrains:
+                generator.sub_terrains["boxes"].grid_height_range = (0.01, args_cli.mismatch_rough_height)
+            if "random_rough" in generator.sub_terrains:
+                generator.sub_terrains["random_rough"].noise_range = (0.005, args_cli.mismatch_rough_noise)
+                generator.sub_terrains["random_rough"].noise_step = 0.01
         return
 
     if mismatch == "push":

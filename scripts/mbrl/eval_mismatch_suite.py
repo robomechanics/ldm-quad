@@ -13,14 +13,19 @@ import sys
 from datetime import datetime
 
 
-DEFAULT_MISMATCHES = ["nominal", "low_friction", "mass", "motor_weakness", "rough", "push"]
+# Terrain axes of the planned evaluation: friction, compliance, roughness, contact
+# geometry. Rigid/deformable transitions run through scripts/mbrl/play_newton_mpm.py.
+TERRAIN_MISMATCHES = ["nominal", "low_friction", "compliant", "rough", "slope"]
+SYSTEM_MISMATCHES = ["mass", "motor_weakness", "push"]   # opt-in, not part of the terrain suite
+DEFAULT_MISMATCHES = TERRAIN_MISMATCHES
+ALL_MISMATCHES = TERRAIN_MISMATCHES + SYSTEM_MISMATCHES
 EVAL_RE = re.compile(r"mean_return=([-+0-9.eE]+)\s+std_return=([-+0-9.eE]+)\s+mean_length=([-+0-9.eE]+)")
 COMPLETED_RE = re.compile(r"steps=([0-9]+)\s+completed_episodes=([0-9]+)")
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
-        description="Launch scripts/mbrl/play.py once per system/terrain mismatch and collect metrics.",
+        description="Launch scripts/mbrl/play.py once per terrain mismatch and collect metrics.",
         allow_abbrev=False,
     )
     parser.add_argument("--checkpoint", required=True, help="Path to the MBRL checkpoint to evaluate.")
@@ -28,8 +33,9 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         "--mismatches",
         nargs="+",
         default=DEFAULT_MISMATCHES,
-        choices=DEFAULT_MISMATCHES,
-        help="Mismatch cases to run.",
+        choices=ALL_MISMATCHES,
+        help=f"Mismatch cases to run. Defaults to the terrain suite {TERRAIN_MISMATCHES}; "
+             f"the system perturbations {SYSTEM_MISMATCHES} must be requested explicitly.",
     )
     parser.add_argument("--output", default=None, help="Optional CSV output path.")
     parser.add_argument("--play_script", default="scripts/mbrl/play.py", help="Path to the play script.")

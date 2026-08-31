@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--command_x", type=float, default=0.2)
     parser.add_argument("--command_y", type=float, default=0.0)
     parser.add_argument("--command_yaw", type=float, default=0.0)
-    parser.add_argument("--mismatch", default="nominal", choices=["nominal", "low_friction", "mass", "motor_weakness", "rough", "push"])
+    parser.add_argument("--mismatch", default="nominal", choices=["nominal", "low_friction", "compliant", "rough", "slope", "mass", "motor_weakness", "push"])
     parser.add_argument("--video_length", type=int, default=300)
     parser.add_argument("--max_steps", type=int, default=300)
     parser.add_argument("--fps", type=int, default=50)

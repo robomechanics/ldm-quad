@@ -17,7 +17,7 @@
 #   -> Stage T (turning): arcs x[0.2,0.4], yaw +-0.8, yaw rew 4.0/0.5, lin std 0.20 -- TURNING SOLVED
 #      (first launch used yaw std 0.2 -> gradient ~9x too weak at err 0.44; relaunched at 0.5)
 #   -> Stage L (lateral): + y +-0.35 -- combo 94/97/98% on all three axes at once
-#   -> Stage M (mixing): x widened to [-0.3,0.4]  <- CURRENT RUN, DEFINES THE FROZEN TASK
+#   -> Stage M (mixing): x widened to [-0.3,0.5]  <- CURRENT RUN, DEFINES THE FROZEN TASK
 #
 #   Stage   cmd_x  scale  Kept checkpoint (logs/mbrl/best_walker/)          ~vel
 #   x0p2    0.2    0.25   best_walker_x0p2_stabletrack.pt / model_150000_*  --
@@ -28,7 +28,7 @@
 #   o1a     wander 0.40   armA_yaw4p0_270k.pt                                 yaw still dead
 #   T       arcs   0.40   stageT_turning_301k.pt              TURNING WORKS (tyaw 0.17 vs 0.42 do-nothing)
 #   L       arcs+lat 0.40  stageL_omni_326k.pt        combo 94/97/98% (x,y,yaw simultaneously)
-#   M       full   0.40   (queued; resumes L @326k, x now [-0.3,0.4])        <- FROZEN TASK
+#   M       full   0.40   (queued; resumes L @326k, x now [-0.3,0.5])        <- FROZEN TASK
 #
 # Omni command curriculum (Step 2 of the benchmark plan): O1 above; planned
 #   O2 x[+-0.5] y[+-0.3] yaw[+-0.6]; O3 (final frozen ranges) ~x[+-0.5..0.6] y[+-0.4] yaw[+-0.8].
@@ -90,10 +90,14 @@ case "$ACTION" in
     # Stage L trained x in [0.2,0.4] only, so x~0 was out-of-distribution: pure strafing from
     # standstill scored 81% one way but 49% the other AND fell. Widening x is what makes
     # standing / pure-lateral / near-stationary commands in-distribution at all.
-    # X_MAX 0.4, not 0.5: measured peak forward speed is ~0.39 m/s (0.367 achieved on a 0.4
-    # command in the Stage L diagnostic), so 0.5 would be an UNREACHABLE command baked into
-    # the frozen task -- permanent tracking error at the top of the range for BOTH controllers.
-    X_MIN="${X_MIN:--0.3}"; X_MAX="${X_MAX:-0.4}"
+    # X_MAX 0.5. An earlier cap at 0.4 was WRONG: it assumed ~0.39 m/s was a physical ceiling.
+    # It is not -- PPO hits 0.4995 at command 0.5 with ZERO falls, so the robot can do 0.5.
+    # MBRL fails there only because 0.5 is OUT-OF-DISTRIBUTION for it (Stage L trained
+    # x in [0.2,0.4]; the command is part of the observation, obs[9:12], so 0.5 is an unseen
+    # encoder input). The tell is REGRESSION not saturation: cmd 0.4 -> 0.374 m/s, 0 falls;
+    # cmd 0.5 -> 0.333 m/s, 36 falls. A physical ceiling saturates; it does not go slower.
+    # Widening x to 0.5 here is precisely what makes that command in-distribution.
+    X_MIN="${X_MIN:--0.3}"; X_MAX="${X_MAX:-0.5}"
     # Stage L: lateral is the ONE new variable. y=0.4 fell over in the diagnostic, so 0.35
     # is the honest ceiling. Yaw stays at the PROVEN +-0.8: dropping it to +-0.2 would put the
     # command back under the +-0.2 sensor noise (the O1 failure) and let turning decay.
@@ -119,7 +123,12 @@ case "$ACTION" in
     # kill (Stage M was OOM/killed once at 16:30 on 2026-08-30). Disk cost only.
     SAVE_INTERVAL="${SAVE_INTERVAL:-2500}"
     RESUME="${RESUME:-$BW/stageL_omni_326k.pt}"             # Stage L @326k (combo 94/97/98% in-distribution)
-    TRAIN_STEPS="${TRAIN_STEPS:-356000}"                    # ~30k new steps to cover the widened x range
+    # 50k new steps (not 30k): Stage M fixes THREE out-of-distribution regions at once
+    # (fast-forward 0.5, standing x~0, backward x<0), where Stage T/L each needed ~25-30k for
+    # ONE. Uniform sampling over the 0.8-wide x range also gives the top 0.05 band only ~6%
+    # of the data, so the 0.5 end is the thinnest-covered part. Checkpoints every 2500 steps
+    # mean we can stop early the moment it plateaus (as Stage T was stopped at 301k).
+    TRAIN_STEPS="${TRAIN_STEPS:-371000}"
     if [[ "$WANDER" == "1" ]]; then
       CMD_ARGS=(--wander --wander_x_min "$X_MIN" --wander_x_max "$X_MAX" \
                 --wander_y_min "$Y_MIN" --wander_y_max "$Y_MAX" \
