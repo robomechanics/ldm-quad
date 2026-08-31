@@ -42,6 +42,10 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.flat_env_cfg:UnitreeGo2RandFlatEnvCfg_PLAY",
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rand_ppo_cfg.yaml",
+        # architecture of the 2026-05-18 flat PPO baseline (MLP [128,128,128], elu).
+        # The default skrl_cfg_entry_point above is a RANDOM-agent stub, and
+        # skrl_ppo_cfg.yaml is [32,32]; neither can load that checkpoint.
+        "skrl_flat_ppo_eval_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_eval_cfg.yaml",
         "skrl_sac_cfg_entry_point": f"{agents.__name__}:skrl_sac_cfg.yaml",
     },
 )

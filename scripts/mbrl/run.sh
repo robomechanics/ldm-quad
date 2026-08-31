@@ -14,19 +14,21 @@
 #   0.0 stand -> x=0.2 -> x=0.3 -> x=0.4 (v0p31, scale 0.25) -> x=0.4 fast (v0p39, scale 0.40)
 #   -> omni O1 (wander x[-0.2,0.5] y[+-0.15] yaw[+-0.3])  -- xy learned, YAW NOT TRACKED
 #   -> omni O1a "Arm A" (same ranges + yaw reward 4.0/0.2)  -- inconclusive, yaw still dead
-#   -> Stage T (turning): arcs x[0.2,0.4], yaw +-0.8, yaw rew 4.0/0.5, lin std 0.20  <- CURRENT RUN
-#      (first Stage T launch used yaw std 0.2 -> gradient ~9x too weak at err 0.44; relaunched)
+#   -> Stage T (turning): arcs x[0.2,0.4], yaw +-0.8, yaw rew 4.0/0.5, lin std 0.20 -- TURNING SOLVED
+#      (first launch used yaw std 0.2 -> gradient ~9x too weak at err 0.44; relaunched at 0.5)
+#   -> Stage L (lateral): + y +-0.35 -- combo 94/97/98% on all three axes at once
+#   -> Stage M (mixing): x widened to [-0.3,0.4]  <- CURRENT RUN, DEFINES THE FROZEN TASK
 #
 #   Stage   cmd_x  scale  Kept checkpoint (logs/mbrl/best_walker/)          ~vel
 #   x0p2    0.2    0.25   best_walker_x0p2_stabletrack.pt / model_150000_*  --
 #   x0p3    0.3    0.25   best_walker_x0p3.pt                                --
 #   x0p4    0.4    0.25   final_x0p4_walker_v0p31.pt                         ~0.33
-#   x0p4f   0.4    0.40   best_x0p4_ascale0p40_v0p39.pt                      ~0.39  (CURRENT BEST)
+#   x0p4f   0.4    0.40   best_x0p4_ascale0p40_v0p39.pt                      ~0.39  (best FORWARD-only)
 #   o1      wander 0.40   omni_O1_265k_xyok_yawfail.pt                      tx=0.062, yaw FAIL
 #   o1a     wander 0.40   armA_yaw4p0_270k.pt                                 yaw still dead
 #   T       arcs   0.40   stageT_turning_301k.pt              TURNING WORKS (tyaw 0.17 vs 0.42 do-nothing)
 #   L       arcs+lat 0.40  stageL_omni_326k.pt        combo 94/97/98% (x,y,yaw simultaneously)
-#   M       full   0.40   (training now; resumes L @326k, x now [-0.3,0.5])  <- FROZEN TASK
+#   M       full   0.40   (queued; resumes L @326k, x now [-0.3,0.4])        <- FROZEN TASK
 #
 # Omni command curriculum (Step 2 of the benchmark plan): O1 above; planned
 #   O2 x[+-0.5] y[+-0.3] yaw[+-0.6]; O3 (final frozen ranges) ~x[+-0.5..0.6] y[+-0.4] yaw[+-0.8].
@@ -69,15 +71,17 @@ case "$ACTION" in
 
   train)
     # ---------- FULL curriculum training recipe (all parameters) ----------
-    # CURRENT EXPERIMENT: omni O1a "Arm A" -- O1 ranges + YAW REWARD PASS.
-    # O1 showed linear tracking works (track_x 0.062, 3x better than ignoring the command)
-    # but yaw was never tracked (track_yaw ~0.31 vs a 0.150 do-nothing baseline = 2x WORSE),
-    # because track_ang_vel_z_exp sat at stock 0.5/0.5 against the tuned linear 8.0/0.11.
-    # Arm A raises yaw to weight 4.0 / std 0.2 (half the linear weight, analogous sharpening).
+    # CURRENT EXPERIMENT: Stage M -- the MIXING stage that DEFINES THE FROZEN BENCHMARK TASK.
+    # Lineage: Stage T solved turning (98% of command); Stage L added lateral (combo 94/97/98%
+    # on all three axes simultaneously). Stage M widens x so standing / backward / pure-lateral
+    # commands are in-distribution -- they were NOT in Stage L (x in [0.2,0.4] only), where
+    # pure strafing at x=0 scored 81% one way, 49% the other, and fell over.
     # Fresh replay is INTENTIONAL: the buffer stores rewards at collection time and nothing
-    # relabels them, so inheriting O1's buffer would train the reward head on stale labels.
-    # Escalation if Arm A fails: Arm B YAW_W=8.0 YAW_STD=0.2 (parity with linear);
-    # if x tracking regresses instead: Arm C YAW_W=2.0 YAW_STD=0.3.
+    # relabels them, so inheriting an old buffer trains the reward head on stale labels.
+    # OPEN DECISION at freeze time: yaw commanded at x~0 demands IN-PLACE turning, the hard
+    # skill (Stage T 56%, PPO 37%, both fall). Either accept it, or gate yaw on |x|.
+    # NOTE: launch is gated by scripts/mbrl/wait_and_run_stageM.sh when the machine is shared --
+    # IsaacSim (~6-9GB) + the grid5 sweep (~19GB) OOMs this 30GB box.
     # Set WANDER=0 CMD_X=<v> to fall back to the old fixed-forward-command recipe.
     SEED="${SEED:-43}"
     WANDER="${WANDER:-1}"
@@ -86,7 +90,10 @@ case "$ACTION" in
     # Stage L trained x in [0.2,0.4] only, so x~0 was out-of-distribution: pure strafing from
     # standstill scored 81% one way but 49% the other AND fell. Widening x is what makes
     # standing / pure-lateral / near-stationary commands in-distribution at all.
-    X_MIN="${X_MIN:--0.3}"; X_MAX="${X_MAX:-0.5}"
+    # X_MAX 0.4, not 0.5: measured peak forward speed is ~0.39 m/s (0.367 achieved on a 0.4
+    # command in the Stage L diagnostic), so 0.5 would be an UNREACHABLE command baked into
+    # the frozen task -- permanent tracking error at the top of the range for BOTH controllers.
+    X_MIN="${X_MIN:--0.3}"; X_MAX="${X_MAX:-0.4}"
     # Stage L: lateral is the ONE new variable. y=0.4 fell over in the diagnostic, so 0.35
     # is the honest ceiling. Yaw stays at the PROVEN +-0.8: dropping it to +-0.2 would put the
     # command back under the +-0.2 sensor noise (the O1 failure) and let turning decay.
@@ -108,6 +115,9 @@ case "$ACTION" in
     # again; 0.5 matches the new reward ratio (yaw 4.0 / linear 8.0).
     EVAL_YAW_W="${EVAL_YAW_W:-0.5}"
     BC_COEF="${BC_COEF:-0.1}"                            # TD-M(PC)^2 BC term (0 = vanilla)
+    # 2500 (not 5000): at ~0.37 steps/s a 5000-step interval risks losing ~3.7h to a silent
+    # kill (Stage M was OOM/killed once at 16:30 on 2026-08-30). Disk cost only.
+    SAVE_INTERVAL="${SAVE_INTERVAL:-2500}"
     RESUME="${RESUME:-$BW/stageL_omni_326k.pt}"             # Stage L @326k (combo 94/97/98% in-distribution)
     TRAIN_STEPS="${TRAIN_STEPS:-356000}"                    # ~30k new steps to cover the widened x range
     if [[ "$WANDER" == "1" ]]; then
@@ -140,7 +150,7 @@ case "$ACTION" in
       --eval_tracking_yaw_weight "$EVAL_YAW_W" \
       --seed_steps 2000 --seed_action_mode smooth_zero --seed_action_noise_std 0.08 --seed_action_smoothing 0.92 \
       --seed_pretrain_updates 5000 --seed_policy_noise 0.02 \
-      --save_interval 5000 --max_checkpoints 5 --save_replay \
+      --save_interval "$SAVE_INTERVAL" --max_checkpoints 5 --save_replay \
       --save_best_metric stable_tracking --eval_interval 50 \
       --wandb --wandb_project "$PROJECT" \
       --resume_checkpoint "$RESUME" \

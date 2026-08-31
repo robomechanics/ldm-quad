@@ -8,3 +8,12 @@ wandb/
 *.pt
 *.png
 *.mp4
+
+# paper artifacts (workshop paper draft, generated figures, and their plot scripts)
+paper/
+figures/
+figures.zip
+scripts/paper/
+
+# transient local orchestration (machine-specific, not part of the project)
+scripts/mbrl/wait_and_run_stageM.sh

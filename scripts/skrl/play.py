@@ -53,6 +53,7 @@ parser.add_argument("--max_steps", type=int, default=0, help="Maximum environmen
 parser.add_argument("--command_x", type=float, default=None, help="Fixed forward velocity command in m/s.")
 parser.add_argument("--command_y", type=float, default=None, help="Fixed lateral velocity command in m/s.")
 parser.add_argument("--command_yaw", type=float, default=None, help="Fixed yaw velocity command in rad/s.")
+parser.add_argument("--action_scale", type=float, default=None, help="Override joint-position action scale. Set this to the scale the checkpoint was TRAINED with; the env default may differ.")
 parser.add_argument(
     "--wander",
     action="store_true",
@@ -156,6 +157,22 @@ else:
     algorithm = agent_cfg_entry_point.split("_cfg")[0].split("skrl_")[-1].lower()
 
 
+def apply_action_scale_override(env_cfg: object) -> None:
+    """Run a checkpoint at the action scale it was trained with.
+
+    The env default has changed over time (0.25 -> 0.40), so replaying an older
+    policy at the current default silently rescales every action it emits.
+    """
+    if args_cli.action_scale is None:
+        return
+    actions = getattr(env_cfg, "actions", None)
+    joint_pos = getattr(actions, "joint_pos", None)
+    if joint_pos is None:
+        raise AttributeError("This task config does not expose actions.joint_pos")
+    print(f"[INFO] Overriding action scale {joint_pos.scale} -> {args_cli.action_scale}")
+    joint_pos.scale = float(args_cli.action_scale)
+
+
 def apply_velocity_command_overrides(env_cfg: object) -> None:
     if not args_cli.wander and args_cli.command_x is None and args_cli.command_y is None and args_cli.command_yaw is None:
         return
@@ -192,6 +209,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     apply_velocity_command_overrides(env_cfg)
+    apply_action_scale_override(env_cfg)
 
     # configure the ML framework into the global skrl variable
     if args_cli.ml_framework.startswith("jax"):
@@ -275,6 +293,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     completed_lengths: list[float] = []
     command_error_xy: list[float] = []
     command_error_yaw: list[float] = []
+    # per-axis achieved velocity and tracking error, defined identically to
+    # scripts/mbrl/play.py:tracking_metrics so the two methods are comparable
+    vel_axis: dict[str, list[float]] = {"x": [], "y": [], "yaw": []}
+    trk_axis: dict[str, list[float]] = {"x": [], "y": [], "yaw": []}
     episode_returns = torch.zeros(obs.shape[0], dtype=torch.float32, device=obs.device)
     episode_lengths = torch.zeros(obs.shape[0], dtype=torch.float32, device=obs.device)
     # simulate environment
@@ -289,6 +311,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
                 base_ang_vel = obs[:, 3:6]
                 command_error_xy.append(torch.linalg.norm(base_lin_vel[:, :2] - command[:, :2], dim=-1).mean().item())
                 command_error_yaw.append((base_ang_vel[:, 2] - command[:, 2]).abs().mean().item())
+                vel = torch.stack([base_lin_vel[:, 0], base_lin_vel[:, 1], base_ang_vel[:, 2]], dim=-1)
+                for i, ax in enumerate(("x", "y", "yaw")):
+                    vel_axis[ax].append(vel[:, i].mean().item())
+                    trk_axis[ax].append((vel[:, i] - command[:, i]).abs().mean().item())
             # agent stepping
             outputs = runner.agent.act(obs, timestep=0, timesteps=0)
             # - multi-agent (deterministic) actions
@@ -344,6 +370,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
                 "[EVAL] "
                 f"mean_cmd_xy_error={float(np.mean(command_error_xy)):.3f} "
                 f"mean_cmd_yaw_error={float(np.mean(command_error_yaw)):.3f}"
+            )
+            warm = max(1, len(vel_axis["x"]) // 5)   # drop the start-up transient
+            print(
+                "[EVAL] "
+                + " ".join(
+                    f"vel_{ax}={float(np.mean(vel_axis[ax][warm:])):.4f} "
+                    f"track_{ax}={float(np.mean(trk_axis[ax][warm:])):.4f}"
+                    for ax in ("x", "y", "yaw")
+                )
             )
 
     # close the simulator
