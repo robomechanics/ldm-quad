@@ -452,13 +452,17 @@ def apply_mismatch(env_cfg: object, mismatch: str) -> None:
         return
 
     if mismatch == "rough":
+        # Roughness only: isolating random_rough keeps this a single-parameter axis,
+        # distinct from the discrete contact geometry of "slope".
         generator = _use_generated_terrain(env_cfg)
         if generator is not None:
-            if "boxes" in generator.sub_terrains:
-                generator.sub_terrains["boxes"].grid_height_range = (0.01, args_cli.mismatch_rough_height)
-            if "random_rough" in generator.sub_terrains:
-                generator.sub_terrains["random_rough"].noise_range = (0.005, args_cli.mismatch_rough_noise)
-                generator.sub_terrains["random_rough"].noise_step = 0.01
+            rough = generator.sub_terrains.get("random_rough")
+            if rough is None:
+                raise ValueError("ROUGH_TERRAINS_CFG has no random_rough sub-terrain to isolate.")
+            rough.proportion = 1.0
+            rough.noise_range = (0.005, args_cli.mismatch_rough_noise)
+            rough.noise_step = 0.01
+            generator.sub_terrains = {"random_rough": rough}
         return
 
     if mismatch == "push":

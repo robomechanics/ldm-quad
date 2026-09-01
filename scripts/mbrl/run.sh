@@ -80,8 +80,18 @@ case "$ACTION" in
     # relabels them, so inheriting an old buffer trains the reward head on stale labels.
     # OPEN DECISION at freeze time: yaw commanded at x~0 demands IN-PLACE turning, the hard
     # skill (Stage T 56%, PPO 37%, both fall). Either accept it, or gate yaw on |x|.
-    # NOTE: launch is gated by scripts/mbrl/wait_and_run_stageM.sh when the machine is shared --
-    # IsaacSim (~6-9GB) + the grid5 sweep (~19GB) OOMs this 30GB box.
+    # NOTE: LAUNCH VIA systemd-run --user (NOT a VS Code terminal, NOT nohup/setsid):
+    #   systemd-run --user --unit=stageM-mixing --collect \
+    #     --working-directory=$PWD bash -c 'exec bash scripts/mbrl/run.sh train >> LOG 2>&1'
+    # Root cause of the 2026-08-30/31 kills was NOT grid5 (measured: 1.2GB total, 7x175MB).
+    # It was cpptools: ros2_ws/src/quad-sdk/.vscode/c_cpp_properties.json had
+    # "limitSymbolsToIncludedHeaders": false with recursive globs over /opt/ros/jazzy/include/**
+    # and /usr/include/**, so the tag parser indexed the whole tree and grew to 23-25GB
+    # (23 OOM kills in 3 days). Global OOM made systemd-oomd sweep the entire snap.code.code-*
+    # scope ("killed 35 process(es) in this unit"), taking any run launched from a VS Code
+    # terminal with it. Fixed 2026-08-31 (flag -> true, /usr/include glob dropped).
+    # A run in its own systemd scope survives that sweep regardless.
+    # wait_and_run_stageM.sh gated on grid5 and is therefore OBSOLETE -- do not use it.
     # Set WANDER=0 CMD_X=<v> to fall back to the old fixed-forward-command recipe.
     SEED="${SEED:-43}"
     WANDER="${WANDER:-1}"
