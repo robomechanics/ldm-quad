@@ -263,6 +263,7 @@ from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 
 import ldm_quad.tasks  # noqa: F401
+from ldm_quad.eval.terrain_mismatch import apply_terrain_mismatch
 from ldm_quad.mbrl import DynamicsEnsemble, LatentWorldModel, ReplayBuffer, StateWorldModel, build_planner, load_policy_prior
 
 try:
@@ -368,69 +369,16 @@ def apply_fixed_velocity_command(env_cfg: object, checkpoint_args: dict) -> tupl
     return command_x, command_y, command_yaw
 
 
-def _set_physics_material_friction(env_cfg: object, static_friction: float, dynamic_friction: float) -> None:
-    material = getattr(getattr(env_cfg, "scene", None), "terrain", None).physics_material
-    material.static_friction = static_friction
-    material.dynamic_friction = dynamic_friction
-    if getattr(env_cfg, "sim", None) is not None:
-        env_cfg.sim.physics_material = material
-
-
-def _set_physics_material_compliance(env_cfg: object, stiffness: float, damping: float) -> None:
-    material = getattr(getattr(env_cfg, "scene", None), "terrain", None).physics_material
-    material.compliant_contact_stiffness = stiffness
-    material.compliant_contact_damping = damping
-    if getattr(env_cfg, "sim", None) is not None:
-        env_cfg.sim.physics_material = material
-
-
-def _use_generated_terrain(env_cfg: object) -> object:
-    """Switch the scene onto a fresh, uncurriculumed 5x5 terrain generator."""
-    env_cfg.scene.terrain.terrain_type = "generator"
-    env_cfg.scene.terrain.terrain_generator = deepcopy(ROUGH_TERRAINS_CFG)
-    env_cfg.scene.terrain.max_init_terrain_level = None
-    env_cfg.curriculum.terrain_levels = None
-    generator = env_cfg.scene.terrain.terrain_generator
-    if generator is not None:
-        generator.num_rows = 5
-        generator.num_cols = 5
-        generator.curriculum = False
-    return generator
-
-
 def apply_mismatch(env_cfg: object, mismatch: str) -> None:
-    if mismatch == "nominal":
-        return
-
-    if mismatch == "low_friction":
-        _set_physics_material_friction(env_cfg, args_cli.mismatch_friction, args_cli.mismatch_friction)
-        if getattr(env_cfg.events, "physics_material", None) is not None:
-            env_cfg.events.physics_material.params["static_friction_range"] = (
-                args_cli.mismatch_friction,
-                args_cli.mismatch_friction,
-            )
-            env_cfg.events.physics_material.params["dynamic_friction_range"] = (
-                args_cli.mismatch_friction,
-                args_cli.mismatch_friction,
-            )
-        return
-
-    if mismatch == "compliant":
-        _set_physics_material_compliance(
-            env_cfg, args_cli.mismatch_compliant_stiffness, args_cli.mismatch_compliant_damping
+    if mismatch in TERRAIN_MISMATCHES:
+        apply_terrain_mismatch(
+            env_cfg, mismatch,
+            friction=args_cli.mismatch_friction,
+            compliant_stiffness=args_cli.mismatch_compliant_stiffness,
+            compliant_damping=args_cli.mismatch_compliant_damping,
+            rough_noise=args_cli.mismatch_rough_noise,
+            slope=args_cli.mismatch_slope,
         )
-        return
-
-    if mismatch == "slope":
-        generator = _use_generated_terrain(env_cfg)
-        if generator is not None:
-            slopes = {k: v for k, v in generator.sub_terrains.items() if "slope" in k}
-            if not slopes:
-                raise ValueError("ROUGH_TERRAINS_CFG has no sloped sub-terrain to isolate.")
-            for sub_terrain in slopes.values():
-                sub_terrain.proportion = 1.0 / len(slopes)
-                sub_terrain.slope_range = (0.0, args_cli.mismatch_slope)
-            generator.sub_terrains = slopes
         return
 
     if mismatch == "mass":
@@ -449,20 +397,6 @@ def apply_mismatch(env_cfg: object, mismatch: str) -> None:
         if args_cli.mismatch_mode == "delayed":
             return
         env_cfg.actions.joint_pos.scale = float(env_cfg.actions.joint_pos.scale) * args_cli.mismatch_motor_scale
-        return
-
-    if mismatch == "rough":
-        # Roughness only: isolating random_rough keeps this a single-parameter axis,
-        # distinct from the discrete contact geometry of "slope".
-        generator = _use_generated_terrain(env_cfg)
-        if generator is not None:
-            rough = generator.sub_terrains.get("random_rough")
-            if rough is None:
-                raise ValueError("ROUGH_TERRAINS_CFG has no random_rough sub-terrain to isolate.")
-            rough.proportion = 1.0
-            rough.noise_range = (0.005, args_cli.mismatch_rough_noise)
-            rough.noise_step = 0.01
-            generator.sub_terrains = {"random_rough": rough}
         return
 
     if mismatch == "push":

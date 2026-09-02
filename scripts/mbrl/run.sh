@@ -17,7 +17,8 @@
 #   -> Stage T (turning): arcs x[0.2,0.4], yaw +-0.8, yaw rew 4.0/0.5, lin std 0.20 -- TURNING SOLVED
 #      (first launch used yaw std 0.2 -> gradient ~9x too weak at err 0.44; relaunched at 0.5)
 #   -> Stage L (lateral): + y +-0.35 -- combo 94/97/98% on all three axes at once
-#   -> Stage M (mixing): x widened to [-0.3,0.5]  <- CURRENT RUN, DEFINES THE FROZEN TASK
+#   -> Stage M (mixing): x widened to [-0.3,0.5] -- omni WORKS; backward+fast-fwd broken
+#   -> Stage B (backward): x [-0.35,0.2]  <- CURRENT RUN, fixes the backward gap
 #
 #   Stage   cmd_x  scale  Kept checkpoint (logs/mbrl/best_walker/)          ~vel
 #   x0p2    0.2    0.25   best_walker_x0p2_stabletrack.pt / model_150000_*  --
@@ -93,6 +94,51 @@ case "$ACTION" in
     # A run in its own systemd scope survives that sweep regardless.
     # wait_and_run_stageM.sh gated on grid5 and is therefore OBSOLETE -- do not use it.
     # Set WANDER=0 CMD_X=<v> to fall back to the old fixed-forward-command recipe.
+    # ============ CURRENT RUN: Stage B (BACKWARD) -- launched 2026-09-01 ============
+    # Stage M gave working omnidirectional locomotion (see measured table below) but left
+    # TWO gaps, both at the x EXTREMES: backward -0.3 (38% of command, FALLS) and
+    # fast-forward 0.5 (60%, FALLS). Everything in the middle -- forward 0.4, standing,
+    # both lateral directions, in-place turning, and all three axes combined -- works.
+    #
+    # WHY A SEPARATE STAGE, NOT MORE OF STAGE M: training Stage M on from 334k to 348k did
+    # not converge, it TRADED AXES. model_347500 vs model_best @334k: backward 38%->49%
+    # (falls->none) and in-place yaw 86%->92%, but lateral +y COLLAPSED 98%->63% and
+    # lateral -y started FALLING. The full-range task is more than one stage holds at once.
+    # This mirrors the curriculum's own history: Stage T (turning alone) and Stage L
+    # (lateral alone) each succeeded; Stage M attacked three regions and fixed one.
+    #
+    # DESIGN: x narrowed to [-0.35, 0.2] so BACKWARD gets ~64% of samples (vs ~37% under
+    # Stage M's [-0.3,0.5]) while moderate forward is retained to limit forgetting.
+    # y +-0.3 and yaw +-0.8 are UNCHANGED so lateral and turning keep being exercised --
+    # they already work and must not regress. Reward is unchanged too (yaw 4.0/0.5,
+    # track_std 0.20): change ONE variable at a time, which is what worked for T and L.
+    # Fast-forward 0.5 is a SEPARATE, later stage -- its cause is different (uniform x
+    # sampling gave the top 0.05 band only ~6% of data, i.e. starvation, not skill).
+    # ==============================================================================
+    # ---------------- REPRODUCING THE STAGE M RESULT (2026-09-01) ----------------
+    # run.sh alone does NOT reproduce the kept artifact. To reproduce exactly:
+    #  1) STOP POINT: this recipe says TRAIN_STEPS=371000, but the run was STOPPED at
+    #     env_steps=348450. The KEPT artifact is model_best.pt @ step ~333750
+    #     (stable_tracking 0.457, saved 2026-09-01 08:50). Training past ~334k made it
+    #     WORSE: over 334k->348k, len100 fell 682->580 and stable_tracking 0.372->0.284
+    #     while tracking errors stalled. Set TRAIN_STEPS=334000 to stop at the keeper.
+    #  2) REWARD IS NOT IN THIS FILE. alive=0.10, track w=8.0/std=0.11 and action
+    #     scale=0.40 are baked into flat_env_cfg.py (pinned at commit 895797e).
+    #     config.txt records reward_alive_weight/reward_track_weight as None for this
+    #     reason -- they never pass through run.sh. Check out that revision to reproduce.
+    #  3) --updates_per_step 8 below is DEAD: --utd 0.25 overrides it via
+    #     train.py:1119 round(utd*num_envs) = round(0.25*64) = 16. config.txt records 16.
+    #  4) Needs logs/mbrl/best_walker/stageL_omni_326k.pt (125MB, not in git).
+    #
+    # MEASURED RESULT of model_best @333750 (fixed-command sweep, logs/mbrl/stageM_sweep/,
+    # 3 episodes x 2000 steps each, action_scale 0.40; len=1000 means NO falls):
+    #   forward 0.4   -> 0.371 (93%)  no falls      in-place yaw 0.8 -> 0.688 (86%) no falls
+    #   lateral +0.3  -> 0.293 (98%)  no falls      combo (.3,.2,.5) -> 86/86/106%  no falls
+    #   lateral -0.3  -> -0.235 (78%) no falls      standing x=0     -> 0.006       no falls
+    #   fast    0.5   -> 0.301 (60%)  FALLS (650)   backward -0.3    -> -0.115 (38%) FALLS (569)
+    # => omnidirectional locomotion WORKS incl. in-place turning (Stage T was 56%, PPO 37%,
+    #    both fell). Remaining gaps are the x EXTREMES only: fast-forward 0.5 and backward.
+    # ---------------------------------------------------------------------------
     SEED="${SEED:-43}"
     WANDER="${WANDER:-1}"
     CMD_X="${CMD_X:-0.4}"
@@ -107,7 +153,7 @@ case "$ACTION" in
     # encoder input). The tell is REGRESSION not saturation: cmd 0.4 -> 0.374 m/s, 0 falls;
     # cmd 0.5 -> 0.333 m/s, 36 falls. A physical ceiling saturates; it does not go slower.
     # Widening x to 0.5 here is precisely what makes that command in-distribution.
-    X_MIN="${X_MIN:--0.3}"; X_MAX="${X_MAX:-0.5}"
+    X_MIN="${X_MIN:--0.35}"; X_MAX="${X_MAX:-0.2}"
     # Stage L: lateral is the ONE new variable. y=0.4 fell over in the diagnostic, so 0.35
     # is the honest ceiling. Yaw stays at the PROVEN +-0.8: dropping it to +-0.2 would put the
     # command back under the +-0.2 sensor noise (the O1 failure) and let turning decay.
@@ -132,19 +178,19 @@ case "$ACTION" in
     # 2500 (not 5000): at ~0.37 steps/s a 5000-step interval risks losing ~3.7h to a silent
     # kill (Stage M was OOM/killed once at 16:30 on 2026-08-30). Disk cost only.
     SAVE_INTERVAL="${SAVE_INTERVAL:-2500}"
-    RESUME="${RESUME:-$BW/stageL_omni_326k.pt}"             # Stage L @326k (combo 94/97/98% in-distribution)
+    RESUME="${RESUME:-$BW/stageM_omni_334k.pt}"             # Stage M keeper @~334k (omni works; backward+fast broken)
     # 50k new steps (not 30k): Stage M fixes THREE out-of-distribution regions at once
     # (fast-forward 0.5, standing x~0, backward x<0), where Stage T/L each needed ~25-30k for
     # ONE. Uniform sampling over the 0.8-wide x range also gives the top 0.05 band only ~6%
     # of the data, so the 0.5 end is the thinnest-covered part. Checkpoints every 2500 steps
     # mean we can stop early the moment it plateaus (as Stage T was stopped at 301k).
-    TRAIN_STEPS="${TRAIN_STEPS:-371000}"
+    TRAIN_STEPS="${TRAIN_STEPS:-354000}"    # resume @~334k + ~20k backward-focused steps
     if [[ "$WANDER" == "1" ]]; then
       CMD_ARGS=(--wander --wander_x_min "$X_MIN" --wander_x_max "$X_MAX" \
                 --wander_y_min "$Y_MIN" --wander_y_max "$Y_MAX" \
                 --wander_yaw_min "$YAW_MIN" --wander_yaw_max "$YAW_MAX")
-      WANDB_NAME="${WANDB_NAME:-stageM_mixing_s${SEED}}"
-      echo "[run] TRAIN Stage M (mixing/frozen task): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
+      WANDB_NAME="${WANDB_NAME:-stageB_backward_s${SEED}}"
+      echo "[run] TRAIN Stage B (backward focus): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
     else
       CMD_ARGS=(--command_x "$CMD_X" --command_y 0.0 --command_yaw 0.0)
       WANDB_NAME="${WANDB_NAME:-curriculum_x$(echo "$CMD_X" | tr . p)_s${SEED}}"

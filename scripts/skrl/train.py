@@ -59,6 +59,12 @@ parser.add_argument("--wander_y_min", type=float, default=-0.4, help="Minimum wa
 parser.add_argument("--wander_y_max", type=float, default=0.4, help="Maximum wander lateral velocity command.")
 parser.add_argument("--wander_yaw_min", type=float, default=-0.8, help="Minimum wander yaw velocity command.")
 parser.add_argument("--wander_yaw_max", type=float, default=0.8, help="Maximum wander yaw velocity command.")
+# Reward overrides, mirroring scripts/mbrl/train.py, so a PPO baseline can be trained
+# on the same frozen task the MBRL walker was (Stage M overrides these at runtime).
+parser.add_argument("--reward_track_weight", type=float, default=None, help="Override track_lin_vel_xy_exp reward weight.")
+parser.add_argument("--reward_track_std", type=float, default=None, help="Override track_lin_vel_xy_exp reward std.")
+parser.add_argument("--reward_yaw_weight", type=float, default=None, help="Override track_ang_vel_z_exp reward weight.")
+parser.add_argument("--reward_yaw_std", type=float, default=None, help="Override track_ang_vel_z_exp reward std.")
 parser.add_argument("--wander_resample_min", type=float, default=3.0, help="Minimum wander command resample time.")
 parser.add_argument("--wander_resample_max", type=float, default=5.0, help="Maximum wander command resample time.")
 
@@ -131,6 +137,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     apply_velocity_command_overrides(env_cfg)
+    apply_reward_overrides(env_cfg)
 
     # check for invalid combination of CPU device with distributed training
     if args_cli.distributed and args_cli.device is not None and "cpu" in args_cli.device:
@@ -250,6 +257,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # close the simulator
     env.close()
+
+
+def apply_reward_overrides(env_cfg: object) -> None:
+    """Same overrides scripts/mbrl/train.py applies, so both controllers see one reward."""
+    rewards = getattr(env_cfg, "rewards", None)
+    if rewards is None:
+        return
+    applied = {}
+    if args_cli.reward_track_weight is not None:
+        rewards.track_lin_vel_xy_exp.weight = args_cli.reward_track_weight
+        applied["track_weight"] = args_cli.reward_track_weight
+    if args_cli.reward_track_std is not None:
+        rewards.track_lin_vel_xy_exp.params["std"] = args_cli.reward_track_std
+        applied["track_std"] = args_cli.reward_track_std
+    if args_cli.reward_yaw_weight is not None:
+        rewards.track_ang_vel_z_exp.weight = args_cli.reward_yaw_weight
+        applied["yaw_weight"] = args_cli.reward_yaw_weight
+    if args_cli.reward_yaw_std is not None:
+        rewards.track_ang_vel_z_exp.params["std"] = args_cli.reward_yaw_std
+        applied["yaw_std"] = args_cli.reward_yaw_std
+    if applied:
+        print(f"[INFO] Reward overrides: {applied}")
 
 
 def apply_velocity_command_overrides(env_cfg: object) -> None:

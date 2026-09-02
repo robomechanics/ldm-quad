@@ -88,6 +88,16 @@ parser.add_argument(
     help="The RL algorithm used for training the skrl agent.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+# Terrain mismatches, identical to scripts/mbrl/play.py via the shared module, so the
+# PPO baseline and the MBRL controller are evaluated on the same perturbed terrain.
+parser.add_argument("--mismatch", type=str, default="nominal",
+                    choices=["nominal", "low_friction", "compliant", "rough", "slope"],
+                    help="Terrain mismatch to apply for evaluation.")
+parser.add_argument("--mismatch_friction", type=float, default=0.35, help="Friction for --mismatch low_friction.")
+parser.add_argument("--mismatch_compliant_stiffness", type=float, default=5000.0, help="Contact stiffness for --mismatch compliant.")
+parser.add_argument("--mismatch_compliant_damping", type=float, default=100.0, help="Contact damping for --mismatch compliant.")
+parser.add_argument("--mismatch_rough_noise", type=float, default=0.025, help="Height noise for --mismatch rough.")
+parser.add_argument("--mismatch_slope", type=float, default=0.3, help="Max slope for --mismatch slope.")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -147,6 +157,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import ldm_quad.tasks  # noqa: F401
+from ldm_quad.eval.terrain_mismatch import apply_terrain_mismatch
 
 # config shortcuts
 if args_cli.agent is None:
@@ -210,6 +221,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     apply_velocity_command_overrides(env_cfg)
     apply_action_scale_override(env_cfg)
+    if args_cli.mismatch != "nominal":
+        print(f"[INFO] Applying terrain mismatch: {args_cli.mismatch}")
+    apply_terrain_mismatch(
+        env_cfg, args_cli.mismatch,
+        friction=args_cli.mismatch_friction,
+        compliant_stiffness=args_cli.mismatch_compliant_stiffness,
+        compliant_damping=args_cli.mismatch_compliant_damping,
+        rough_noise=args_cli.mismatch_rough_noise,
+        slope=args_cli.mismatch_slope,
+    )
 
     # configure the ML framework into the global skrl variable
     if args_cli.ml_framework.startswith("jax"):
