@@ -256,6 +256,16 @@ class TrajectoryPlanner:
             states = states + preds.delta_obs
         return torch.stack(actions, dim=2)
 
+    def policy_action(self, obs: torch.Tensor) -> torch.Tensor:
+        """Act with the learned policy pi_phi ALONE -- no MPPI search, no world-model rollout.
+
+        Diagnostic for world-model quality: MPPI exists to beat pi_phi by planning through
+        the model, so if MPPI <= pi_phi the model is wrong enough that searching it hurts.
+        Uses the same model interface and clipping as _rollout_model_policy_actions().
+        """
+        with torch.no_grad():
+            return self._clip_actions(self.model.pi(obs, deterministic=True))
+
     def _prior_baseline_controls(self, obs: torch.Tensor) -> torch.Tensor:
         if self._uses_full_action_prior:
             return self._prior_control_mean(obs)
@@ -1006,6 +1016,17 @@ class LatentMPPIPlanner:
             "planner_predicted_return_margin_min": 0.0,
             "planner_prior_fallback_fraction": 0.0,
         }
+
+    def policy_action(self, obs: torch.Tensor) -> torch.Tensor:
+        """Act with the learned policy pi_phi ALONE -- no MPPI search, no world-model rollout.
+
+        Diagnostic for world-model quality: MPPI exists to beat pi_phi by planning through the
+        model, so MPPI <= pi_phi means the model is wrong enough that searching it hurts.
+        Mirrors this class's own encode->pi idiom (see _rollout_policy_actions).
+        """
+        with torch.no_grad():
+            z = self.model.encode(obs)
+            return self._clip_actions(self.model.pi(z, deterministic=True))
 
     def plan(self, obs: torch.Tensor, eval_mode: bool = False, t0: bool = False) -> torch.Tensor:
         if t0:

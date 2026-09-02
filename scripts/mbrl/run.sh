@@ -153,12 +153,12 @@ case "$ACTION" in
     # encoder input). The tell is REGRESSION not saturation: cmd 0.4 -> 0.374 m/s, 0 falls;
     # cmd 0.5 -> 0.333 m/s, 36 falls. A physical ceiling saturates; it does not go slower.
     # Widening x to 0.5 here is precisely what makes that command in-distribution.
-    X_MIN="${X_MIN:--0.35}"; X_MAX="${X_MAX:-0.2}"
+    X_MIN="${X_MIN:--0.45}"; X_MAX="${X_MAX:-0.65}"   # WIDER than the frozen task [-0.3,0.5]
     # Stage L: lateral is the ONE new variable. y=0.4 fell over in the diagnostic, so 0.35
     # is the honest ceiling. Yaw stays at the PROVEN +-0.8: dropping it to +-0.2 would put the
     # command back under the +-0.2 sensor noise (the O1 failure) and let turning decay.
-    Y_MIN="${Y_MIN:--0.3}"; Y_MAX="${Y_MAX:-0.3}"       # frozen-task lateral range
-    YAW_MIN="${YAW_MIN:--0.8}"; YAW_MAX="${YAW_MAX:-0.8}"  # E|yaw|=0.4 > the 0.18-0.58 involuntary drift
+    Y_MIN="${Y_MIN:--0.4}"; Y_MAX="${Y_MAX:-0.4}"       # wider than frozen task (+-0.3)
+    YAW_MIN="${YAW_MIN:--0.9}"; YAW_MAX="${YAW_MAX:-0.9}"  # E|yaw|=0.4 > the 0.18-0.58 involuntary drift
     # Yaw tracking reward. std MUST be comparable to the CURRENT error, not the target error:
     # the kernel is exp(-err^2/std^2), and yaw error starts at ~0.44 (the robot does not turn).
     #   std 0.2 @ err 0.44 -> reward 0.008, gradient 0.17   (essentially flat / dead)
@@ -178,19 +178,21 @@ case "$ACTION" in
     # 2500 (not 5000): at ~0.37 steps/s a 5000-step interval risks losing ~3.7h to a silent
     # kill (Stage M was OOM/killed once at 16:30 on 2026-08-30). Disk cost only.
     SAVE_INTERVAL="${SAVE_INTERVAL:-2500}"
-    RESUME="${RESUME:-$BW/stageM_omni_334k.pt}"             # Stage M keeper @~334k (omni works; backward+fast broken)
+    # Stage W resumes the VERIFIED Stage M keeper with a FRESH replay: the aborted Stage B
+    # buffer holds only narrow-range x[-0.35,0.2] data, which would bias a wide-range run.
+    RESUME="${RESUME:-$BW/stageM_omni_334k.pt}"
     # 50k new steps (not 30k): Stage M fixes THREE out-of-distribution regions at once
     # (fast-forward 0.5, standing x~0, backward x<0), where Stage T/L each needed ~25-30k for
     # ONE. Uniform sampling over the 0.8-wide x range also gives the top 0.05 band only ~6%
     # of the data, so the 0.5 end is the thinnest-covered part. Checkpoints every 2500 steps
     # mean we can stop early the moment it plateaus (as Stage T was stopped at 301k).
-    TRAIN_STEPS="${TRAIN_STEPS:-354000}"    # resume @~334k + ~20k backward-focused steps
+    TRAIN_STEPS="${TRAIN_STEPS:-364000}"    # resume @~334k + ~30k wide-range steps
     if [[ "$WANDER" == "1" ]]; then
       CMD_ARGS=(--wander --wander_x_min "$X_MIN" --wander_x_max "$X_MAX" \
                 --wander_y_min "$Y_MIN" --wander_y_max "$Y_MAX" \
                 --wander_yaw_min "$YAW_MIN" --wander_yaw_max "$YAW_MAX")
-      WANDB_NAME="${WANDB_NAME:-stageB_backward_s${SEED}}"
-      echo "[run] TRAIN Stage B (backward focus): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
+      WANDB_NAME="${WANDB_NAME:-stageW_wide_s${SEED}}"
+      echo "[run] TRAIN Stage W (wide range, single stage): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
     else
       CMD_ARGS=(--command_x "$CMD_X" --command_y 0.0 --command_yaw 0.0)
       WANDB_NAME="${WANDB_NAME:-curriculum_x$(echo "$CMD_X" | tr . p)_s${SEED}}"

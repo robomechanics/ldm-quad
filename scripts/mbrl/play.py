@@ -225,6 +225,7 @@ parser.add_argument(
     help="Write TensorBoard/CSV mismatch diagnostics from play/eval rollouts.",
 )
 parser.add_argument("--diagnostics_dir", type=str, default=None, help="Optional diagnostics output directory.")
+parser.add_argument("--policy_only", action="store_true", default=False, help="Act with the learned TD-MPC2 policy pi_phi directly, bypassing MPPI planning (world-model diagnostic).")
 parser.add_argument("--diagnostics_interval", type=int, default=10, help="Environment steps between diagnostics rows.")
 parser.add_argument(
     "--online_adapt",
@@ -1114,6 +1115,8 @@ def main() -> None:
                 if action_prior is None:
                     raise RuntimeError("--prior_only requires a prior checkpoint in the MBRL checkpoint or --prior_checkpoint.")
                 actions = action_prior(obs)
+            elif args_cli.policy_only:
+                actions = planner.policy_action(obs)
             else:
                 actions = planner.plan(obs, eval_mode=True, t0=steps == 0)
             if args_cli.showcase:
