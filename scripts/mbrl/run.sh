@@ -165,7 +165,13 @@ case "$ACTION" in
     #   std 0.5 @ err 0.44 -> reward 0.461, gradient 1.62   (~9x more learning signal)
     # Tighten std only AFTER turning exists, the same way the linear term was sharpened
     # to 0.11 only after forward walking worked.
-    YAW_W="${YAW_W:-4.0}"; YAW_STD="${YAW_STD:-0.5}"
+    # Stage R (reward rebalance): yaw std 0.5 was set when yaw error was 0.44; it is now
+    # 0.275, so the kernel is far too wide and the yaw gradient has gone slack. At the
+    # measured errors the reward pulls linear:yaw = 4.4:1, which is WHY yaw loses whenever
+    # the two compete (Stage W: x -> 108%, yaw -> 54%). std 0.28 matches current yaw error
+    # and weight 8.0 matches the linear term -> gradient ratio 1.3:1. Same "set std to the
+    # CURRENT error, not the target" rule that unblocked turning in Stage T.
+    YAW_W="${YAW_W:-8.0}"; YAW_STD="${YAW_STD:-0.28}"
     # Linear std MUST be loosened for turning stages. With std 0.11 (tuned when x was the
     # ONLY error) the reward math is: ignore-yaw = 7.30 vs turn-costing-0.1m/s = 7.26, i.e.
     # turning earns nothing and any bigger speed cost is a net LOSS. At std 0.20 it becomes
@@ -173,26 +179,32 @@ case "$ACTION" in
     TRACK_STD="${TRACK_STD:-0.20}"
     # best-checkpoint metric: default yaw weight 0.25 would let a great-x/no-yaw policy win
     # again; 0.5 matches the new reward ratio (yaw 4.0 / linear 8.0).
-    EVAL_YAW_W="${EVAL_YAW_W:-0.5}"
+    EVAL_YAW_W="${EVAL_YAW_W:-1.0}"   # tracks the reward ratio (now yaw 8.0 / linear 8.0)
     BC_COEF="${BC_COEF:-0.1}"                            # TD-M(PC)^2 BC term (0 = vanilla)
     # 2500 (not 5000): at ~0.37 steps/s a 5000-step interval risks losing ~3.7h to a silent
     # kill (Stage M was OOM/killed once at 16:30 on 2026-08-30). Disk cost only.
-    SAVE_INTERVAL="${SAVE_INTERVAL:-2500}"
+    SAVE_INTERVAL="${SAVE_INTERVAL:-2000}"
+    # Replay reuse. A REWARD change invalidates the buffer (rewards are stored at collection
+    # time and nothing relabels them) -> REPLAY_RESUME=0. A COMMAND-RANGE change does NOT:
+    # old transitions stay correctly labelled, they just do not cover the new region yet, so
+    # ADR rounds reuse the buffer and skip the ~1h cold refill. Default 0 (safe).
+    REPLAY_RESUME="${REPLAY_RESUME:-0}"
+    if [[ "$REPLAY_RESUME" == "1" ]]; then REPLAY_FLAG=""; else REPLAY_FLAG="--no-auto_resume_replay"; fi
     # Stage W resumes the VERIFIED Stage M keeper with a FRESH replay: the aborted Stage B
     # buffer holds only narrow-range x[-0.35,0.2] data, which would bias a wide-range run.
-    RESUME="${RESUME:-$BW/stageM_omni_334k.pt}"
+    RESUME="${RESUME:-$BW/stageW_wide_364k.pt}"   # Stage W final: x 108% ok, yaw 54% FALLS
     # 50k new steps (not 30k): Stage M fixes THREE out-of-distribution regions at once
     # (fast-forward 0.5, standing x~0, backward x<0), where Stage T/L each needed ~25-30k for
     # ONE. Uniform sampling over the 0.8-wide x range also gives the top 0.05 band only ~6%
     # of the data, so the 0.5 end is the thinnest-covered part. Checkpoints every 2500 steps
     # mean we can stop early the moment it plateaus (as Stage T was stopped at 301k).
-    TRAIN_STEPS="${TRAIN_STEPS:-364000}"    # resume @~334k + ~30k wide-range steps
+    TRAIN_STEPS="${TRAIN_STEPS:-374000}"    # resume @364k + ~10k reward-rebalance steps
     if [[ "$WANDER" == "1" ]]; then
       CMD_ARGS=(--wander --wander_x_min "$X_MIN" --wander_x_max "$X_MAX" \
                 --wander_y_min "$Y_MIN" --wander_y_max "$Y_MAX" \
                 --wander_yaw_min "$YAW_MIN" --wander_yaw_max "$YAW_MAX")
-      WANDB_NAME="${WANDB_NAME:-stageW_wide_s${SEED}}"
-      echo "[run] TRAIN Stage W (wide range, single stage): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
+      WANDB_NAME="${WANDB_NAME:-stageR_rewardbalance_s${SEED}}"
+      echo "[run] TRAIN Stage R (yaw reward rebalance): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
     else
       CMD_ARGS=(--command_x "$CMD_X" --command_y 0.0 --command_yaw 0.0)
       WANDB_NAME="${WANDB_NAME:-curriculum_x$(echo "$CMD_X" | tr . p)_s${SEED}}"
@@ -217,7 +229,8 @@ case "$ACTION" in
       --eval_tracking_yaw_weight "$EVAL_YAW_W" \
       --seed_steps 2000 --seed_action_mode smooth_zero --seed_action_noise_std 0.08 --seed_action_smoothing 0.92 \
       --seed_pretrain_updates 5000 --seed_policy_noise 0.02 \
-      --save_interval "$SAVE_INTERVAL" --max_checkpoints 5 --save_replay \
+      --save_interval "$SAVE_INTERVAL" --max_checkpoints 50 --save_replay \
+      $REPLAY_FLAG \
       --save_best_metric stable_tracking --eval_interval 50 \
       --wandb --wandb_project "$PROJECT" \
       --resume_checkpoint "$RESUME" \
