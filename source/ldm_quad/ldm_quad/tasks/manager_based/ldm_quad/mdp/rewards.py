@@ -74,3 +74,36 @@ def feet_swing_gait(
     command = env.command_manager.get_command(command_name)
     moving = (torch.linalg.norm(command[:, :2], dim=1) > float(command_threshold)).float()
     return spread * moving
+
+
+def track_lin_vel_x_exp(
+    env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Track ONLY the forward/backward velocity command, with its own exponential kernel.
+
+    Split out from IsaacLab's ``track_lin_vel_xy_exp``, which exponentiates the SUMMED squared
+    xy error: ``exp(-(ex^2 + ey^2)/s^2)`` factorises into ``exp(-ex^2/s^2) * exp(-ey^2/s^2)``,
+    so each axis MULTIPLICATIVELY gates the other's gradient. Measured at std=0.20: an x error
+    of 0.30 leaves only 10.5% of the y gradient alive. Worse, it is super-additive -- from both
+    axes at 0.30 error, fixing x pays +0.754 and then fixing y pays +7.157, i.e. the reward pays
+    ~9x more for COMPLETING a specialisation than for starting one. That is a direct incentive
+    to trade one axis away for the other, and it matches the observed Stage M behaviour
+    (backward 38%->49% while lateral collapsed 98%->63%).
+
+    Two additive per-axis terms at half weight each give the same total at zero error and pay
+    the same for either axis regardless of the other, removing the trading incentive.
+    NOTE: the additive form is SOFTER at moderate error (at ex=ey=0.10, joint=4.85 vs
+    additive=6.23), so step reward rises on the switch for structural reasons, not skill.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    err = torch.square(env.command_manager.get_command(command_name)[:, 0] - asset.data.root_lin_vel_b[:, 0])
+    return torch.exp(-err / std**2)
+
+
+def track_lin_vel_y_exp(
+    env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Track ONLY the lateral velocity command. See :func:`track_lin_vel_x_exp` for why split."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    err = torch.square(env.command_manager.get_command(command_name)[:, 1] - asset.data.root_lin_vel_b[:, 1])
+    return torch.exp(-err / std**2)

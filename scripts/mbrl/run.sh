@@ -176,7 +176,14 @@ case "$ACTION" in
     # ONLY error) the reward math is: ignore-yaw = 7.30 vs turn-costing-0.1m/s = 7.26, i.e.
     # turning earns nothing and any bigger speed cost is a net LOSS. At std 0.20 it becomes
     # 7.83 vs 9.99 -> turning clearly pays. Revisit when freezing the final task.
+    # KEEP 0.20 this run. Measured end-of-Stage-R errors were x 0.105 / y 0.094, so the
+    # match-current-error rule would say ~0.10 -- but the loosening to 0.20 is what made
+    # turning pay at all (at std 0.11: ignore-yaw 7.30 vs turn-costing-0.1m/s 7.26). Change
+    # ONLY the kernel STRUCTURE this run; tighten later once the split is proven.
     TRACK_STD="${TRACK_STD:-0.20}"
+    # Stage S: split the joint xy kernel into additive per-axis terms (see train.py flag).
+    SPLIT_LINEAR="${SPLIT_LINEAR:-1}"
+    if [[ "$SPLIT_LINEAR" == "1" ]]; then SPLIT_FLAG="--split_linear_reward"; else SPLIT_FLAG=""; fi
     # best-checkpoint metric: default yaw weight 0.25 would let a great-x/no-yaw policy win
     # again; 0.5 matches the new reward ratio (yaw 4.0 / linear 8.0).
     EVAL_YAW_W="${EVAL_YAW_W:-1.0}"   # tracks the reward ratio (now yaw 8.0 / linear 8.0)
@@ -192,19 +199,21 @@ case "$ACTION" in
     if [[ "$REPLAY_RESUME" == "1" ]]; then REPLAY_FLAG=""; else REPLAY_FLAG="--no-auto_resume_replay"; fi
     # Stage W resumes the VERIFIED Stage M keeper with a FRESH replay: the aborted Stage B
     # buffer holds only narrow-range x[-0.35,0.2] data, which would bias a wide-range run.
-    RESUME="${RESUME:-$BW/stageW_wide_364k.pt}"   # Stage W final: x 108% ok, yaw 54% FALLS
+    # Stage S resumes Stage R @370k -- the only late Stage R checkpoint clean on all four
+    # sweep conditions (73.4/50.6/65.5/74.7, no falls); 372k and 374k both fall on backward.
+    RESUME="${RESUME:-$BW/stageR_yawfix_370k.pt}"
     # 50k new steps (not 30k): Stage M fixes THREE out-of-distribution regions at once
     # (fast-forward 0.5, standing x~0, backward x<0), where Stage T/L each needed ~25-30k for
     # ONE. Uniform sampling over the 0.8-wide x range also gives the top 0.05 band only ~6%
     # of the data, so the 0.5 end is the thinnest-covered part. Checkpoints every 2500 steps
     # mean we can stop early the moment it plateaus (as Stage T was stopped at 301k).
-    TRAIN_STEPS="${TRAIN_STEPS:-374000}"    # resume @364k + ~10k reward-rebalance steps
+    TRAIN_STEPS="${TRAIN_STEPS:-390000}"    # resume @370k + ~20k steps (split needs time to converge)
     if [[ "$WANDER" == "1" ]]; then
       CMD_ARGS=(--wander --wander_x_min "$X_MIN" --wander_x_max "$X_MAX" \
                 --wander_y_min "$Y_MIN" --wander_y_max "$Y_MAX" \
                 --wander_yaw_min "$YAW_MIN" --wander_yaw_max "$YAW_MAX")
-      WANDB_NAME="${WANDB_NAME:-stageR_rewardbalance_s${SEED}}"
-      echo "[run] TRAIN Stage R (yaw reward rebalance): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
+      WANDB_NAME="${WANDB_NAME:-stageS_splitlinear_s${SEED}}"
+      echo "[run] TRAIN Stage S (split linear reward, additive per-axis): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
     else
       CMD_ARGS=(--command_x "$CMD_X" --command_y 0.0 --command_yaw 0.0)
       WANDB_NAME="${WANDB_NAME:-curriculum_x$(echo "$CMD_X" | tr . p)_s${SEED}}"
@@ -225,7 +234,7 @@ case "$ACTION" in
       --q_dropout 0.1 --entropy_coef 0.0003 \
       --tdmpc2_bc_coef "$BC_COEF" \
       --reward_yaw_weight "$YAW_W" --reward_yaw_std "$YAW_STD" \
-      --reward_track_std "$TRACK_STD" \
+      --reward_track_std "$TRACK_STD" $SPLIT_FLAG \
       --eval_tracking_yaw_weight "$EVAL_YAW_W" \
       --seed_steps 2000 --seed_action_mode smooth_zero --seed_action_noise_std 0.08 --seed_action_smoothing 0.92 \
       --seed_pretrain_updates 5000 --seed_policy_noise 0.02 \

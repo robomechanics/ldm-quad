@@ -440,6 +440,16 @@ parser.add_argument("--reward_track_std", type=float, default=None, help="Overri
 parser.add_argument("--reward_yaw_weight", type=float, default=None, help="Override track_ang_vel_z_exp reward weight (yaw/turn-tracking strength). Stock 0.5 is far weaker than the tuned linear term (8.0), so yaw is effectively untracked.")
 parser.add_argument("--reward_yaw_std", type=float, default=None, help="Override track_ang_vel_z_exp reward std (lower = sharper yaw tracking).")
 parser.add_argument("--reward_alive_weight", type=float, default=None, help="Override the alive reward weight.")
+parser.add_argument(
+    "--split_linear_reward",
+    action="store_true",
+    default=False,
+    help="Replace IsaacLab's joint track_lin_vel_xy_exp with two ADDITIVE per-axis terms "
+         "(x and y, half weight each). The joint kernel exp(-(ex^2+ey^2)/s^2) factorises, so "
+         "each axis multiplicatively gates the other's gradient and the reward pays ~9x more "
+         "for completing a specialisation than for starting one -- a direct axis-trading "
+         "incentive. Same total weight at zero error; softer at moderate error.",
+)
 parser.add_argument("--action_scale", type=float, default=None, help="Override the joint-position action scale (env_cfg.actions.joint_pos.scale). Higher = larger joint motions per step = enables faster gaits.")
 parser.add_argument("--command_y", type=float, default=None, help="Fixed lateral velocity command in m/s.")
 parser.add_argument("--command_yaw", type=float, default=None, help="Fixed yaw velocity command in rad/s.")
@@ -595,10 +605,25 @@ def apply_reward_overrides(env_cfg: object) -> None:
     if rewards is None:
         return
     applied = {}
-    if args_cli.reward_track_weight is not None:
+    if args_cli.split_linear_reward:
+        from isaaclab.managers import RewardTermCfg as _RewTerm
+        import ldm_quad.tasks.manager_based.ldm_quad.mdp as _ldm_mdp
+        joint = rewards.track_lin_vel_xy_exp
+        w = args_cli.reward_track_weight if args_cli.reward_track_weight is not None else joint.weight
+        std = args_cli.reward_track_std if args_cli.reward_track_std is not None else joint.params["std"]
+        cmd = joint.params.get("command_name", "base_velocity")
+        rewards.track_lin_vel_x_exp = _RewTerm(
+            func=_ldm_mdp.track_lin_vel_x_exp, weight=w / 2.0, params={"std": std, "command_name": cmd}
+        )
+        rewards.track_lin_vel_y_exp = _RewTerm(
+            func=_ldm_mdp.track_lin_vel_y_exp, weight=w / 2.0, params={"std": std, "command_name": cmd}
+        )
+        rewards.track_lin_vel_xy_exp = None
+        applied["split_linear"] = f"x/y additive @ w={w/2.0} std={std}"
+    if args_cli.reward_track_weight is not None and not args_cli.split_linear_reward:
         rewards.track_lin_vel_xy_exp.weight = args_cli.reward_track_weight
         applied["track_weight"] = args_cli.reward_track_weight
-    if args_cli.reward_track_std is not None:
+    if args_cli.reward_track_std is not None and not args_cli.split_linear_reward:
         rewards.track_lin_vel_xy_exp.params["std"] = args_cli.reward_track_std
         applied["track_std"] = args_cli.reward_track_std
     if args_cli.reward_yaw_weight is not None:
