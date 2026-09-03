@@ -612,14 +612,21 @@ def apply_reward_overrides(env_cfg: object) -> None:
         w = args_cli.reward_track_weight if args_cli.reward_track_weight is not None else joint.weight
         std = args_cli.reward_track_std if args_cli.reward_track_std is not None else joint.params["std"]
         cmd = joint.params.get("command_name", "base_velocity")
+        # FULL weight on each axis, NOT w/2. Halving preserves the reward VALUE at zero error
+        # but HALVES each axis's GRADIENT when the other axis is already tracked, because the
+        # joint kernel's exp(-ey^2/s^2) factor is ~1 there. Measured at x err 0.15 / y err 0.05:
+        # joint w=8.0 gives |dR/dex|=32.1; split w=4.0 gives 17.1; split w=8.0 gives 34.2.
+        # Stage S first attempt used w/2 and yaw kept its full 8.0, flipping linear:yaw from
+        # 1.65 to 0.88 -- all three linear conditions collapsed within 4k steps while yaw held
+        # at 83% (logs/mbrl/history/stageS_split_w4p0_FAILED_yaw_dominated).
         rewards.track_lin_vel_x_exp = _RewTerm(
-            func=_ldm_mdp.track_lin_vel_x_exp, weight=w / 2.0, params={"std": std, "command_name": cmd}
+            func=_ldm_mdp.track_lin_vel_x_exp, weight=w, params={"std": std, "command_name": cmd}
         )
         rewards.track_lin_vel_y_exp = _RewTerm(
-            func=_ldm_mdp.track_lin_vel_y_exp, weight=w / 2.0, params={"std": std, "command_name": cmd}
+            func=_ldm_mdp.track_lin_vel_y_exp, weight=w, params={"std": std, "command_name": cmd}
         )
         rewards.track_lin_vel_xy_exp = None
-        applied["split_linear"] = f"x/y additive @ w={w/2.0} std={std}"
+        applied["split_linear"] = f"x/y additive @ w={w} each (per-axis gradient preserved) std={std}"
     if args_cli.reward_track_weight is not None and not args_cli.split_linear_reward:
         rewards.track_lin_vel_xy_exp.weight = args_cli.reward_track_weight
         applied["track_weight"] = args_cli.reward_track_weight

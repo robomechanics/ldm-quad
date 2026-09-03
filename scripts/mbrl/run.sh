@@ -207,7 +207,7 @@ case "$ACTION" in
     # ONE. Uniform sampling over the 0.8-wide x range also gives the top 0.05 band only ~6%
     # of the data, so the 0.5 end is the thinnest-covered part. Checkpoints every 2500 steps
     # mean we can stop early the moment it plateaus (as Stage T was stopped at 301k).
-    TRAIN_STEPS="${TRAIN_STEPS:-390000}"    # resume @370k + ~20k steps (split needs time to converge)
+    TRAIN_STEPS="${TRAIN_STEPS:-390000}"    # resume @370k + ~20k steps (per-axis w=8.0, attempt 2)
     if [[ "$WANDER" == "1" ]]; then
       CMD_ARGS=(--wander --wander_x_min "$X_MIN" --wander_x_max "$X_MAX" \
                 --wander_y_min "$Y_MIN" --wander_y_max "$Y_MAX" \
