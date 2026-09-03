@@ -92,6 +92,35 @@ def sweep_one(ckpt: str, out_dir: str, action_scale: float, episodes: int, max_s
     return rows
 
 
+def init_wandb(run_dir: str, project: str, name: str | None):
+    """Separate run in the same project, x-axis pinned to env_steps.
+
+    Deliberately NOT resuming the training run: two live writers to one wandb run is
+    unreliable, and train.py already syncs tensorboard into it (which hijacks the implicit
+    step -- hence its "Step cannot be set when using tensorboard syncing" warning). A sibling
+    run with an explicit step_metric overlays cleanly on the same x-axis in the UI.
+    """
+    try:
+        import wandb
+    except ImportError:
+        print("[ckpt-sweep] wandb not installed; continuing without it", flush=True)
+        return None
+    try:
+        run = wandb.init(
+            project=project,
+            name=name or (os.path.basename(os.path.normpath(run_dir)) + "_fixedeval"),
+            job_type="fixed_command_eval",
+            reinit=True,
+        )
+        wandb.define_metric("env_steps")
+        wandb.define_metric("FixedEval/*", step_metric="env_steps")
+        print(f"[ckpt-sweep] wandb: {run.url}", flush=True)
+        return run
+    except Exception as exc:
+        print(f"[ckpt-sweep] wandb init failed ({exc}); continuing without it", flush=True)
+        return None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run_dir", required=True, help="Training run directory (contains checkpoints/).")
@@ -100,12 +129,17 @@ def main() -> None:
     ap.add_argument("--max_steps", type=int, default=2000)
     ap.add_argument("--poll_seconds", type=int, default=300)
     ap.add_argument("--once", action="store_true", help="Sweep everything present, then exit.")
+    ap.add_argument("--wandb", action="store_true", help="Also log per-condition results to Weights & Biases.")
+    ap.add_argument("--wandb_project", default="ldm-quad-mbrl")
+    ap.add_argument("--wandb_name", default=None, help="Defaults to <run_dir basename>_fixedeval.")
     a = ap.parse_args()
 
     ck_dir = os.path.join(a.run_dir, "checkpoints")
     out_dir = os.path.join(a.run_dir, "checkpoint_sweep")
     csv_path = os.path.join(a.run_dir, "checkpoint_sweep.csv")
     os.makedirs(out_dir, exist_ok=True)
+
+    wb = init_wandb(a.run_dir, a.wandb_project, a.wandb_name) if a.wandb else None
 
     seen: set[str] = set()
     if os.path.exists(csv_path):
@@ -130,6 +164,18 @@ def main() -> None:
                 print("[ckpt-sweep] " + "  ".join(
                     f"{r['condition']}={r['pct_of_cmd']}%/{'FALL' if r['falls'] == 'YES' else 'ok'}" for r in rows
                 ), flush=True)
+                if wb is not None:
+                    payload = {"env_steps": rows[0]["env_steps"]}
+                    for r in rows:
+                        c = r["condition"]
+                        payload[f"FixedEval/{c}_pct"] = float(r["pct_of_cmd"]) if r["pct_of_cmd"] else 0.0
+                        payload[f"FixedEval/{c}_len"] = float(r["mean_length"])
+                        payload[f"FixedEval/{c}_falls"] = 1.0 if r["falls"] == "YES" else 0.0
+                    # worst-axis summary: the metric save_best_metric should have been using
+                    pcts = [float(r["pct_of_cmd"]) for r in rows if r["pct_of_cmd"]]
+                    payload["FixedEval/worst_axis_pct"] = min(pcts) if pcts else 0.0
+                    payload["FixedEval/n_falls"] = sum(1 for r in rows if r["falls"] == "YES")
+                    wb.log(payload)
             seen.add(f)
         if a.once:
             break
