@@ -182,7 +182,15 @@ case "$ACTION" in
     # ONLY the kernel STRUCTURE this run; tighten later once the split is proven.
     TRACK_STD="${TRACK_STD:-0.20}"
     # Stage S: split the joint xy kernel into additive per-axis terms (see train.py flag).
-    SPLIT_LINEAR="${SPLIT_LINEAR:-1}"
+    # DISPROVEN 2026-09-04 -- default OFF. Splitting the joint xy kernel into additive
+    # per-axis terms was tried at w=4.0 each (yaw then outweighed each axis 2:1, all linear
+    # conditions collapsed) and at w=8.0 each (gradient ratio restored, forward still fell
+    # 73.4%->25.8% with falls at every checkpoint). At matched age the JOINT kernel beat both:
+    # joint 73.4/50.6/65.5/74.7 with 0 falls vs split-8.0 25.8/36.9/42.5/86.8 with falls.
+    # Reason the theory was backwards: the multiplicative kernel makes ABANDONING an axis
+    # catastrophic (-98% of linear reward vs -49% additive), which is the pressure keeping
+    # both axes alive. See logs/mbrl/history/stageS*_{FAILED,DISPROVEN}/.
+    SPLIT_LINEAR="${SPLIT_LINEAR:-0}"
     if [[ "$SPLIT_LINEAR" == "1" ]]; then SPLIT_FLAG="--split_linear_reward"; else SPLIT_FLAG=""; fi
     # best-checkpoint metric: default yaw weight 0.25 would let a great-x/no-yaw policy win
     # again; 0.5 matches the new reward ratio (yaw 4.0 / linear 8.0).
@@ -195,25 +203,30 @@ case "$ACTION" in
     # time and nothing relabels them) -> REPLAY_RESUME=0. A COMMAND-RANGE change does NOT:
     # old transitions stay correctly labelled, they just do not cover the new region yet, so
     # ADR rounds reuse the buffer and skip the ~1h cold refill. Default 0 (safe).
-    REPLAY_RESUME="${REPLAY_RESUME:-0}"
+    REPLAY_RESUME="${REPLAY_RESUME:-1}"   # Stage T2: reward UNCHANGED, so the buffer is valid
     if [[ "$REPLAY_RESUME" == "1" ]]; then REPLAY_FLAG=""; else REPLAY_FLAG="--no-auto_resume_replay"; fi
     # Stage W resumes the VERIFIED Stage M keeper with a FRESH replay: the aborted Stage B
     # buffer holds only narrow-range x[-0.35,0.2] data, which would bias a wide-range run.
     # Stage S resumes Stage R @370k -- the only late Stage R checkpoint clean on all four
     # sweep conditions (73.4/50.6/65.5/74.7, no falls); 372k and 374k both fall on backward.
-    RESUME="${RESUME:-$BW/stageR_yawfix_370k.pt}"
+    # Stage T2 = WARM-BUFFER CONTROL. Every run since Stage M has been cold-start limited
+    # (W fresh/30k, R fresh/10k, S1/S2 fresh/~6k) and Stage M -- the only warm long run --
+    # produced the best artifact of the project. "It just needs warm data and more steps" has
+    # never been tested. Resume Stage R's 374k model WITH ITS OWN 560MB replay: same reward
+    # (yaw 8.0/0.28, joint linear 8.0), same box, nothing else changed. One variable: data.
+    RESUME="${RESUME:-$BW/stageR_yawfix_374k.pt}"
     # 50k new steps (not 30k): Stage M fixes THREE out-of-distribution regions at once
     # (fast-forward 0.5, standing x~0, backward x<0), where Stage T/L each needed ~25-30k for
     # ONE. Uniform sampling over the 0.8-wide x range also gives the top 0.05 band only ~6%
     # of the data, so the 0.5 end is the thinnest-covered part. Checkpoints every 2500 steps
     # mean we can stop early the moment it plateaus (as Stage T was stopped at 301k).
-    TRAIN_STEPS="${TRAIN_STEPS:-390000}"    # resume @370k + ~20k steps (per-axis w=8.0, attempt 2)
+    TRAIN_STEPS="${TRAIN_STEPS:-404000}"    # resume @374k + 30k warm steps
     if [[ "$WANDER" == "1" ]]; then
       CMD_ARGS=(--wander --wander_x_min "$X_MIN" --wander_x_max "$X_MAX" \
                 --wander_y_min "$Y_MIN" --wander_y_max "$Y_MAX" \
                 --wander_yaw_min "$YAW_MIN" --wander_yaw_max "$YAW_MAX")
-      WANDB_NAME="${WANDB_NAME:-stageS_splitlinear_s${SEED}}"
-      echo "[run] TRAIN Stage S (split linear reward, additive per-axis): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
+      WANDB_NAME="${WANDB_NAME:-stageT2_warmbuffer_s${SEED}}"
+      echo "[run] TRAIN Stage T2 (WARM buffer control): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
     else
       CMD_ARGS=(--command_x "$CMD_X" --command_y 0.0 --command_yaw 0.0)
       WANDB_NAME="${WANDB_NAME:-curriculum_x$(echo "$CMD_X" | tr . p)_s${SEED}}"
