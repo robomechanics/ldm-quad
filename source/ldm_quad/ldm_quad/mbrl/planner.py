@@ -35,6 +35,12 @@ class TrajectoryPlanner:
         prior_control_mode: str = "residual",
         action_bounds_finite: bool = True,
         planner_velocity_objective_weight: float = 0.0,
+        planner_velocity_objective_form: str = "quadratic",
+        planner_velocity_objective_lin_weight: float = 8.0,
+        planner_velocity_objective_lin_std: float = 0.20,
+        planner_velocity_objective_yaw_weight: float = 8.0,
+        planner_velocity_objective_yaw_std: float = 0.28,
+        planner_velocity_objective_yaw_deadband: float = 0.0,
         planner_velocity_target_x: float = 0.0,
         planner_velocity_target_y: float = 0.0,
         planner_velocity_target_yaw: float = 0.0,
@@ -68,6 +74,12 @@ class TrajectoryPlanner:
         self.prior_control_mode = prior_control_mode
         self.action_bounds_finite = action_bounds_finite
         self.planner_velocity_objective_weight = planner_velocity_objective_weight
+        self.planner_velocity_objective_form = planner_velocity_objective_form
+        self.planner_velocity_objective_lin_weight = planner_velocity_objective_lin_weight
+        self.planner_velocity_objective_lin_std = planner_velocity_objective_lin_std
+        self.planner_velocity_objective_yaw_weight = planner_velocity_objective_yaw_weight
+        self.planner_velocity_objective_yaw_std = planner_velocity_objective_yaw_std
+        self.planner_velocity_objective_yaw_deadband = planner_velocity_objective_yaw_deadband
         self.planner_velocity_target_x = planner_velocity_target_x
         self.planner_velocity_target_y = planner_velocity_target_y
         self.planner_velocity_target_yaw = planner_velocity_target_yaw
@@ -527,6 +539,12 @@ class CEMPlanner(TrajectoryPlanner):
         prior_control_mode: str = "residual",
         action_bounds_finite: bool = True,
         planner_velocity_objective_weight: float = 0.0,
+        planner_velocity_objective_form: str = "quadratic",
+        planner_velocity_objective_lin_weight: float = 8.0,
+        planner_velocity_objective_lin_std: float = 0.20,
+        planner_velocity_objective_yaw_weight: float = 8.0,
+        planner_velocity_objective_yaw_std: float = 0.28,
+        planner_velocity_objective_yaw_deadband: float = 0.0,
         planner_velocity_target_x: float = 0.0,
         planner_velocity_target_y: float = 0.0,
         planner_velocity_target_yaw: float = 0.0,
@@ -628,6 +646,12 @@ class MPPIPlanner(TrajectoryPlanner):
         prior_control_mode: str = "residual",
         action_bounds_finite: bool = True,
         planner_velocity_objective_weight: float = 0.0,
+        planner_velocity_objective_form: str = "quadratic",
+        planner_velocity_objective_lin_weight: float = 8.0,
+        planner_velocity_objective_lin_std: float = 0.20,
+        planner_velocity_objective_yaw_weight: float = 8.0,
+        planner_velocity_objective_yaw_std: float = 0.28,
+        planner_velocity_objective_yaw_deadband: float = 0.0,
         planner_velocity_target_x: float = 0.0,
         planner_velocity_target_y: float = 0.0,
         planner_velocity_target_yaw: float = 0.0,
@@ -737,6 +761,12 @@ class LatentMPPIPlanner:
         hard_continue_model: bool = False,
         continue_threshold: float = 0.5,
         planner_velocity_objective_weight: float = 0.0,
+        planner_velocity_objective_form: str = "quadratic",
+        planner_velocity_objective_lin_weight: float = 8.0,
+        planner_velocity_objective_lin_std: float = 0.20,
+        planner_velocity_objective_yaw_weight: float = 8.0,
+        planner_velocity_objective_yaw_std: float = 0.28,
+        planner_velocity_objective_yaw_deadband: float = 0.0,
         planner_velocity_target_x: float = 0.0,
         planner_velocity_target_y: float = 0.0,
         planner_velocity_target_yaw: float = 0.0,
@@ -769,6 +799,12 @@ class LatentMPPIPlanner:
         self.hard_continue_model = hard_continue_model
         self.continue_threshold = continue_threshold
         self.planner_velocity_objective_weight = planner_velocity_objective_weight
+        self.planner_velocity_objective_form = planner_velocity_objective_form
+        self.planner_velocity_objective_lin_weight = planner_velocity_objective_lin_weight
+        self.planner_velocity_objective_lin_std = planner_velocity_objective_lin_std
+        self.planner_velocity_objective_yaw_weight = planner_velocity_objective_yaw_weight
+        self.planner_velocity_objective_yaw_std = planner_velocity_objective_yaw_std
+        self.planner_velocity_objective_yaw_deadband = planner_velocity_objective_yaw_deadband
         self.planner_velocity_target_x = planner_velocity_target_x
         self.planner_velocity_target_y = planner_velocity_target_y
         self.planner_velocity_target_yaw = planner_velocity_target_yaw
@@ -950,6 +986,35 @@ class LatentMPPIPlanner:
                 device=z.device,
                 dtype=z.dtype,
             ).view(1, 3).expand(batch_size * candidates, -1)
+        if getattr(self, "planner_velocity_objective_form", "quadratic") == "exp":
+            # BOUNDED form. The quadratic below is UNBOUNDED, so MPPI hunts actions that
+            # maximise predicted speed, leaves the buffer distribution, and the physical head
+            # predicts speed without predicting the fall -- model exploitation. Measured
+            # 2026-09-04: lateral survived 4/4 at W=0 and 0/4 at every W>0, falling in 60-135
+            # steps, while pct_of_cmd still read 68-83% (it averages over whatever steps exist).
+            # Mirroring the ENV's own exponential kernels caps the term at (w_lin + w_yaw)/step
+            # so it cannot outweigh the terminating/continue heads however optimistic the
+            # physical head becomes. Deliberately double-counts tracking with the reward head;
+            # the head's tracking component is the noisy part (RMSE 0.73 vs 0.084).
+            lin_err = (predicted[:, :2] - target[:, :2]).square().sum(dim=-1)
+            # DEADBAND: strafing on this robot carries yaw wobble (|wz| 0.12-0.42 measured
+            # while strafing, vs |vy| 0.00-0.04 while turning -- the tax is one-directional).
+            # The bare kernel forfeits 5.5 of 8.0 per step at a 0.3 rad/s wobble (std 0.28),
+            # so scoring yaw hard makes strafing expensive and turning cheap. A deadband
+            # forgives wobble below d while leaving real turning (0.8 rad/s) fully scored:
+            # at d=0.2 a 0.3 wobble costs ~1.0/step instead of 5.5.
+            yaw_raw = (predicted[:, 2] - target[:, 2]).abs()
+            dead = float(getattr(self, "planner_velocity_objective_yaw_deadband", 0.0))
+            if dead > 0.0:
+                yaw_raw = (yaw_raw - dead).clamp_min(0.0)
+            yaw_err = yaw_raw.square()
+            lin = float(self.planner_velocity_objective_lin_weight) * torch.exp(
+                -lin_err / float(self.planner_velocity_objective_lin_std) ** 2
+            )
+            yaw = float(self.planner_velocity_objective_yaw_weight) * torch.exp(
+                -yaw_err / float(self.planner_velocity_objective_yaw_std) ** 2
+            )
+            return float(self.planner_velocity_objective_weight) * (lin + yaw)
         error = (predicted[:, :3] - target).square().sum(dim=-1)
         return -float(self.planner_velocity_objective_weight) * error
 
@@ -1122,6 +1187,12 @@ def build_planner(
     hard_continue_model: bool = False,
     continue_threshold: float = 0.5,
     planner_velocity_objective_weight: float = 0.0,
+    planner_velocity_objective_form: str = "quadratic",
+    planner_velocity_objective_lin_weight: float = 8.0,
+    planner_velocity_objective_lin_std: float = 0.20,
+    planner_velocity_objective_yaw_weight: float = 8.0,
+    planner_velocity_objective_yaw_std: float = 0.28,
+    planner_velocity_objective_yaw_deadband: float = 0.0,
     planner_velocity_target_x: float = 0.0,
     planner_velocity_target_y: float = 0.0,
     planner_velocity_target_yaw: float = 0.0,
@@ -1158,6 +1229,12 @@ def build_planner(
             hard_continue_model=hard_continue_model,
             continue_threshold=continue_threshold,
             planner_velocity_objective_weight=planner_velocity_objective_weight,
+            planner_velocity_objective_form=planner_velocity_objective_form,
+            planner_velocity_objective_lin_weight=planner_velocity_objective_lin_weight,
+            planner_velocity_objective_lin_std=planner_velocity_objective_lin_std,
+            planner_velocity_objective_yaw_weight=planner_velocity_objective_yaw_weight,
+            planner_velocity_objective_yaw_std=planner_velocity_objective_yaw_std,
+            planner_velocity_objective_yaw_deadband=planner_velocity_objective_yaw_deadband,
             planner_velocity_target_x=planner_velocity_target_x,
             planner_velocity_target_y=planner_velocity_target_y,
             planner_velocity_target_yaw=planner_velocity_target_yaw,
@@ -1190,6 +1267,12 @@ def build_planner(
             prior_control_mode=prior_control_mode,
             action_bounds_finite=action_bounds_finite,
             planner_velocity_objective_weight=planner_velocity_objective_weight,
+            planner_velocity_objective_form=planner_velocity_objective_form,
+            planner_velocity_objective_lin_weight=planner_velocity_objective_lin_weight,
+            planner_velocity_objective_lin_std=planner_velocity_objective_lin_std,
+            planner_velocity_objective_yaw_weight=planner_velocity_objective_yaw_weight,
+            planner_velocity_objective_yaw_std=planner_velocity_objective_yaw_std,
+            planner_velocity_objective_yaw_deadband=planner_velocity_objective_yaw_deadband,
             planner_velocity_target_x=planner_velocity_target_x,
             planner_velocity_target_y=planner_velocity_target_y,
             planner_velocity_target_yaw=planner_velocity_target_yaw,
@@ -1224,6 +1307,12 @@ def build_planner(
             prior_control_mode=prior_control_mode,
             action_bounds_finite=action_bounds_finite,
             planner_velocity_objective_weight=planner_velocity_objective_weight,
+            planner_velocity_objective_form=planner_velocity_objective_form,
+            planner_velocity_objective_lin_weight=planner_velocity_objective_lin_weight,
+            planner_velocity_objective_lin_std=planner_velocity_objective_lin_std,
+            planner_velocity_objective_yaw_weight=planner_velocity_objective_yaw_weight,
+            planner_velocity_objective_yaw_std=planner_velocity_objective_yaw_std,
+            planner_velocity_objective_yaw_deadband=planner_velocity_objective_yaw_deadband,
             planner_velocity_target_x=planner_velocity_target_x,
             planner_velocity_target_y=planner_velocity_target_y,
             planner_velocity_target_yaw=planner_velocity_target_yaw,

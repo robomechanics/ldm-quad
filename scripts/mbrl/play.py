@@ -200,6 +200,15 @@ parser.add_argument(
 )
 parser.add_argument("--planner_continue_threshold", type=float, default=None, help="Override hard continuation threshold.")
 parser.add_argument("--planner_velocity_objective_weight", type=float, default=None, help="Override planner-only velocity objective weight.")
+parser.add_argument("--planner_velocity_objective_form", type=str, default=None, choices=["quadratic", "exp"],
+                    help="quadratic (default, UNBOUNDED -- exploitable) or exp (bounded, mirrors the env kernels).")
+parser.add_argument("--planner_velocity_objective_lin_weight", type=float, default=8.0)
+parser.add_argument("--planner_velocity_objective_lin_std", type=float, default=0.20)
+parser.add_argument("--planner_velocity_objective_yaw_weight", type=float, default=8.0)
+parser.add_argument("--planner_velocity_objective_yaw_std", type=float, default=0.28)
+parser.add_argument("--planner_velocity_objective_yaw_deadband", type=float, default=0.0,
+                    help="Forgive yaw error below this (rad/s) in the planner objective. Strafing carries "
+                         "yaw wobble; scoring it hard taxes strafing. 0.0 = no change.")
 parser.add_argument("--planner_velocity_target_x", type=float, default=None, help="Override planner-only target body x velocity.")
 parser.add_argument("--planner_velocity_target_y", type=float, default=None, help="Override planner-only target body y velocity.")
 parser.add_argument("--planner_velocity_target_yaw", type=float, default=None, help="Override planner-only target yaw rate.")
@@ -1006,6 +1015,16 @@ def main() -> None:
                 if args_cli.planner_velocity_objective_weight is not None
                 else checkpoint_args.get("planner_velocity_objective_weight", 0.0)
             ),
+            planner_velocity_objective_form=(
+                args_cli.planner_velocity_objective_form
+                if args_cli.planner_velocity_objective_form is not None
+                else checkpoint_args.get("planner_velocity_objective_form", "quadratic")
+            ),
+            planner_velocity_objective_lin_weight=args_cli.planner_velocity_objective_lin_weight,
+            planner_velocity_objective_lin_std=args_cli.planner_velocity_objective_lin_std,
+            planner_velocity_objective_yaw_weight=args_cli.planner_velocity_objective_yaw_weight,
+            planner_velocity_objective_yaw_std=args_cli.planner_velocity_objective_yaw_std,
+            planner_velocity_objective_yaw_deadband=args_cli.planner_velocity_objective_yaw_deadband,
             planner_velocity_target_x=(
                 args_cli.planner_velocity_target_x
                 if args_cli.planner_velocity_target_x is not None
