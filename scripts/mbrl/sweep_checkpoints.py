@@ -37,6 +37,7 @@ CONDITIONS = [
     ("back_xm0p3", -0.3, 0.0, 0.0, 0),
     ("lat_yp0p3", 0.0, 0.3, 0.0, 1),
     ("inplace_yaw", 0.0, 0.0, 0.8, 2),
+    ("combo", 0.3, 0.2, 0.5, 2),
 ]
 VEL_KEYS = ("velocity_x_mean", "velocity_y_mean", "velocity_yaw_mean")
 FIELDS = ["checkpoint", "env_steps", "condition", "commanded", "achieved", "pct_of_cmd", "mean_length", "falls"]
@@ -52,6 +53,9 @@ def sweep_one(ckpt: str, out_dir: str, action_scale: float, episodes: int, max_s
     for name, cx, cy, cw, axis in CONDITIONS:
         d = os.path.join(out_dir, f"{os.path.basename(ckpt)[:-3]}__{name}")
         os.makedirs(d, exist_ok=True)
+        if not os.path.exists(ckpt):
+            print(f"[ckpt-sweep] ABORT: missing checkpoint {ckpt}", flush=True)
+            raise SystemExit(1)
         cmd = [
             PY, "-u", "scripts/mbrl/play.py", "--checkpoint", ckpt,
             "--headless", "--num_envs", "1",

@@ -252,6 +252,17 @@ parser.add_argument(
     default=1.0,
     help="Planner-only velocity objective weight using decoded latent or state velocity features. Disabled when 0.",
 )
+parser.add_argument("--planner_velocity_objective_form", type=str, default="quadratic", choices=["quadratic", "exp"],
+                    help="quadratic (unbounded, exploitable) or exp (bounded, mirrors the env kernels).")
+parser.add_argument("--planner_velocity_objective_lin_weight", type=float, default=8.0)
+parser.add_argument("--planner_velocity_objective_lin_std", type=float, default=0.20)
+parser.add_argument("--planner_velocity_objective_yaw_weight", type=float, default=8.0)
+parser.add_argument("--planner_velocity_objective_yaw_std", type=float, default=0.28)
+parser.add_argument("--planner_velocity_objective_yaw_deadband", type=float, default=0.0,
+                    help="Forgive yaw error below this (rad/s) in the planner objective.")
+parser.add_argument("--planner_velocity_objective_yaw_gate", type=float, default=0.0,
+                    help="Only score yaw when |cmd_yaw| exceeds this; pure-lateral commands then reduce to the "
+                         "unmodified planner by construction (15g: lateral identical to baseline, yaw 79.4->98.3%).")
 parser.add_argument("--planner_velocity_target_x", type=float, default=0.0, help="Planner-only target body x velocity.")
 parser.add_argument("--planner_velocity_target_y", type=float, default=0.0, help="Planner-only target body y velocity.")
 parser.add_argument("--planner_velocity_target_yaw", type=float, default=0.0, help="Planner-only target yaw rate.")
@@ -384,7 +395,8 @@ parser.add_argument(
     "--save_best_metric",
     type=str,
     default="mean_return",
-    choices=["mean_return", "estimated_return", "tracking", "stable_tracking", "eval_return", "eval_tracking"],
+    choices=["mean_return", "estimated_return", "tracking", "stable_tracking", "eval_return", "eval_tracking",
+             "worst_axis"],
     help="Metric used to save checkpoints/model_best.pt.",
 )
 parser.add_argument(
@@ -413,7 +425,8 @@ parser.add_argument(
     "--early_stop_metric",
     type=str,
     default="stable_tracking",
-    choices=["mean_return", "estimated_return", "tracking", "stable_tracking", "eval_return", "eval_tracking"],
+    choices=["mean_return", "estimated_return", "tracking", "stable_tracking", "eval_return", "eval_tracking",
+             "worst_axis"],
     help="Metric used for early-stop plateau detection.",
 )
 parser.add_argument(
@@ -1350,6 +1363,13 @@ def main() -> None:
         hard_continue_model=args_cli.planner_hard_continue_model,
         continue_threshold=args_cli.planner_continue_threshold,
         planner_velocity_objective_weight=args_cli.planner_velocity_objective_weight,
+        planner_velocity_objective_form=args_cli.planner_velocity_objective_form,
+        planner_velocity_objective_lin_weight=args_cli.planner_velocity_objective_lin_weight,
+        planner_velocity_objective_lin_std=args_cli.planner_velocity_objective_lin_std,
+        planner_velocity_objective_yaw_weight=args_cli.planner_velocity_objective_yaw_weight,
+        planner_velocity_objective_yaw_std=args_cli.planner_velocity_objective_yaw_std,
+        planner_velocity_objective_yaw_deadband=args_cli.planner_velocity_objective_yaw_deadband,
+        planner_velocity_objective_yaw_gate=args_cli.planner_velocity_objective_yaw_gate,
         planner_velocity_target_x=args_cli.planner_velocity_target_x,
         planner_velocity_target_y=args_cli.planner_velocity_target_y,
         planner_velocity_target_yaw=args_cli.planner_velocity_target_yaw,
@@ -1435,6 +1455,13 @@ def main() -> None:
             hard_continue_model=args_cli.planner_hard_continue_model,
             continue_threshold=args_cli.planner_continue_threshold,
             planner_velocity_objective_weight=args_cli.planner_velocity_objective_weight,
+            planner_velocity_objective_form=args_cli.planner_velocity_objective_form,
+            planner_velocity_objective_lin_weight=args_cli.planner_velocity_objective_lin_weight,
+            planner_velocity_objective_lin_std=args_cli.planner_velocity_objective_lin_std,
+            planner_velocity_objective_yaw_weight=args_cli.planner_velocity_objective_yaw_weight,
+            planner_velocity_objective_yaw_std=args_cli.planner_velocity_objective_yaw_std,
+            planner_velocity_objective_yaw_deadband=args_cli.planner_velocity_objective_yaw_deadband,
+            planner_velocity_objective_yaw_gate=args_cli.planner_velocity_objective_yaw_gate,
             planner_velocity_target_x=args_cli.planner_velocity_target_x,
             planner_velocity_target_y=args_cli.planner_velocity_target_y,
             planner_velocity_target_yaw=args_cli.planner_velocity_target_yaw,
@@ -1539,7 +1566,7 @@ def main() -> None:
     planner_was_active = False
     seed_pretrain_done = args_cli.resume_checkpoint is not None
     latest_control_mode = "init"
-    if args_cli.save_best_metric in {"tracking", "stable_tracking", "eval_tracking"}:
+    if args_cli.save_best_metric in {"tracking", "stable_tracking", "eval_tracking", "worst_axis"}:
         best_checkpoint_metric = float("-inf")
     else:
         best_checkpoint_metric = float(train_state.best_mean_return)
@@ -1675,6 +1702,18 @@ def main() -> None:
                 step_planner_mean = planner.last_action_mean.detach()
                 step_planner_std = planner.last_action_std.detach()
 
+            # #9 groundwork: record the CLEAN base velocity straight from the sim, alongside
+            # the noisy observation. Read AFTER env.step so it matches next_obs. Lets a future
+            # reward change be recomputed at sample time instead of forcing a fresh buffer.
+            step_clean_vel = None
+            try:
+                _rd = env.unwrapped.scene["robot"].data
+                step_clean_vel = torch.cat(
+                    [_rd.root_lin_vel_b[:, :2], _rd.root_ang_vel_b[:, 2:3]], dim=-1
+                ).detach()
+            except Exception:
+                step_clean_vel = None
+
             replay.add_batch(
                 obs.detach(),
                 actions.detach(),
@@ -1684,6 +1723,7 @@ def main() -> None:
                 done.detach(),
                 planner_mean=step_planner_mean,
                 planner_std=step_planner_std,
+                clean_vel=step_clean_vel,
             )
 
             recent_step_rewards.append(float(rewards.mean().item()))
@@ -1830,6 +1870,16 @@ def main() -> None:
                 save_best_value = tracking_metrics["tracking_score"]
             elif args_cli.save_best_metric == "stable_tracking":
                 save_best_value = stable_tracking_score
+            elif args_cli.save_best_metric == "worst_axis":
+                # stable_tracking SUMS the three per-axis errors, so a gain on one axis hides a
+                # loss on another -- that is how model_best kept selecting unbalanced policies
+                # (Stage W: best-ever stable_tracking while in-place turning fell 86%->54%).
+                # Score the WORST axis instead; negated so larger is still better.
+                save_best_value = -max(
+                    abs(tracking_metrics["tracking_x_abs_error"]),
+                    abs(tracking_metrics["tracking_y_abs_error"]),
+                    abs(tracking_metrics["tracking_yaw_abs_error"]),
+                )
             elif args_cli.save_best_metric == "eval_tracking":
                 save_best_value = latest_eval_metrics["eval_tracking_score"]
             else:

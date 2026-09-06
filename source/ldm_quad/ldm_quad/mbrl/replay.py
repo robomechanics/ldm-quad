@@ -21,6 +21,12 @@ class ReplayBuffer:
         # "no planner Gaussian here" sentinel (seed/bootstrap steps, or legacy
         # buffers), which the actor BC term masks out.
         self.planner_mean = torch.full((capacity, action_dim), float("nan"), dtype=torch.float32, device=self.device)
+        # #9 groundwork: CLEAN base velocity (vx, vy, wz) per transition, straight from the
+        # sim rather than the noisy observation. Lets a future reward change be recomputed at
+        # sample time instead of forcing a fresh buffer -- every reward experiment so far
+        # (Stage R, S1, S2, #16) had to cold-start, which made each verdict a ~6k-step
+        # cold-start verdict. NaN = not recorded (legacy buffers).
+        self.clean_vel = torch.full((capacity, 3), float("nan"), dtype=torch.float32, device=self.device)
         self.planner_std = torch.full((capacity, action_dim), float("nan"), dtype=torch.float32, device=self.device)
         self.next_obs = torch.zeros((capacity, obs_dim), dtype=torch.float32, device=self.device)
         self.rewards = torch.zeros((capacity, 1), dtype=torch.float32, device=self.device)
@@ -48,6 +54,7 @@ class ReplayBuffer:
             "actions": self.actions.cpu(),
             "planner_mean": self.planner_mean.cpu(),
             "planner_std": self.planner_std.cpu(),
+            "clean_vel": self.clean_vel.cpu(),
             "next_obs": self.next_obs.cpu(),
             "rewards": self.rewards.cpu(),
             "continues": self.continues.cpu(),
@@ -77,6 +84,11 @@ class ReplayBuffer:
                 f"current capacity={self.capacity} obs_dim={self.obs.shape[-1]} action_dim={self.actions.shape[-1]}"
             )
 
+        # legacy buffers predate clean_vel -> leave the NaN sentinel in place
+        if "clean_vel" in state_dict:
+            self.clean_vel.copy_(state_dict["clean_vel"])
+        else:
+            self.clean_vel.fill_(float("nan"))
         self.obs.copy_(state_dict["obs"])
         self.actions.copy_(state_dict["actions"])
         # Backward-compatible: legacy checkpoints predate the planner Gaussian.
@@ -111,6 +123,7 @@ class ReplayBuffer:
         resets: torch.Tensor | None = None,
         planner_mean: torch.Tensor | None = None,
         planner_std: torch.Tensor | None = None,
+        clean_vel: torch.Tensor | None = None,
     ) -> None:
         obs = obs.to(self.device, non_blocking=True)
         actions = actions.to(self.device, non_blocking=True)
@@ -130,6 +143,11 @@ class ReplayBuffer:
             planner_std = torch.full_like(self.planner_std[:batch_size], float("nan"))
         else:
             planner_std = planner_std.to(self.device, non_blocking=True)
+
+        if clean_vel is None:
+            clean_vel = torch.full_like(self.clean_vel[:batch_size], float("nan"))
+        else:
+            clean_vel = clean_vel.to(self.device, non_blocking=True)
 
         self._last_batch_size = batch_size
         if self._env_episode_ids.numel() != batch_size:
@@ -156,6 +174,7 @@ class ReplayBuffer:
             self.actions[start:end] = actions
             self.planner_mean[start:end] = planner_mean
             self.planner_std[start:end] = planner_std
+            self.clean_vel[start:end] = clean_vel
             self.rewards[start:end] = rewards
             self.next_obs[start:end] = next_obs
             self.continues[start:end] = continues
@@ -169,6 +188,7 @@ class ReplayBuffer:
             self.actions[start:] = actions[:first]
             self.planner_mean[start:] = planner_mean[:first]
             self.planner_std[start:] = planner_std[:first]
+            self.clean_vel[start:] = clean_vel[:first]
             self.rewards[start:] = rewards[:first]
             self.next_obs[start:] = next_obs[:first]
             self.continues[start:] = continues[:first]
@@ -179,6 +199,7 @@ class ReplayBuffer:
             self.actions[:second] = actions[first:]
             self.planner_mean[:second] = planner_mean[first:]
             self.planner_std[:second] = planner_std[first:]
+            self.clean_vel[:second] = clean_vel[first:]
             self.rewards[:second] = rewards[first:]
             self.next_obs[:second] = next_obs[first:]
             self.continues[:second] = continues[first:]
