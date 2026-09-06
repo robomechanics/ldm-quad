@@ -41,6 +41,7 @@ class TrajectoryPlanner:
         planner_velocity_objective_yaw_weight: float = 8.0,
         planner_velocity_objective_yaw_std: float = 0.28,
         planner_velocity_objective_yaw_deadband: float = 0.0,
+        planner_velocity_objective_yaw_gate: float = 0.0,
         planner_velocity_target_x: float = 0.0,
         planner_velocity_target_y: float = 0.0,
         planner_velocity_target_yaw: float = 0.0,
@@ -80,6 +81,7 @@ class TrajectoryPlanner:
         self.planner_velocity_objective_yaw_weight = planner_velocity_objective_yaw_weight
         self.planner_velocity_objective_yaw_std = planner_velocity_objective_yaw_std
         self.planner_velocity_objective_yaw_deadband = planner_velocity_objective_yaw_deadband
+        self.planner_velocity_objective_yaw_gate = planner_velocity_objective_yaw_gate
         self.planner_velocity_target_x = planner_velocity_target_x
         self.planner_velocity_target_y = planner_velocity_target_y
         self.planner_velocity_target_yaw = planner_velocity_target_yaw
@@ -545,6 +547,7 @@ class CEMPlanner(TrajectoryPlanner):
         planner_velocity_objective_yaw_weight: float = 8.0,
         planner_velocity_objective_yaw_std: float = 0.28,
         planner_velocity_objective_yaw_deadband: float = 0.0,
+        planner_velocity_objective_yaw_gate: float = 0.0,
         planner_velocity_target_x: float = 0.0,
         planner_velocity_target_y: float = 0.0,
         planner_velocity_target_yaw: float = 0.0,
@@ -652,6 +655,7 @@ class MPPIPlanner(TrajectoryPlanner):
         planner_velocity_objective_yaw_weight: float = 8.0,
         planner_velocity_objective_yaw_std: float = 0.28,
         planner_velocity_objective_yaw_deadband: float = 0.0,
+        planner_velocity_objective_yaw_gate: float = 0.0,
         planner_velocity_target_x: float = 0.0,
         planner_velocity_target_y: float = 0.0,
         planner_velocity_target_yaw: float = 0.0,
@@ -767,6 +771,7 @@ class LatentMPPIPlanner:
         planner_velocity_objective_yaw_weight: float = 8.0,
         planner_velocity_objective_yaw_std: float = 0.28,
         planner_velocity_objective_yaw_deadband: float = 0.0,
+        planner_velocity_objective_yaw_gate: float = 0.0,
         planner_velocity_target_x: float = 0.0,
         planner_velocity_target_y: float = 0.0,
         planner_velocity_target_yaw: float = 0.0,
@@ -805,6 +810,7 @@ class LatentMPPIPlanner:
         self.planner_velocity_objective_yaw_weight = planner_velocity_objective_yaw_weight
         self.planner_velocity_objective_yaw_std = planner_velocity_objective_yaw_std
         self.planner_velocity_objective_yaw_deadband = planner_velocity_objective_yaw_deadband
+        self.planner_velocity_objective_yaw_gate = planner_velocity_objective_yaw_gate
         self.planner_velocity_target_x = planner_velocity_target_x
         self.planner_velocity_target_y = planner_velocity_target_y
         self.planner_velocity_target_yaw = planner_velocity_target_yaw
@@ -1014,6 +1020,15 @@ class LatentMPPIPlanner:
             yaw = float(self.planner_velocity_objective_yaw_weight) * torch.exp(
                 -yaw_err / float(self.planner_velocity_objective_yaw_std) ** 2
             )
+            # COMMAND GATE: only score yaw when yaw is actually COMMANDED. Strafing carries
+            # yaw wobble that the kernel taxes (5.5 of 8.0/step at 0.3 rad/s), and a deadband
+            # only softens that -- measured 2026-09-06, d=0.25 recovered lateral to 51.2% of
+            # a 69.1% baseline. Gating removes the term entirely at cmd_yaw~0, so pure-lateral
+            # commands reduce to the unmodified planner by construction, while real turning
+            # (|cmd_yaw| 0.8) keeps the full benefit.
+            gate = float(getattr(self, "planner_velocity_objective_yaw_gate", 0.0))
+            if gate > 0.0:
+                yaw = yaw * (target[:, 2].abs() > gate).to(yaw.dtype)
             return float(self.planner_velocity_objective_weight) * (lin + yaw)
         error = (predicted[:, :3] - target).square().sum(dim=-1)
         return -float(self.planner_velocity_objective_weight) * error
@@ -1193,6 +1208,7 @@ def build_planner(
     planner_velocity_objective_yaw_weight: float = 8.0,
     planner_velocity_objective_yaw_std: float = 0.28,
     planner_velocity_objective_yaw_deadband: float = 0.0,
+    planner_velocity_objective_yaw_gate: float = 0.0,
     planner_velocity_target_x: float = 0.0,
     planner_velocity_target_y: float = 0.0,
     planner_velocity_target_yaw: float = 0.0,
@@ -1235,6 +1251,7 @@ def build_planner(
             planner_velocity_objective_yaw_weight=planner_velocity_objective_yaw_weight,
             planner_velocity_objective_yaw_std=planner_velocity_objective_yaw_std,
             planner_velocity_objective_yaw_deadband=planner_velocity_objective_yaw_deadband,
+            planner_velocity_objective_yaw_gate=planner_velocity_objective_yaw_gate,
             planner_velocity_target_x=planner_velocity_target_x,
             planner_velocity_target_y=planner_velocity_target_y,
             planner_velocity_target_yaw=planner_velocity_target_yaw,
@@ -1273,6 +1290,7 @@ def build_planner(
             planner_velocity_objective_yaw_weight=planner_velocity_objective_yaw_weight,
             planner_velocity_objective_yaw_std=planner_velocity_objective_yaw_std,
             planner_velocity_objective_yaw_deadband=planner_velocity_objective_yaw_deadband,
+            planner_velocity_objective_yaw_gate=planner_velocity_objective_yaw_gate,
             planner_velocity_target_x=planner_velocity_target_x,
             planner_velocity_target_y=planner_velocity_target_y,
             planner_velocity_target_yaw=planner_velocity_target_yaw,
@@ -1313,6 +1331,7 @@ def build_planner(
             planner_velocity_objective_yaw_weight=planner_velocity_objective_yaw_weight,
             planner_velocity_objective_yaw_std=planner_velocity_objective_yaw_std,
             planner_velocity_objective_yaw_deadband=planner_velocity_objective_yaw_deadband,
+            planner_velocity_objective_yaw_gate=planner_velocity_objective_yaw_gate,
             planner_velocity_target_x=planner_velocity_target_x,
             planner_velocity_target_y=planner_velocity_target_y,
             planner_velocity_target_yaw=planner_velocity_target_yaw,

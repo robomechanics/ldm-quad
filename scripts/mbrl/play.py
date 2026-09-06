@@ -206,6 +206,9 @@ parser.add_argument("--planner_velocity_objective_lin_weight", type=float, defau
 parser.add_argument("--planner_velocity_objective_lin_std", type=float, default=0.20)
 parser.add_argument("--planner_velocity_objective_yaw_weight", type=float, default=8.0)
 parser.add_argument("--planner_velocity_objective_yaw_std", type=float, default=0.28)
+parser.add_argument("--planner_velocity_objective_yaw_gate", type=float, default=0.0,
+                    help="Only score yaw when |cmd_yaw| exceeds this. Pure-lateral commands then reduce to the "
+                         "unmodified planner by construction. 0.0 = no gating.")
 parser.add_argument("--planner_velocity_objective_yaw_deadband", type=float, default=0.0,
                     help="Forgive yaw error below this (rad/s) in the planner objective. Strafing carries "
                          "yaw wobble; scoring it hard taxes strafing. 0.0 = no change.")
@@ -542,6 +545,15 @@ DIAGNOSTIC_FIELDS = [
     "tracking_x_abs_error",
     "tracking_y_abs_error",
     "tracking_yaw_abs_error",
+    # (B) fall diagnostics -- DIAGNOSTIC_FIELDS is an allow-list; write() drops anything
+    # not named here, so new diag_metrics keys are silently discarded without it.
+    "proj_grav_x",
+    "proj_grav_y",
+    "proj_grav_z",
+    "base_height",
+    "term_base_height",
+    "term_bad_orientation",
+    "term_time_out",
     "model_obs_mse",
     "model_obs_rmse",
     "model_velocity_mse",
@@ -1025,6 +1037,7 @@ def main() -> None:
             planner_velocity_objective_yaw_weight=args_cli.planner_velocity_objective_yaw_weight,
             planner_velocity_objective_yaw_std=args_cli.planner_velocity_objective_yaw_std,
             planner_velocity_objective_yaw_deadband=args_cli.planner_velocity_objective_yaw_deadband,
+            planner_velocity_objective_yaw_gate=args_cli.planner_velocity_objective_yaw_gate,
             planner_velocity_target_x=(
                 args_cli.planner_velocity_target_x
                 if args_cli.planner_velocity_target_x is not None
@@ -1191,6 +1204,33 @@ def main() -> None:
                     "action_abs_max": float(actions.abs().max().item()),
                 }
             )
+            # (B) FALL DIAGNOSTIC: --diagnostics logged no orientation, height or termination
+            # cause, so three different mechanism stories for the lateral falls could not be
+            # checked. obs[6:9] is projected gravity (x, y, z); roll shows as proj-grav y.
+            # Uses PRE-step obs -- next_obs is already the reset observation on a done step.
+            try:
+                if obs.shape[-1] >= 9:
+                    diag_metrics["proj_grav_x"] = float(obs[:, 6].mean().item())
+                    diag_metrics["proj_grav_y"] = float(obs[:, 7].mean().item())
+                    diag_metrics["proj_grav_z"] = float(obs[:, 8].mean().item())
+            except Exception:
+                pass
+            try:
+                diag_metrics["base_height"] = float(
+                    env.unwrapped.scene["robot"].data.root_pos_w[:, 2].mean().item()
+                )
+            except Exception:
+                pass
+            try:
+                tm = env.unwrapped.termination_manager
+                for _tname in ("base_height", "bad_orientation", "time_out"):
+                    try:
+                        _tv = tm.get_term(_tname)
+                        diag_metrics[f"term_{_tname}"] = float(_tv.float().mean().item())
+                    except Exception:
+                        continue
+            except Exception:
+                pass
             diag_metrics.update(tracking_metrics(obs))
             diag_metrics.update(prediction_error_metrics(model, model_type, obs, actions, rewards, next_obs, continues))
             if planner is not None:
