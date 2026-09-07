@@ -161,6 +161,7 @@ class ReplayBuffer:
             continues = continues[-self.capacity :]
             planner_mean = planner_mean[-self.capacity :]
             planner_std = planner_std[-self.capacity :]
+            clean_vel = clean_vel[-self.capacity :]
             batch_size = self.capacity
 
         env_ids = torch.arange(batch_size, dtype=torch.long, device=self.device)

@@ -462,6 +462,12 @@ parser.add_argument("--relabel_flat_orientation_from", type=float, default=None,
                          "weight: rewards += (w_new - w_old) * (gx^2 + gy^2) using stored obs[6:8]. Projected-"
                          "gravity observation noise is +-0.05, so this is a valid approximate relabel. Requires "
                          "--reward_flat_orientation_weight.")
+parser.add_argument("--reward_yaw_deadband", type=float, default=None,
+                    help="Replace track_ang_vel_z_exp with a deadband version: forgive |wz-cmd| below this. "
+                         "Weight and std unchanged.")
+parser.add_argument("--relabel_yaw_deadband", action="store_true", default=False,
+                    help="Relabel stored rewards for the yaw deadband. Uses clean_vel[:,2] where finite (exact) "
+                         "and the noisy obs[:,5] otherwise (approximate; bounded error w*dt*(1-exp(-d^2/std^2))).")
 parser.add_argument(
     "--split_linear_reward",
     action="store_true",
@@ -667,6 +673,19 @@ def apply_reward_overrides(env_cfg: object) -> None:
     if args_cli.reward_flat_orientation_weight is not None:
         rewards.flat_orientation_l2.weight = args_cli.reward_flat_orientation_weight
         applied["flat_orientation_weight"] = args_cli.reward_flat_orientation_weight
+    if args_cli.reward_yaw_deadband is not None:
+        from isaaclab.managers import RewardTermCfg as _RewTerm
+        import ldm_quad.tasks.manager_based.ldm_quad.mdp as _ldm_mdp
+        _old = rewards.track_ang_vel_z_exp
+        _std = args_cli.reward_yaw_std if args_cli.reward_yaw_std is not None else _old.params["std"]
+        rewards.track_ang_vel_z_exp_deadband = _RewTerm(
+            func=_ldm_mdp.track_ang_vel_z_exp_deadband,
+            weight=_old.weight,
+            params={"std": _std, "deadband": args_cli.reward_yaw_deadband,
+                    "command_name": _old.params.get("command_name", "base_velocity")},
+        )
+        rewards.track_ang_vel_z_exp = None
+        applied["yaw_deadband"] = f"d={args_cli.reward_yaw_deadband} (w={_old.weight} std={_std})"
     if args_cli.action_scale is not None:
         env_cfg.actions.joint_pos.scale = args_cli.action_scale
         applied["action_scale"] = args_cli.action_scale
@@ -1332,7 +1351,11 @@ def main() -> None:
                 _dt = float(getattr(env.unwrapped, "step_dt", 0.0))
                 if _dt <= 0.0:
                     raise ValueError("Cannot relabel: env.unwrapped.step_dt unavailable.")
-                _g2 = replay.obs[:_n, 6:8].square().sum(dim=-1, keepdim=True)
+                # POST-step state: ManagerBasedRLEnv computes reward (line 208) on the
+                # post-physics state, before command resample (232) and the returned obs (238).
+                # next_obs carries that state; obs is the PRE-step one. (On done rows next_obs
+                # is post-reset, so neither is exact -- one row per episode.)
+                _g2 = replay.next_obs[:_n, 6:8].square().sum(dim=-1, keepdim=True)
                 _delta = (_w_new - _w_old) * _g2 * _dt
                 replay.rewards[:_n] += _delta
                 print(
@@ -1342,6 +1365,65 @@ def main() -> None:
                     f"max={float(_delta.max()):.4f} mean_g2={float(_g2.mean()):.5f}",
                     flush=True,
                 )
+            # YAW DEADBAND relabel. Env term is w*dt*exp(-err^2/std^2); with a deadband it is
+            # w*dt*exp(-max(err-d,0)^2/std^2). Delta is the difference. wz comes from clean_vel
+            # where finite (EXACT) and from the noisy obs[:,5] otherwise (APPROXIMATE; bounded
+            # error w*dt*(1-exp(-d^2/std^2))). Legacy rows are relabelled, NOT dropped --
+            # invalidating them would empty _valid_sequence_starts and break sequence sampling.
+            if args_cli.relabel_yaw_deadband:
+                if args_cli.reward_yaw_deadband is None:
+                    raise ValueError("--relabel_yaw_deadband requires --reward_yaw_deadband.")
+                _dt = float(getattr(env.unwrapped, "step_dt", 0.0))
+                if _dt <= 0.0:
+                    raise ValueError("Cannot relabel: env.unwrapped.step_dt unavailable.")
+                _n = len(replay)
+                _w = float(args_cli.reward_yaw_weight) if args_cli.reward_yaw_weight is not None else 8.0
+                _std = float(args_cli.reward_yaw_std) if args_cli.reward_yaw_std is not None else 0.28
+                _d = float(args_cli.reward_yaw_deadband)
+                _cmd = replay.obs[:_n, 11]
+                _cv = replay.clean_vel[:_n, 2]
+                _exact = torch.isfinite(_cv)
+                _wz = torch.where(_exact, _cv, replay.next_obs[:_n, 5])  # post-step; see above
+                _err = (_cmd - _wz).abs()
+                _old_r = torch.exp(-_err.square() / _std**2)
+                _new_r = torch.exp(-(_err - _d).clamp_min(0.0).square() / _std**2)
+                _dy = (_w * _dt * (_new_r - _old_r)).unsqueeze(-1)
+                replay.rewards[:_n] += _dy
+                print(
+                    f"[MBRL] Relabelled replay for yaw deadband d={_d} (w={_w} std={_std} dt={_dt:.4f}) "
+                    f"over {_n} rows: exact(clean_vel)={int(_exact.sum())} approx(noisy obs)={int((~_exact).sum())} "
+                    f"mean_delta={float(_dy.mean()):.5f} min={float(_dy.min()):.5f} max={float(_dy.max()):.5f} "
+                    f"bounded_approx_err={_w*_dt*(1-float(torch.exp(torch.tensor(-_d**2/_std**2)))):.5f}",
+                    flush=True,
+                )
+                # GATE: confirm the relabel formula equals what the env actually computes.
+                # A silent mismatch would leave every one of the ~1M rewritten rows wrong with
+                # no error anywhere. Compares the env's OWN reward functions against the exact
+                # expression used above, on live sim states.
+                try:
+                    import ldm_quad.tasks.manager_based.ldm_quad.mdp as _vmdp
+                    _u = env.unwrapped
+                    _stock = _vmdp.track_ang_vel_z_exp(_u, std=_std, command_name="base_velocity")
+                    _dead = _vmdp.track_ang_vel_z_exp_deadband(
+                        _u, std=_std, deadband=_d, command_name="base_velocity"
+                    )
+                    _env_delta = _w * _dt * (_dead - _stock)
+                    _wz_l = _u.scene["robot"].data.root_ang_vel_b[:, 2]
+                    _cmd_l = _u.command_manager.get_command("base_velocity")[:, 2]
+                    _e_l = (_cmd_l - _wz_l).abs()
+                    _f_delta = _w * _dt * (
+                        torch.exp(-(_e_l - _d).clamp_min(0.0).square() / _std**2)
+                        - torch.exp(-_e_l.square() / _std**2)
+                    )
+                    _maxerr = float((_env_delta - _f_delta).abs().max())
+                    print(f"[MBRL] Relabel VERIFY: max_abs_err={_maxerr:.3e} over {_e_l.numel()} live envs", flush=True)
+                    if _maxerr > 1e-5:
+                        raise ValueError(
+                            f"Relabel formula does NOT match the env reward (max_abs_err={_maxerr:.3e}). "
+                            "Aborting rather than training on a mis-relabelled buffer."
+                        )
+                except ImportError:
+                    print("[MBRL] Relabel VERIFY skipped (mdp import unavailable)", flush=True)
         elif args_cli.resume_replay is not None:
             raise FileNotFoundError(f"Replay checkpoint not found: {args_cli.resume_replay}")
         elif args_cli.auto_resume_replay:

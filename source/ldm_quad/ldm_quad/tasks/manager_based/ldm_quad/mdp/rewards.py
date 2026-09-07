@@ -107,3 +107,23 @@ def track_lin_vel_y_exp(
     asset: Articulation = env.scene[asset_cfg.name]
     err = torch.square(env.command_manager.get_command(command_name)[:, 1] - asset.data.root_lin_vel_b[:, 1])
     return torch.exp(-err / std**2)
+
+
+def track_ang_vel_z_exp_deadband(
+    env: ManagerBasedRLEnv, std: float, deadband: float, command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Yaw tracking with a DEADBAND: forgive |wz - cmd| below ``deadband``.
+
+    Strafing on this robot carries yaw wobble (|wz| 0.12-0.42 measured while strafing, vs
+    |vy| 0.00-0.04 while turning -- the tax is one-directional). The stock kernel forfeits
+    5.5 of 8.0 per step at a 0.3 rad/s wobble (std 0.28), so scoring yaw hard makes strafing
+    expensive and turning cheap -- a reward-level coupling between exactly the two skills that
+    anti-correlate (r = -0.64 across the T2 warm-buffer checkpoints). The deadband forgives
+    wobble below d while leaving real turning (0.8 rad/s) fully scored: at d=0.20 a 0.3 wobble
+    costs ~1.0/step instead of 5.5.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    err = (env.command_manager.get_command(command_name)[:, 2] - asset.data.root_ang_vel_b[:, 2]).abs()
+    err_eff = (err - deadband).clamp_min(0.0)
+    return torch.exp(-err_eff.square() / std**2)

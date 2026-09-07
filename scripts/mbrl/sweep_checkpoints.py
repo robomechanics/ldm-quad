@@ -40,7 +40,25 @@ CONDITIONS = [
     ("combo", 0.3, 0.2, 0.5, 2),
 ]
 VEL_KEYS = ("velocity_x_mean", "velocity_y_mean", "velocity_yaw_mean")
-FIELDS = ["checkpoint", "env_steps", "condition", "commanded", "achieved", "pct_of_cmd", "mean_length", "falls"]
+FIELDS = ["checkpoint", "env_steps", "condition", "objective", "commanded", "achieved", "pct_of_cmd", "mean_length", "falls"]
+
+
+# play.py inherits objective settings from the CHECKPOINT when not given on the CLI, so a
+# checkpoint trained with weight>0 would otherwise be swept with the objective silently ON.
+# (That happened to every Phase A/A2 sweep: weight 0.5 + form exp inherited, but lin_weight
+# and yaw_gate came from CLI defaults 8.0/0.0 -- the exact 15b config that rolls lateral over.
+# Tell: planner_candidate_return_best ~16 with the objective off vs ~70 with it on.)
+OBJECTIVE_FLAGS = {
+    "off": ["--planner_velocity_objective_weight", "0.0"],
+    "gated": [
+        "--planner_velocity_objective_weight", "0.5",
+        "--planner_velocity_objective_form", "exp",
+        "--planner_velocity_objective_lin_weight", "0.0",
+        "--planner_velocity_objective_yaw_weight", "8.0",
+        "--planner_velocity_objective_yaw_gate", "0.1",
+        "--planner_velocity_objective_yaw_deadband", "0.0",
+    ],
+}
 
 
 def step_of(name: str) -> int:
@@ -48,10 +66,11 @@ def step_of(name: str) -> int:
     return int(m.group(1)) if m else -1
 
 
-def sweep_one(ckpt: str, out_dir: str, action_scale: float, episodes: int, max_steps: int) -> list[dict]:
+def sweep_one(ckpt: str, out_dir: str, action_scale: float, episodes: int, max_steps: int,
+              objective: str = "off") -> list[dict]:
     rows = []
     for name, cx, cy, cw, axis in CONDITIONS:
-        d = os.path.join(out_dir, f"{os.path.basename(ckpt)[:-3]}__{name}")
+        d = os.path.join(out_dir, f"{os.path.basename(ckpt)[:-3]}__{name}__{objective}")
         os.makedirs(d, exist_ok=True)
         if not os.path.exists(ckpt):
             print(f"[ckpt-sweep] ABORT: missing checkpoint {ckpt}", flush=True)
@@ -63,7 +82,7 @@ def sweep_one(ckpt: str, out_dir: str, action_scale: float, episodes: int, max_s
             "--command_x", str(cx), "--command_y", str(cy), "--command_yaw", str(cw),
             "--action_scale", str(action_scale),
             "--diagnostics", "--diagnostics_dir", d, "--diagnostics_interval", "5",
-        ]
+        ] + OBJECTIVE_FLAGS[objective]
         with open(os.path.join(d, "console.log"), "w") as log:
             rc = subprocess.call(cmd, stdout=log, stderr=subprocess.STDOUT)
         if rc != 0:
@@ -86,6 +105,7 @@ def sweep_one(ckpt: str, out_dir: str, action_scale: float, episodes: int, max_s
             "checkpoint": os.path.basename(ckpt),
             "env_steps": step_of(ckpt),
             "condition": name,
+            "objective": objective,
             "commanded": f"{commanded:.3f}",
             "achieved": f"{achieved:.4f}",
             "pct_of_cmd": f"{(achieved / commanded * 100):.1f}" if commanded else "",
@@ -133,6 +153,9 @@ def main() -> None:
     ap.add_argument("--max_steps", type=int, default=2000)
     ap.add_argument("--poll_seconds", type=int, default=300)
     ap.add_argument("--once", action="store_true", help="Sweep everything present, then exit.")
+    ap.add_argument("--objective", default="off", choices=sorted(OBJECTIVE_FLAGS),
+                    help="Which planner objective to evaluate under. ALWAYS passed explicitly so nothing is "
+                         "inherited from the checkpoint.")
     ap.add_argument("--wandb", action="store_true", help="Also log per-condition results to Weights & Biases.")
     ap.add_argument("--wandb_project", default="ldm-quad-mbrl")
     ap.add_argument("--wandb_name", default=None, help="Defaults to <run_dir basename>_fixedeval.")
@@ -147,7 +170,18 @@ def main() -> None:
 
     seen: set[str] = set()
     if os.path.exists(csv_path):
-        seen = {r["checkpoint"] for r in csv.DictReader(open(csv_path))}
+        # Key on (checkpoint, objective). Rows WITHOUT an objective column predate the
+        # explicit-flags fix and were swept with whatever play.py inherited from the
+        # checkpoint -- treat them as unusable, never as "already done". (Defaulting a
+        # missing column to "off" silently skipped 15 contaminated Phase A rows.)
+        _rows = list(csv.DictReader(open(csv_path)))
+        _bad = [r for r in _rows if not r.get("objective")]
+        if _bad:
+            raise SystemExit(
+                f"[ckpt-sweep] ABORT: {csv_path} has {len(_bad)} row(s) with no 'objective' column "
+                "(pre-fix, objective inherited from the checkpoint). Delete or repair them first."
+            )
+        seen = {r["checkpoint"] for r in _rows if r["objective"] == a.objective}
         print(f"[ckpt-sweep] resuming, {len(seen)} checkpoint(s) already swept", flush=True)
 
     while True:
@@ -157,9 +191,17 @@ def main() -> None:
         ) if os.path.isdir(ck_dir) else []
         for f in pending:
             print(f"[ckpt-sweep] sweeping {f} at {time.strftime('%H:%M:%S')}", flush=True)
-            rows = sweep_one(os.path.join(ck_dir, f), out_dir, a.action_scale, a.episodes, a.max_steps)
+            rows = sweep_one(os.path.join(ck_dir, f), out_dir, a.action_scale, a.episodes, a.max_steps, a.objective)
             if rows:
                 new = not os.path.exists(csv_path)
+                if not new:
+                    with open(csv_path) as _fh:
+                        _hdr = _fh.readline().rstrip("\n").split(",")
+                    if _hdr != FIELDS:
+                        raise SystemExit(
+                            f"[ckpt-sweep] ABORT: {csv_path} header {_hdr} != {FIELDS}. Appending would "
+                            "misalign every column. Repair or delete the file first."
+                        )
                 with open(csv_path, "a", newline="") as fh:
                     w = csv.DictWriter(fh, fieldnames=FIELDS)
                     if new:

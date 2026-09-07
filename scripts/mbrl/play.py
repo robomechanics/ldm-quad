@@ -202,14 +202,14 @@ parser.add_argument("--planner_continue_threshold", type=float, default=None, he
 parser.add_argument("--planner_velocity_objective_weight", type=float, default=None, help="Override planner-only velocity objective weight.")
 parser.add_argument("--planner_velocity_objective_form", type=str, default=None, choices=["quadratic", "exp"],
                     help="quadratic (default, UNBOUNDED -- exploitable) or exp (bounded, mirrors the env kernels).")
-parser.add_argument("--planner_velocity_objective_lin_weight", type=float, default=8.0)
-parser.add_argument("--planner_velocity_objective_lin_std", type=float, default=0.20)
-parser.add_argument("--planner_velocity_objective_yaw_weight", type=float, default=8.0)
-parser.add_argument("--planner_velocity_objective_yaw_std", type=float, default=0.28)
-parser.add_argument("--planner_velocity_objective_yaw_gate", type=float, default=0.0,
+parser.add_argument("--planner_velocity_objective_lin_weight", type=float, default=None)
+parser.add_argument("--planner_velocity_objective_lin_std", type=float, default=None)
+parser.add_argument("--planner_velocity_objective_yaw_weight", type=float, default=None)
+parser.add_argument("--planner_velocity_objective_yaw_std", type=float, default=None)
+parser.add_argument("--planner_velocity_objective_yaw_gate", type=float, default=None,
                     help="Only score yaw when |cmd_yaw| exceeds this. Pure-lateral commands then reduce to the "
                          "unmodified planner by construction. 0.0 = no gating.")
-parser.add_argument("--planner_velocity_objective_yaw_deadband", type=float, default=0.0,
+parser.add_argument("--planner_velocity_objective_yaw_deadband", type=float, default=None,
                     help="Forgive yaw error below this (rad/s) in the planner objective. Strafing carries "
                          "yaw wobble; scoring it hard taxes strafing. 0.0 = no change.")
 parser.add_argument("--planner_velocity_target_x", type=float, default=None, help="Override planner-only target body x velocity.")
@@ -1032,12 +1032,36 @@ def main() -> None:
                 if args_cli.planner_velocity_objective_form is not None
                 else checkpoint_args.get("planner_velocity_objective_form", "quadratic")
             ),
-            planner_velocity_objective_lin_weight=args_cli.planner_velocity_objective_lin_weight,
-            planner_velocity_objective_lin_std=args_cli.planner_velocity_objective_lin_std,
-            planner_velocity_objective_yaw_weight=args_cli.planner_velocity_objective_yaw_weight,
-            planner_velocity_objective_yaw_std=args_cli.planner_velocity_objective_yaw_std,
-            planner_velocity_objective_yaw_deadband=args_cli.planner_velocity_objective_yaw_deadband,
-            planner_velocity_objective_yaw_gate=args_cli.planner_velocity_objective_yaw_gate,
+            planner_velocity_objective_lin_weight=(
+                args_cli.planner_velocity_objective_lin_weight
+                if args_cli.planner_velocity_objective_lin_weight is not None
+                else checkpoint_args.get("planner_velocity_objective_lin_weight", 8.0)
+            ),
+            planner_velocity_objective_lin_std=(
+                args_cli.planner_velocity_objective_lin_std
+                if args_cli.planner_velocity_objective_lin_std is not None
+                else checkpoint_args.get("planner_velocity_objective_lin_std", 0.20)
+            ),
+            planner_velocity_objective_yaw_weight=(
+                args_cli.planner_velocity_objective_yaw_weight
+                if args_cli.planner_velocity_objective_yaw_weight is not None
+                else checkpoint_args.get("planner_velocity_objective_yaw_weight", 8.0)
+            ),
+            planner_velocity_objective_yaw_std=(
+                args_cli.planner_velocity_objective_yaw_std
+                if args_cli.planner_velocity_objective_yaw_std is not None
+                else checkpoint_args.get("planner_velocity_objective_yaw_std", 0.28)
+            ),
+            planner_velocity_objective_yaw_deadband=(
+                args_cli.planner_velocity_objective_yaw_deadband
+                if args_cli.planner_velocity_objective_yaw_deadband is not None
+                else checkpoint_args.get("planner_velocity_objective_yaw_deadband", 0.0)
+            ),
+            planner_velocity_objective_yaw_gate=(
+                args_cli.planner_velocity_objective_yaw_gate
+                if args_cli.planner_velocity_objective_yaw_gate is not None
+                else checkpoint_args.get("planner_velocity_objective_yaw_gate", 0.0)
+            ),
             planner_velocity_target_x=(
                 args_cli.planner_velocity_target_x
                 if args_cli.planner_velocity_target_x is not None
@@ -1110,6 +1134,17 @@ def main() -> None:
             flush=True,
         )
     print(f"[INFO] Planner={'prior_only' if args_cli.prior_only else planner_name}")
+    _vo_w = planner.planner_velocity_objective_weight if hasattr(planner, "planner_velocity_objective_weight") else 0.0
+    print(
+        "[INFO] VelObjective "
+        f"weight={_vo_w} "
+        f"form={getattr(planner, 'planner_velocity_objective_form', 'n/a')} "
+        f"lin_w={getattr(planner, 'planner_velocity_objective_lin_weight', 'n/a')} "
+        f"yaw_w={getattr(planner, 'planner_velocity_objective_yaw_weight', 'n/a')} "
+        f"yaw_gate={getattr(planner, 'planner_velocity_objective_yaw_gate', 'n/a')} "
+        f"yaw_deadband={getattr(planner, 'planner_velocity_objective_yaw_deadband', 'n/a')}",
+        flush=True,
+    )
     if args_cli.horizon is not None:
         print(f"[INFO] planning horizon OVERRIDE = {args_cli.horizon} (checkpoint trained at {checkpoint_args.get('horizon')})")
     if args_cli.online_adapt:
