@@ -453,6 +453,15 @@ parser.add_argument("--reward_track_std", type=float, default=None, help="Overri
 parser.add_argument("--reward_yaw_weight", type=float, default=None, help="Override track_ang_vel_z_exp reward weight (yaw/turn-tracking strength). Stock 0.5 is far weaker than the tuned linear term (8.0), so yaw is effectively untracked.")
 parser.add_argument("--reward_yaw_std", type=float, default=None, help="Override track_ang_vel_z_exp reward std (lower = sharper yaw tracking).")
 parser.add_argument("--reward_alive_weight", type=float, default=None, help="Override the alive reward weight.")
+parser.add_argument("--reward_flat_orientation_weight", type=float, default=None,
+                    help="Override flat_orientation_l2 weight. At the stock -1.0 the term pays ~0.02-0.25/step "
+                         "against ~16/step of tracking, so lean is effectively free -- Phase A's falls were all "
+                         "slow roll-overs (proj_grav_y 0.15->0.48 with height flat).")
+parser.add_argument("--relabel_flat_orientation_from", type=float, default=None,
+                    help="After loading a replay buffer, rewrite stored rewards for the NEW flat_orientation "
+                         "weight: rewards += (w_new - w_old) * (gx^2 + gy^2) using stored obs[6:8]. Projected-"
+                         "gravity observation noise is +-0.05, so this is a valid approximate relabel. Requires "
+                         "--reward_flat_orientation_weight.")
 parser.add_argument(
     "--split_linear_reward",
     action="store_true",
@@ -655,6 +664,9 @@ def apply_reward_overrides(env_cfg: object) -> None:
     if args_cli.reward_alive_weight is not None:
         rewards.alive.weight = args_cli.reward_alive_weight
         applied["alive_weight"] = args_cli.reward_alive_weight
+    if args_cli.reward_flat_orientation_weight is not None:
+        rewards.flat_orientation_l2.weight = args_cli.reward_flat_orientation_weight
+        applied["flat_orientation_weight"] = args_cli.reward_flat_orientation_weight
     if args_cli.action_scale is not None:
         env_cfg.actions.joint_pos.scale = args_cli.action_scale
         applied["action_scale"] = args_cli.action_scale
@@ -1301,6 +1313,35 @@ def main() -> None:
                 f"recent_lengths={len(recent_lengths)} recent_step_rewards={len(recent_step_rewards)}",
                 flush=True,
             )
+            # RELABEL for a changed flat_orientation weight. The env term is
+            # flat_orientation_l2 = sum(projected_gravity_xy^2), scaled by its weight, so a
+            # weight change is an exact affine shift of the stored reward given gx,gy. We read
+            # them from the stored OBSERVATION (obs[6:8]); projected-gravity obs noise is
+            # +-0.05, so this is approximate but far better than discarding a 1M warm buffer
+            # (every previous reward change forced a cold start, which is what made Stage R /
+            # S1 / S2 verdicts unreadable). Velocity-tracking terms are untouched.
+            if args_cli.relabel_flat_orientation_from is not None:
+                if args_cli.reward_flat_orientation_weight is None:
+                    raise ValueError("--relabel_flat_orientation_from requires --reward_flat_orientation_weight.")
+                _w_old = float(args_cli.relabel_flat_orientation_from)
+                _w_new = float(args_cli.reward_flat_orientation_weight)
+                _n = len(replay)
+                # CRITICAL: IsaacLab's RewardManager stores value = func * weight * dt
+                # (reward_manager.py:150). Omitting dt would scale the correction by ~1/0.02
+                # = 50x, silently, across every row.
+                _dt = float(getattr(env.unwrapped, "step_dt", 0.0))
+                if _dt <= 0.0:
+                    raise ValueError("Cannot relabel: env.unwrapped.step_dt unavailable.")
+                _g2 = replay.obs[:_n, 6:8].square().sum(dim=-1, keepdim=True)
+                _delta = (_w_new - _w_old) * _g2 * _dt
+                replay.rewards[:_n] += _delta
+                print(
+                    "[MBRL] Relabelled replay for flat_orientation "
+                    f"w {_w_old} -> {_w_new} (dt={_dt:.4f}) over {_n} rows: "
+                    f"mean_delta={float(_delta.mean()):.4f} min={float(_delta.min()):.4f} "
+                    f"max={float(_delta.max()):.4f} mean_g2={float(_g2.mean()):.5f}",
+                    flush=True,
+                )
         elif args_cli.resume_replay is not None:
             raise FileNotFoundError(f"Replay checkpoint not found: {args_cli.resume_replay}")
         elif args_cli.auto_resume_replay:

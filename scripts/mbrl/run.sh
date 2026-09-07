@@ -194,6 +194,17 @@ case "$ACTION" in
     # Phase A planner objective (15g). Gate closes at cmd_yaw~0 so pure-lateral commands reduce
     # to the unmodified planner by construction; the LINEAR term is OFF because it destroyed
     # lateral at every weight in #15/#15b (0/4 survived, falls in 60-135 steps).
+    # PHASE A2 (#17): ONE variable vs Phase A -- the orientation penalty.
+    # Phase A's falls were all slow ROLL-OVERS: proj_grav_y 0.155 -> 0.482 over 35 steps with
+    # base height FLAT at 0.29 (first direct observation, from the new (B) diagnostic columns).
+    # At the stock -1.0, flat_orientation_l2 pays ~0.02-0.25/step against ~16/step of tracking,
+    # so lean is effectively free. At -10 the quadratic still spares the working lean
+    # (8-14 deg strafe, 15-28 deg turn) and taxes the 25 deg+ that precedes a fall.
+    # The resumed buffer is RELABELLED for the new weight rather than discarded (see
+    # --relabel_flat_orientation_from); every prior reward change forced a cold start, which is
+    # what made the Stage R / S1 / S2 verdicts unreadable.
+    LEAN_PEN="${LEAN_PEN:--10.0}"; LEAN_PEN_OLD="${LEAN_PEN_OLD:--1.0}"
+    LEAN_FLAGS="--reward_flat_orientation_weight $LEAN_PEN --relabel_flat_orientation_from $LEAN_PEN_OLD"
     VELOBJ_W="${VELOBJ_W:-0.5}"; VELOBJ_GATE="${VELOBJ_GATE:-0.1}"
     VELOBJ_FLAGS="--planner_velocity_objective_weight $VELOBJ_W --planner_velocity_objective_form exp --planner_velocity_objective_lin_weight 0.0 --planner_velocity_objective_yaw_weight 8.0 --planner_velocity_objective_yaw_gate $VELOBJ_GATE --planner_velocity_objective_yaw_deadband 0.0"
     if [[ "$SPLIT_LINEAR" == "1" ]]; then SPLIT_FLAG="--split_linear_reward"; else SPLIT_FLAG=""; fi
@@ -235,8 +246,8 @@ case "$ACTION" in
       CMD_ARGS=(--wander --wander_x_min "$X_MIN" --wander_x_max "$X_MAX" \
                 --wander_y_min "$Y_MIN" --wander_y_max "$Y_MAX" \
                 --wander_yaw_min "$YAW_MIN" --wander_yaw_max "$YAW_MAX")
-      WANDB_NAME="${WANDB_NAME:-phaseA_gatedyaw_s${SEED}}"
-      echo "[run] TRAIN Phase A (gated yaw planner objective, reward unchanged): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
+      WANDB_NAME="${WANDB_NAME:-phaseA2_leanpen10_s${SEED}}"
+      echo "[run] TRAIN Phase A2 (gated yaw objective + orientation penalty -10): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
     else
       CMD_ARGS=(--command_x "$CMD_X" --command_y 0.0 --command_yaw 0.0)
       WANDB_NAME="${WANDB_NAME:-curriculum_x$(echo "$CMD_X" | tr . p)_s${SEED}}"
@@ -263,7 +274,7 @@ case "$ACTION" in
       --seed_pretrain_updates 5000 --seed_policy_noise 0.02 \
       --save_interval "$SAVE_INTERVAL" --max_checkpoints 50 --save_replay \
       $REPLAY_FLAG \
-      --save_best_metric worst_axis --eval_interval 50 $VELOBJ_FLAGS \
+      --save_best_metric worst_axis --eval_interval 50 $VELOBJ_FLAGS $LEAN_FLAGS \
       --wandb --wandb_project "$PROJECT" \
       --resume_checkpoint "$RESUME" \
       --train_steps "$TRAIN_STEPS" "${CMD_ARGS[@]}" \
