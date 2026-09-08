@@ -64,3 +64,50 @@ ablation (the thesis). Report tables with mean_length FIRST; pct_of_cmd alone hi
 
 Dead/dropped: 0, 2, 8 (dead); 5, 13 (dropped: #15 removed their justification); 6 (dropped for 6a);
 4, 7 (parked). Done: 1, 11, 12, 15, 15a, 15b, 15d.
+
+# Budget experiment (2026-09-08): which lever raises the ceiling?
+
+Finding: across 8 artifacts every reward/objective change redistributed capability (mean of the 4 axes 74.6 +- 13.5,
+best four within 2 pts). Test the levers that could raise the total, one variable per arm, same base, same reward,
+same measurement.
+
+## Common protocol (every arm)
+- Base: Phase A 402k (`best_walker/phaseA_gatedyaw_402k_backward.pt`) + Phase A's OWN replay at 402k (labels already
+  match: stock yaw kernel, orientation -1). No relabel. Phase B's deadband is NOT carried (it traded backward for lateral).
+- Reward/objective FROZEN at Phase A's: joint linear 8.0/0.20, yaw 8.0/0.28, orientation -1, gated yaw objective in
+  collection (exp, W 0.5, lin 0, yaw 8, gate 0.1). save_best_metric worst_axis. clean_vel on.
+- 20k steps per arm (402k -> 422k), save_interval 2000, sweeper attached, objective=off (plain planner) primary.
+- Metrics per checkpoint: the 5 fixed conditions, mean_length first. Primary score = WORST-AXIS % among
+  fwd/back/lat/yaw with zero falls on all 5; secondary = mean of the 4 axes; tertiary = swing amplitude
+  (std across the last 5 checkpoints per axis: the trading metric). Compare at matched env steps; for the
+  throughput arm also at matched wall-clock.
+- Decision: an arm "raises the budget" if its mean of 4 axes over the last 5 checkpoints exceeds 80 (control ~75)
+  AND worst-axis >= 60 with no falls on >= 3 consecutive checkpoints. Winner = highest worst-axis, tie-break mean.
+
+## Arms (numbered as table items)
+- **#18 control**: base continued unchanged, 20k. The null: does time alone move the total? Also the reference for
+  swing amplitude. Cheapest, run FIRST.
+- **#6a command skip-connection**: concat raw cmd (obs[9:12]) to the inputs of dynamics, reward, Q ensemble, and pi;
+  zero-init the new input columns; partial checkpoint load (all existing weights copied); Adam state reset for new
+  params only. Function-preserving at step 0 (verify: identical planner actions on a fixed batch before/after load).
+- **#5w width expansion, WARM** (net2net): latent 256 -> 512 (SimNorm groups 32 -> 64), hidden 512 -> 1024.
+  Copy old weights into the top-left blocks, zero-init new encoder output rows (new SimNorm groups start uniform),
+  zero-init all new INPUT columns of dynamics/reward/Q/pi/continue/physical heads so the old function is preserved
+  exactly; verify identical outputs on a fixed batch before training. If verification fails, this arm is invalid.
+- **#19 throughput**: num_envs 64 -> 256. PROBE FIRST (10 min): measure steps/s at 256 envs with the planner; keep
+  updates-per-env-step constant by scaling --utd 0.25 -> 0.0625 (utd*num_envs = 16 updates/step). HAZARD: the replay's
+  sequence sampler assumes stride = num_envs at write time; a 64-env buffer loaded into a 256-env run makes every old
+  row an invalid sequence start (cold start on sequences). Fix before running: store an explicit per-row `next_index`
+  (or per-row stride) in ReplayBuffer and use it in _valid_sequence_starts/sample_sequences instead of the current
+  global stride. Compare at matched env steps AND matched wall-clock (report both).
+- **#20 duration** (after the winner is known): winner's config, 100k+ steps, reward/objective frozen, to see
+  whether the model settles when left alone. Not an arm of the comparison.
+
+## Order and cost (one GPU, sequential, ~1 day each)
+#18 control -> #6a -> #5w -> #19 (probe first, then the arm) -> #20 with the winner. ~4 days to the winner.
+In PARALLEL, no GPU: freeze the task on Phase A 402k; prepare the PPO retrain on the frozen ranges and the
+perturbation-study configs, so the thesis starts the moment the GPU frees.
+
+## Review points
+Each arm -> read the 5-checkpoint table before launching the next; abort an arm early only on falls >= 2 conditions
+across 3 consecutive checkpoints (it is then already worse than the base).

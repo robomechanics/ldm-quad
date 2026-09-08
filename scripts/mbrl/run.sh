@@ -205,11 +205,12 @@ case "$ACTION" in
     # what made the Stage R / S1 / S2 verdicts unreadable.
     # Phase B: orientation back to the env default -1.0. A2 relabelled the whole buffer to
     # -10 AND collected at -10, so the inverse relabel is required to make the buffer consistent.
-    LEAN_PEN="${LEAN_PEN:--1.0}"; LEAN_PEN_OLD="${LEAN_PEN_OLD:--10.0}"
+    # #18: labels already match the base (stock yaw kernel, orientation -1) -> NO relabel.
+    LEAN_PEN="${LEAN_PEN:-}"; LEAN_PEN_OLD="${LEAN_PEN_OLD:-}"
     # ENV yaw deadband (the planner objective keeps deadband 0; this is the reward).
-    YAW_DEAD="${YAW_DEAD:-0.20}"
-    YAWDEAD_FLAGS="--reward_yaw_deadband $YAW_DEAD --relabel_yaw_deadband"
-    LEAN_FLAGS="--reward_flat_orientation_weight $LEAN_PEN --relabel_flat_orientation_from $LEAN_PEN_OLD"
+    YAW_DEAD="${YAW_DEAD:-}"   # #18: stock yaw kernel, no deadband
+    if [[ -n "$YAW_DEAD" ]]; then YAWDEAD_FLAGS="--reward_yaw_deadband $YAW_DEAD --relabel_yaw_deadband"; else YAWDEAD_FLAGS=""; fi
+    if [[ -n "$LEAN_PEN" ]]; then LEAN_FLAGS="--reward_flat_orientation_weight $LEAN_PEN --relabel_flat_orientation_from $LEAN_PEN_OLD"; else LEAN_FLAGS=""; fi
     VELOBJ_W="${VELOBJ_W:-0.5}"; VELOBJ_GATE="${VELOBJ_GATE:-0.1}"
     VELOBJ_FLAGS="--planner_velocity_objective_weight $VELOBJ_W --planner_velocity_objective_form exp --planner_velocity_objective_lin_weight 0.0 --planner_velocity_objective_yaw_weight 8.0 --planner_velocity_objective_yaw_gate $VELOBJ_GATE --planner_velocity_objective_yaw_deadband 0.0"
     if [[ "$SPLIT_LINEAR" == "1" ]]; then SPLIT_FLAG="--split_linear_reward"; else SPLIT_FLAG=""; fi
@@ -246,19 +247,24 @@ case "$ACTION" in
     # two skills that anti-correlate (r=-0.64 on T2). d=0.20 forgives the wobble and leaves
     # real turning (0.8 rad/s) fully scored. Resumes Phase A 402k (90.6/87.0/56.2/75.5/83.6,
     # zero falls under the PLAIN planner) with Phase A2's buffer, relabelled twice.
+    # BUDGET EXPERIMENT #18 CONTROL ARM. Across 8 artifacts every reward/objective change
+    # REDISTRIBUTED capability (mean of the 4 axes 74.6 +- 13.5; best four within 2 pts) rather
+    # than adding any. This arm is the null: base continued unchanged for 20k steps, to see
+    # whether time alone moves the total, and to give the reference swing amplitude.
+    # Reward/objective FROZEN at Phase A's -- no deadband (Phase B traded backward for lateral).
     RESUME="${RESUME:-$BW/phaseA_gatedyaw_402k_backward.pt}"
     # 50k new steps (not 30k): Stage M fixes THREE out-of-distribution regions at once
     # (fast-forward 0.5, standing x~0, backward x<0), where Stage T/L each needed ~25-30k for
     # ONE. Uniform sampling over the 0.8-wide x range also gives the top 0.05 band only ~6%
     # of the data, so the 0.5 end is the thinnest-covered part. Checkpoints every 2500 steps
     # mean we can stop early the moment it plateaus (as Stage T was stopped at 301k).
-    TRAIN_STEPS="${TRAIN_STEPS:-422000}"    # resume @402k + 20k Phase B steps
+    TRAIN_STEPS="${TRAIN_STEPS:-422000}"    # resume @402k + 20k control steps
     if [[ "$WANDER" == "1" ]]; then
       CMD_ARGS=(--wander --wander_x_min "$X_MIN" --wander_x_max "$X_MAX" \
                 --wander_y_min "$Y_MIN" --wander_y_max "$Y_MAX" \
                 --wander_yaw_min "$YAW_MIN" --wander_yaw_max "$YAW_MAX")
-      WANDB_NAME="${WANDB_NAME:-phaseB_yawdeadband_s${SEED}}"
-      echo "[run] TRAIN Phase B (gated yaw objective + ENV yaw deadband 0.20): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
+      WANDB_NAME="${WANDB_NAME:-budget18_control_s${SEED}}"
+      echo "[run] TRAIN #18 CONTROL (Phase A config, unchanged, 20k): x[$X_MIN,$X_MAX] y[$Y_MIN,$Y_MAX] yaw[$YAW_MIN,$YAW_MAX] yaw_rew=w$YAW_W/std$YAW_STD lin_std=$TRACK_STD bc=$BC_COEF resume=$RESUME -> $TRAIN_STEPS"
     else
       CMD_ARGS=(--command_x "$CMD_X" --command_y 0.0 --command_yaw 0.0)
       WANDB_NAME="${WANDB_NAME:-curriculum_x$(echo "$CMD_X" | tr . p)_s${SEED}}"
