@@ -40,6 +40,30 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task to 
 parser.add_argument("--checkpoint", type=str, required=True, help="Path to an MBRL checkpoint.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment.")
 parser.add_argument("--num_episodes", type=int, default=5, help="Number of completed episodes to evaluate.")
+parser.add_argument(
+    "--command_start_step",
+    type=int,
+    default=0,
+    help=(
+        "Hold the command at ZERO for this many steps at the start of EVERY episode, then apply "
+        "the test command. Separates two different failures: initiation out of the spawn transient "
+        "(still settling from ~0.398 m toward the 0.20 m cut) versus initiation from a settled "
+        "stance, which is what a deployed controller does for every command after the first. "
+        "Counted PER EPISODE, so envs resetting mid-rollout each get their own window."
+    ),
+)
+parser.add_argument(
+    "--settle_steps",
+    type=int,
+    default=20,
+    help=(
+        "Steps at the start of an episode treated as the spawn-settle transient and excluded from "
+        "the post-settle velocity average. The robot spawns at base_height ~0.398 and settles to "
+        "~0.27 by step ~20; episodes that terminate inside this window are LANDING failures, not "
+        "locomotion failures, and conflating the two made the old mean_length uninterpretable "
+        "(406k lateral at N=1 was {13, 14, 765} -> 'mean_length 265')."
+    ),
+)
 parser.add_argument("--max_steps", type=int, default=4000, help="Maximum environment steps to run.")
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 parser.add_argument("--command_x", type=float, default=None, help="Fixed forward velocity command in m/s.")
@@ -547,6 +571,7 @@ DIAGNOSTIC_FIELDS = [
     "tracking_yaw_abs_error",
     # (B) fall diagnostics -- DIAGNOSTIC_FIELDS is an allow-list; write() drops anything
     # not named here, so new diag_metrics keys are silently discarded without it.
+    "commanded_abs_max",
     "proj_grav_x",
     "proj_grav_y",
     "proj_grav_z",
@@ -677,10 +702,12 @@ def prediction_error_metrics(
     next_obs: torch.Tensor,
     continues: torch.Tensor,
 ) -> dict[str, float]:
+    # model_obs_mse / model_obs_rmse / model_velocity_mse are deliberately ABSENT here, not 0.0.
+    # The latent world model is decoder-free, so there is no predicted observation to score; only
+    # the ensemble ("state") path below can fill them. Defaulting them to 0.0 wrote a hard zero
+    # into metrics.csv for every latent run, which reads as "perfect prediction" to anyone who
+    # finds the column later. Absent keys render as an empty cell via metrics.get(field, "").
     metrics = {
-        "model_obs_mse": 0.0,
-        "model_obs_rmse": 0.0,
-        "model_velocity_mse": 0.0,
         "model_reward_mse": 0.0,
         "model_reward_abs_error": 0.0,
         "model_continue_bce": 0.0,
@@ -695,7 +722,12 @@ def prediction_error_metrics(
         z = model.encode(obs)
         z_next = model.next(z, actions)
         z_target = model.encode(next_obs)
-        latent_error = (z_next - z_target).square().mean()
+        # Compare the LEARNED latent only, matching LatentWorldModel.loss: with the #6a command
+        # skip-connection next() carries the command forward from step t while z_target holds the
+        # command at t+1, so including those columns would charge the dynamics for an exogenous
+        # command change. Slicing is a no-op when the skip-connection is off.
+        _lat = int(getattr(model, "latent_dim", z_next.shape[-1]))
+        latent_error = (z_next[..., :_lat] - z_target[..., :_lat]).square().mean()
         reward_pred = model.reward(z, actions)
         continue_logits = model.continue_logits(z_next)
         metrics["model_latent_consistency_mse"] = float(latent_error.item())
@@ -891,6 +923,10 @@ def main() -> None:
                 simnorm_dim=checkpoint_args.get("simnorm_dim", 8),
                 q_dropout=checkpoint_args.get("q_dropout", 0.01),
                 physical_feature_indices=parse_index_list(checkpoint_args.get("latent_physical_indices", "")),
+                # #6a: inherited from the CHECKPOINT, never a CLI default -- a skip-trained model
+                # built without it mismatches the first Linear of every head. (Same class of bug
+                # as the objective-inheritance asymmetry that silently contaminated Phase A/A2.)
+                command_indices=parse_index_list(checkpoint_args.get("command_skip_indices", "")),
             ).to(device)
         elif model_type == "state":
             model = StateWorldModel(
@@ -1116,6 +1152,19 @@ def main() -> None:
     completed_lengths: list[float] = []
     episode_returns = torch.zeros(obs.shape[0], dtype=torch.float32, device=device)
     episode_lengths = torch.zeros(obs.shape[0], dtype=torch.float32, device=device)
+    # Per-EPISODE records. The sweeper used to time-average velocity over the whole rollout,
+    # which folded post-reset acceleration transients and post-fall ~zero velocity into the
+    # "achieved" number -- so one early fall depressed it twice. Averaging per episode and
+    # then taking the FIRST episode of every env gives one unbiased sample per env.
+    episode_vel_sum = torch.zeros(obs.shape[0], 3, dtype=torch.float32, device=device)
+    # Post-settle accumulator: the locomotion signal, free of the spawn drop.
+    # Tracking must never be averaged over the zero-command hold, so the post-settle window starts
+    # after BOTH the spawn settle and the command hold.
+    _effective_settle = float(max(args_cli.settle_steps, args_cli.command_start_step))
+    episode_vel_sum_post = torch.zeros(obs.shape[0], 3, dtype=torch.float32, device=device)
+    episode_post_counts = torch.zeros(obs.shape[0], dtype=torch.float32, device=device)
+    episode_counts = torch.zeros(obs.shape[0], dtype=torch.long, device=device)
+    episode_records: list[dict] = []
     showcase_groups = build_showcase_groups(obs.shape[0], args_cli.showcase_groups, device) if args_cli.showcase else {}
     showcase_completed_returns: dict[str, list[float]] = {name: [] for name in showcase_groups}
     showcase_completed_lengths: dict[str, list[float]] = {name: [] for name in showcase_groups}
@@ -1166,6 +1215,43 @@ def main() -> None:
     elif command_x is not None:
         print(f"[INFO] Velocity command=({command_x:.3f}, {command_y:.3f}, {command_yaw:.3f})")
 
+    _command_idx = command_slice(obs.shape[-1])
+    _cmd_buf = None
+    if args_cli.command_start_step > 0:
+        if _command_idx is None:
+            raise RuntimeError(f"--command_start_step needs a command slice; obs_dim={obs.shape[-1]}")
+        try:
+            _cmd_buf = env.unwrapped.command_manager.get_command("base_velocity")
+        except Exception as _exc:
+            raise RuntimeError(f"--command_start_step could not reach command_manager: {_exc}")
+        # The override is only exact if obs[command_slice] is an unscaled copy of the command
+        # buffer. Check rather than assume: a scale or noise term would silently make the policy
+        # see a different command than the reward is computed from.
+        _mismatch = float((obs[:, _command_idx] - _cmd_buf[:, :3]).abs().max())
+        if _mismatch > 1e-5:
+            raise RuntimeError(
+                f"obs{_command_idx} does not mirror command_manager('base_velocity') "
+                f"(max|diff|={_mismatch:.3e}); --command_start_step would desync policy and reward."
+            )
+        if args_cli.wander:
+            raise RuntimeError("--command_start_step is for a FIXED test command; --wander resamples.")
+        _test_cmd = torch.tensor(
+            [[command_x or 0.0, command_y or 0.0, command_yaw or 0.0]], dtype=obs.dtype, device=device
+        ).expand(obs.shape[0], 3).contiguous()
+        _zero_cmd = torch.zeros_like(_test_cmd)
+        # Positive gate: an eval that silently never applies its own command must FAIL, not read as
+        # clean. The first version of this code zeroed the command buffer destructively and the test
+        # command never arrived; the run looked perfectly healthy (no falls, tiny tracking error)
+        # because the robot simply stood still. Track what was actually commanded in each phase and
+        # assert the transition really happened.
+        _cmd_absmax_hold = 0.0
+        _cmd_absmax_live = 0.0
+        _steps_hold = 0
+        _steps_live = 0
+        print(f"[INFO] command_start_step={args_cli.command_start_step} per episode; "
+              f"hold=(0,0,0) then ({command_x:.3f},{command_y:.3f},{command_yaw:.3f}) "
+              f"(obs/command buffer in sync, max|diff|={_mismatch:.1e})", flush=True)
+
     steps = 0
     delayed_mismatch_announced = False
     delayed_push_available = True
@@ -1176,6 +1262,33 @@ def main() -> None:
         and (args_cli.video or len(completed_returns) < args_cli.num_episodes)
     ):
         start_time = time.time()
+
+        # Delayed command: zero until each episode has run --command_start_step steps, then the test
+        # command. episode_lengths is the per-env count of steps already taken this episode, so
+        # `< N` covers exactly the first N actions.
+        #
+        # Write the command for EVERY env every step, in both directions. Only zeroing the held envs
+        # is not enough and was wrong: the command manager rewrites its buffer only on a resample
+        # tick, so a zeroed entry stays zero long past the hold window and the test command never
+        # arrives. (Smoke test tell: tracking_y_abs_error stayed ~0.03 after the hung-over hold
+        # instead of jumping to ~0.2, and the robot never strafed.) Writing both branches every step
+        # also makes this independent of whatever the manager did inside env.step().
+        if args_cli.command_start_step > 0 and _command_idx is not None and _cmd_buf is not None:
+            _hold = episode_lengths < float(args_cli.command_start_step)
+            _want = torch.where(_hold.unsqueeze(-1), _zero_cmd, _test_cmd)
+            _cmd_buf[:, :3] = _want
+            obs[:, _command_idx] = _want
+            if bool(_hold.any()):
+                _cmd_absmax_hold = max(_cmd_absmax_hold, float(_want[_hold].abs().max()))
+                _steps_hold += 1
+            if bool((~_hold).any()):
+                _cmd_absmax_live = max(_cmd_absmax_live, float(_want[~_hold].abs().max()))
+                _steps_live += 1
+            if steps % 200 == 0:
+                # The override is only sound while obs mirrors the command buffer the reward reads.
+                _d = float((obs[:, _command_idx] - _cmd_buf[:, :3]).abs().max())
+                if _d > 1e-5:
+                    raise RuntimeError(f"step {steps}: obs/command buffer desync {_d:.3e}")
 
         with torch.no_grad():
             if args_cli.prior_only:
@@ -1222,10 +1335,14 @@ def main() -> None:
         next_obs_raw, rewards, terminated, truncated, _ = env.step(actions)
         next_obs = flatten_obs(next_obs_raw, device)
         rewards = to_tensor(rewards, device).float().view(-1)
-        done = to_tensor(terminated, device).bool().view(-1) | to_tensor(truncated, device).bool().view(-1)
+        terminated_t = to_tensor(terminated, device).bool().view(-1)
+        truncated_t = to_tensor(truncated, device).bool().view(-1)
+        done = terminated_t | truncated_t
         continues = (~done).float().view(-1, 1)
 
         diag_metrics: dict[str, float] = {}
+        if diagnostics is not None and _command_idx is not None:
+            diag_metrics["commanded_abs_max"] = float(obs[:, _command_idx].abs().max().item())
         if diagnostics is not None:
             diag_metrics.update(
                 {
@@ -1299,6 +1416,13 @@ def main() -> None:
 
         episode_returns += rewards
         episode_lengths += 1
+        if obs.ndim == 2 and obs.shape[-1] >= 6:
+            _vel_now = obs[:, [0, 1, 5]]
+            episode_vel_sum += _vel_now
+            # episode_lengths was just incremented, so it is this step's 1-based index.
+            _past_settle = (episode_lengths > _effective_settle).float().unsqueeze(-1)
+            episode_vel_sum_post += _vel_now * _past_settle
+            episode_post_counts += _past_settle.squeeze(-1)
 
         if done.any():
             done_mask = done
@@ -1318,6 +1442,33 @@ def main() -> None:
                         showcase_completed_lengths[group_name].extend(
                             episode_lengths[group_ids][group_done].detach().cpu().tolist()
                         )
+            _ep_len = episode_lengths.detach().cpu()
+            _ep_ret = episode_returns.detach().cpu()
+            _ep_vel = (episode_vel_sum / episode_lengths.clamp_min(1.0).unsqueeze(-1)).detach().cpu()
+            _ep_vel_post = (
+                episode_vel_sum_post / episode_post_counts.clamp_min(1.0).unsqueeze(-1)
+            ).detach().cpu()
+            _ep_post_n = episode_post_counts.detach().cpu()
+            _ep_term = terminated_t.detach().cpu()
+            for _i in torch.nonzero(done_mask, as_tuple=False).view(-1).tolist():
+                episode_records.append({
+                    "env": int(_i),
+                    "ep_index": int(episode_counts[_i].item()),
+                    "length": float(_ep_len[_i]),
+                    "ret": float(_ep_ret[_i]),
+                    "vx": float(_ep_vel[_i, 0]),
+                    "vy": float(_ep_vel[_i, 1]),
+                    "vyaw": float(_ep_vel[_i, 2]),
+                    "n_post": float(_ep_post_n[_i]),
+                    "vx_post": float(_ep_vel_post[_i, 0]),
+                    "vy_post": float(_ep_vel_post[_i, 1]),
+                    "vyaw_post": float(_ep_vel_post[_i, 2]),
+                    "terminated": int(_ep_term[_i]),
+                })
+            episode_counts[done_mask] += 1
+            episode_vel_sum[done_mask] = 0.0
+            episode_vel_sum_post[done_mask] = 0.0
+            episode_post_counts[done_mask] = 0.0
             episode_returns[done_mask] = 0.0
             episode_lengths[done_mask] = 0.0
             if planner is not None:
@@ -1332,6 +1483,76 @@ def main() -> None:
 
         if args_cli.video and steps >= args_cli.video_length:
             break
+
+    if args_cli.command_start_step > 0:
+        _want_live = float(max(abs(command_x or 0.0), abs(command_y or 0.0), abs(command_yaw or 0.0)))
+        print(f"[EVAL] command_gate hold_steps={_steps_hold} live_steps={_steps_live} "
+              f"|cmd|_hold={_cmd_absmax_hold:.4f} |cmd|_live={_cmd_absmax_live:.4f} "
+              f"expected_live={_want_live:.4f}", flush=True)
+        if _steps_hold == 0 or _steps_live == 0:
+            raise RuntimeError(
+                f"--command_start_step={args_cli.command_start_step} never exercised both phases "
+                f"(hold_steps={_steps_hold}, live_steps={_steps_live}); raise --max_steps."
+            )
+        if _cmd_absmax_hold > 1e-6:
+            raise RuntimeError(f"command was not held at zero during the hold "
+                               f"(|cmd|_hold={_cmd_absmax_hold:.3e})")
+        if abs(_cmd_absmax_live - _want_live) > 1e-5:
+            raise RuntimeError(
+                f"test command was never applied after the hold: |cmd|_live="
+                f"{_cmd_absmax_live:.4f}, expected {_want_live:.4f}. The eval would have read as "
+                "clean while commanding nothing."
+            )
+
+    _diag_dir = getattr(args_cli, "diagnostics_dir", None)
+    if episode_records and _diag_dir:
+        os.makedirs(_diag_dir, exist_ok=True)
+        _ep_path = os.path.join(_diag_dir, "episodes.csv")
+        with open(_ep_path, "w", newline="") as _f:
+            _w = csv.DictWriter(_f, fieldnames=[
+                "env", "ep_index", "length", "ret", "vx", "vy", "vyaw",
+                "n_post", "vx_post", "vy_post", "vyaw_post", "terminated",
+            ])
+            _w.writeheader()
+            _w.writerows(episode_records)
+        print(f"[EVAL] wrote {_ep_path} ({len(episode_records)} episodes)")
+    _first: dict[int, dict] = {}
+    for _r in episode_records:
+        _first.setdefault(_r["env"], _r)
+    if _first:
+        _fr = list(_first.values())
+        _n = len(_fr)
+        _settle = _effective_settle
+        _landed = [r for r in _fr if r["length"] >= _settle]
+        _land_fail = sum(1 for r in _fr if r["terminated"] and r["length"] < _settle) / _n
+        print(
+            "[EVAL] first_ep_per_env "
+            f"n={_n} "
+            f"mean_length={sum(r['length'] for r in _fr) / _n:.2f} "
+            f"fall_rate={sum(r['terminated'] for r in _fr) / _n:.4f} "
+            f"vx={sum(r['vx'] for r in _fr) / _n:.4f} "
+            f"vy={sum(r['vy'] for r in _fr) / _n:.4f} "
+            f"vyaw={sum(r['vyaw'] for r in _fr) / _n:.4f}"
+        )
+        # Landing and locomotion are different failures; one number cannot carry both.
+        if _landed:
+            _nl = len(_landed)
+            _post = [r for r in _landed if r["n_post"] > 0]
+            _np = max(len(_post), 1)
+            print(
+                "[EVAL] split "
+                f"settle_steps={_effective_settle:.0f} "
+                f"landing_fail_rate={_land_fail:.4f} "
+                f"landed={_nl}/{_n} "
+                f"fall_rate_post={sum(r['terminated'] for r in _landed) / _nl:.4f} "
+                f"mean_length_post={sum(r['length'] for r in _landed) / _nl:.2f} "
+                f"vx_post={sum(r['vx_post'] for r in _post) / _np:.4f} "
+                f"vy_post={sum(r['vy_post'] for r in _post) / _np:.4f} "
+                f"vyaw_post={sum(r['vyaw_post'] for r in _post) / _np:.4f}"
+            )
+        else:
+            print(f"[EVAL] split settle_steps={_effective_settle:.0f} "
+                  f"landing_fail_rate={_land_fail:.4f} landed=0/{_n} -- NO episode survived landing")
 
     eval_returns = completed_returns[: args_cli.num_episodes]
     eval_lengths = completed_lengths[: args_cli.num_episodes]

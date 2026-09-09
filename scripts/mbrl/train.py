@@ -193,6 +193,18 @@ parser.add_argument(
     default="0,1,5",
     help="Comma-separated observation indices decoded from latent state, defaulting to body vx, vy, yaw rate.",
 )
+parser.add_argument(
+    "--command_skip_indices",
+    type=str,
+    default="",
+    help=(
+        "#6a: route these raw observation indices (the velocity command is 9,10,11) around the "
+        "encoder and straight into the dynamics/reward/Q/policy heads. Empty (default) keeps the "
+        "architecture identical to every existing checkpoint. New weight columns are zero-init and "
+        "a no-skip checkpoint is grafted in column-by-column, so the model starts numerically "
+        "identical -- verify with scripts/mbrl/verify_command_skip.py before launching."
+    ),
+)
 parser.add_argument("--simnorm_dim", type=int, default=8, help="SimNorm group size for latent encoder/dynamics outputs. Set <=1 to disable.")
 parser.add_argument("--hidden_dim", type=int, default=512, help="Model hidden dimension.")
 parser.add_argument("--model_depth", type=int, default=3, help="Number of hidden layers per ensemble member.")
@@ -517,6 +529,7 @@ from ldm_quad.mbrl import (
     StateWorldModel,
     WorldModelLossWeights,
     build_planner,
+    expand_state_dict_for_command_skip,
     load_policy_prior,
 )
 
@@ -1005,7 +1018,21 @@ def load_training_checkpoint(
     print(f"[MBRL] Checkpoint file loaded to CPU in {time.monotonic() - load_start_time:.2f}s", flush=True)
 
     model_load_start_time = time.monotonic()
-    model.load_state_dict(checkpoint["model"])
+    model_state = checkpoint["model"]
+    # #6a: a command-skip model resuming a no-skip checkpoint needs column-aware grafting.
+    # strict=False would NOT work here: the first Linear of every head changed width, so the
+    # shapes mismatch, torch skips the tensor, and the head silently keeps its random init.
+    grafted = False
+    if getattr(model, "command_dim", 0) and "dynamics.0.0.weight" in model_state:
+        ckpt_in = model_state["dynamics.0.0.weight"].shape[-1]
+        live_in = model.dynamics[0][0].weight.shape[-1]
+        if ckpt_in != live_in:
+            print(f"[MBRL] #6a grafting no-skip checkpoint (dynamics in_features {ckpt_in} -> "
+                  f"{live_in}); new command columns are zero so behaviour is unchanged at load",
+                  flush=True)
+            model_state = expand_state_dict_for_command_skip(model_state, model)
+            grafted = True
+    model.load_state_dict(model_state)
     print(f"[MBRL] Model weights restored in {time.monotonic() - model_load_start_time:.2f}s", flush=True)
     if load_optim:
         optim_load_start_time = time.monotonic()
@@ -1015,6 +1042,30 @@ def load_training_checkpoint(
         policy_optimizer_state = checkpoint.get("policy_optimizer")
         if policy_optimizer is not None and policy_optimizer_state is not None:
             policy_optimizer.load_state_dict(policy_optimizer_state)
+        if grafted:
+            # Adam state is per-TENSOR and was saved at the old width. Keeping it is worse than
+            # dropping it: the moments would not even be reshaped (load_state_dict only casts),
+            # so the first step would raise on the shape mismatch. And carrying the old `step`
+            # forward with exp_avg_sq==0 in the new columns makes Adam's first update on those
+            # columns ~1/sqrt(1-beta2) ~ 30x oversized, which would knock them straight off zero
+            # and defeat the point of the zero init. Dropping the entry restarts step=0 for those
+            # tensors so bias correction behaves, at the cost of momentum on ~20 first layers.
+            for _label, _opt in (("model", optimizer), ("policy", policy_optimizer)):
+                if _opt is None:
+                    continue
+                _dropped = 0
+                for _group in _opt.param_groups:
+                    for _p in _group["params"]:
+                        _st = _opt.state.get(_p)
+                        if not _st:
+                            continue
+                        _ea = _st.get("exp_avg")
+                        if _ea is not None and tuple(_ea.shape) != tuple(_p.shape):
+                            _opt.state.pop(_p, None)
+                            _dropped += 1
+                if _dropped:
+                    print(f"[MBRL] #6a reset {_opt.__class__.__name__} state for {_dropped} "
+                          f"widened {_label} tensor(s)", flush=True)
         print(f"[MBRL] Optimizer state restored in {time.monotonic() - optim_load_start_time:.2f}s", flush=True)
     else:
         checkpoint.pop("optimizer", None)
@@ -1225,6 +1276,14 @@ def main() -> None:
         raise ValueError(
             f"--latent_physical_indices must be within observation dim {obs_dim}: {latent_physical_indices}"
         )
+    command_skip_indices = parse_index_list(args_cli.command_skip_indices)
+    if any(index < 0 or index >= obs_dim for index in command_skip_indices):
+        raise ValueError(
+            f"--command_skip_indices must be within observation dim {obs_dim}: {command_skip_indices}"
+        )
+    if command_skip_indices:
+        print(f"[MBRL] #6a command skip-connection ON: obs indices {command_skip_indices} "
+              "feed dynamics/reward/Q/policy directly", flush=True)
     print(f"[MBRL] Building {args_cli.model_type} world model", flush=True)
     if args_cli.model_type == "latent":
         model = LatentWorldModel(
@@ -1245,6 +1304,7 @@ def main() -> None:
             simnorm_dim=args_cli.simnorm_dim,
             q_dropout=args_cli.q_dropout,
             physical_feature_indices=latent_physical_indices,
+            command_indices=command_skip_indices,
             loss_weights=WorldModelLossWeights(
                 consistency=args_cli.consistency_coef,
                 reward=args_cli.reward_coef,
@@ -1332,6 +1392,36 @@ def main() -> None:
                 f"recent_lengths={len(recent_lengths)} recent_step_rewards={len(recent_step_rewards)}",
                 flush=True,
             )
+            # A resumed buffer is laid out by VECTORISED STRIDE: row i+num_envs is the next
+            # transition of the same env (replay.py sample_sequences). Resuming a buffer that was
+            # filled with a different num_envs does not corrupt anything -- the env/episode/step
+            # consistency checks in _valid_sequence_starts reject the mis-strided rows -- but it
+            # silently invalidates EVERY old row as a sequence start. And train_ready is gated on
+            # can_sample_sequences, so the run would then step forever, collecting data and
+            # applying ZERO gradient updates, with no error. Fail here instead.
+            if args_cli.model_type in {"latent", "state"} and len(replay) > 0:
+                _buf_stride = int(getattr(replay, "_last_batch_size", 1))
+                _valid = replay.valid_sequence_count(args_cli.horizon)
+                print(f"[MBRL] replay stride={_buf_stride} num_envs={num_envs} "
+                      f"valid_sequences(horizon={args_cli.horizon})={_valid}", flush=True)
+                if _valid == 0:
+                    raise ValueError(
+                        f"Resumed replay has {len(replay)} rows but ZERO valid horizon-"
+                        f"{args_cli.horizon} sequences. The buffer was filled at stride "
+                        f"{_buf_stride}; this run uses num_envs={num_envs}."
+                        + (
+                            " Those differ, which is the cause: every stored row is an invalid "
+                            "sequence start at the new stride. Either rerun with --num_envs "
+                            f"{_buf_stride}, or start from a cold buffer."
+                            if _buf_stride != num_envs else
+                            " The stride matches, so the buffer itself is inconsistent -- "
+                            "inspect episode_ids/step_ids before proceeding."
+                        )
+                    )
+                if _buf_stride != num_envs:
+                    print(f"[MBRL] WARNING: replay stride {_buf_stride} != num_envs {num_envs}; "
+                          f"only {_valid} sequence start(s) survive out of {len(replay)} rows",
+                          flush=True)
             # RELABEL for a changed flat_orientation weight. The env term is
             # flat_orientation_l2 = sum(projected_gravity_xy^2), scaled by its weight, so a
             # weight change is an exact affine shift of the stored reward given gx,gy. We read
@@ -1722,6 +1812,7 @@ def main() -> None:
     def app_is_running() -> bool:
         return simulation_app is None or simulation_app.is_running()
 
+    not_ready_steps = 0
     while app_is_running() and train_state.env_steps < args_cli.train_steps:
         with torch.inference_mode():
             recent_length_window = recent_lengths[-args_cli.planner_recent_episodes :]
@@ -1880,6 +1971,19 @@ def main() -> None:
             else len(replay) >= args_cli.batch_size
         )
         train_ready = train_ready and train_state.env_steps >= resume_warmup_until
+        # Watchdog: "stepping but never training" is invisible in the console -- step and len100
+        # keep advancing normally -- so bound how long it may persist once the warmup is over.
+        if train_ready:
+            not_ready_steps = 0
+        elif train_state.env_steps >= resume_warmup_until:
+            not_ready_steps += num_envs
+            if not_ready_steps >= 20000:
+                raise ValueError(
+                    f"No gradient updates for {not_ready_steps} env steps past the warmup "
+                    f"(buffer={len(replay)}, valid_sequences="
+                    f"{replay.valid_sequence_count(args_cli.horizon)}, batch_size="
+                    f"{args_cli.batch_size}). Training is not happening; refusing to burn GPU."
+                )
         if train_ready:
             model.train()
             update_count = args_cli.updates_per_step

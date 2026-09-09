@@ -147,6 +147,69 @@ class WorldModelLossWeights:
     physical: float = 0.0
 
 
+def expand_state_dict_for_command_skip(old_sd: dict, model: "LatentWorldModel") -> dict:
+    """Fit a no-skip checkpoint into a command-skip model WITHOUT changing its outputs.
+
+    Widening a head's first Linear shifts the action columns, so a plain
+    load_state_dict(strict=False) is not merely lossy here -- the shapes mismatch, the layer is
+    skipped entirely, and the head silently reverts to random init. Every first layer is
+    therefore rebuilt column-by-column:
+
+        old [z | a]        ->  new [z | cmd | a]
+             ^^^ copied          ^^^   ^^^   ^^^ copied, shifted right by command_dim
+                                       zero-init
+
+    Zeroing the command columns makes the grafted model numerically identical to the original
+    at load time, so an A/B measures what the skip-connection LEARNS rather than the shock of
+    re-initialised weights.
+    """
+    cd = model.command_dim
+    if cd == 0:
+        return dict(old_sd)
+    lat, act = model.latent_dim, model.action_dim
+    new_sd = model.state_dict()
+    # first-layer key -> does its input carry the action after z?
+    specs: dict[str, bool] = {
+        "dynamics.0.0.weight": True,
+        "reward_head.0.weight": True,
+        "continue_head.0.weight": False,
+        "policy_head.0.weight": False,
+        "physical_head.0.weight": False,
+    }
+    for i in range(model.num_q):
+        for prefix in ("q_heads", "target_q_heads", "detach_q_heads"):
+            specs[f"{prefix}.{i}.0.weight"] = True
+
+    out, grafted = {}, []
+    for key, value in old_sd.items():
+        if key in specs and key in new_sd and torch.is_tensor(value) and value.ndim == 2:
+            has_action = specs[key]
+            expected_old = lat + (act if has_action else 0)
+            if value.shape[-1] != expected_old:
+                raise ValueError(
+                    f"{key}: expected old in_features {expected_old}, found {value.shape[-1]}. "
+                    "Refusing to graft -- the column layout is not what this function assumes."
+                )
+            target = new_sd[key]
+            if target.shape[-1] != expected_old + cd:
+                raise ValueError(
+                    f"{key}: new in_features {target.shape[-1]} != {expected_old + cd}."
+                )
+            fresh = torch.zeros_like(target)
+            fresh[:, :lat] = value[:, :lat]
+            if has_action:
+                fresh[:, lat + cd : lat + cd + act] = value[:, lat : lat + act]
+            out[key] = fresh
+            grafted.append(key)
+        else:
+            out[key] = value
+    missing = [k for k in new_sd if k not in out]
+    if missing:
+        raise ValueError(f"checkpoint is missing {len(missing)} key(s), e.g. {missing[:4]}")
+    print(f"[#6a] grafted {len(grafted)} first-layer(s) for command_dim={cd}: {sorted(grafted)}", flush=True)
+    return out
+
+
 class LatentWorldModel(nn.Module):
     """TD-MPC-style decoder-free latent world model for proprioceptive observations."""
 
@@ -173,6 +236,7 @@ class LatentWorldModel(nn.Module):
         log_std_min: float = -10.0,
         log_std_max: float = 2.0,
         physical_feature_indices: list[int] | tuple[int, ...] | None = None,
+        command_indices: list[int] | tuple[int, ...] | None = None,
         loss_weights: WorldModelLossWeights | None = None,
     ):
         super().__init__()
@@ -194,22 +258,40 @@ class LatentWorldModel(nn.Module):
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
         self.physical_feature_indices = tuple(physical_feature_indices or ())
+        # #6a COMMAND SKIP-CONNECTION.
+        # Every head reads only z, and z is a 256-d SimNorm bottleneck of the 48-d obs. If the
+        # command (obs[9:12]) is not preserved faithfully through that bottleneck, the reward
+        # head cannot tell WHICH axis is being commanded and fits an axis-averaged reward --
+        # a concrete mechanism for axis trading living in the world model rather than in pi.
+        # This routes the raw command around the encoder and into every head. Default () keeps
+        # the architecture bit-identical to every existing checkpoint.
+        self.command_indices = tuple(command_indices or ())
+        self.command_dim = len(self.command_indices)
+        if self.command_dim:
+            self.register_buffer(
+                "_command_index_t",
+                torch.as_tensor(self.command_indices, dtype=torch.long),
+                persistent=False,
+            )
+        # Width of what encode()/next() hand to the heads.
+        self.z_dim = latent_dim + self.command_dim
         self.loss_weights = loss_weights or WorldModelLossWeights()
         head_dim = max(num_bins, 1)
         self.q_scale = RunningScale(tau)
 
+        z_dim = self.z_dim
         self.encoder = latent_mlp(obs_dim, hidden_dim, latent_dim, depth, simnorm_dim)
-        self.dynamics = latent_mlp(latent_dim + action_dim, hidden_dim, latent_dim, depth, simnorm_dim)
-        self.reward_head = mlp(latent_dim + action_dim, hidden_dim, head_dim, depth)
-        self.continue_head = mlp(latent_dim, hidden_dim, 1, depth)
-        self.policy_head = mlp(latent_dim, hidden_dim, 2 * action_dim, depth)
+        self.dynamics = latent_mlp(z_dim + action_dim, hidden_dim, latent_dim, depth, simnorm_dim)
+        self.reward_head = mlp(z_dim + action_dim, hidden_dim, head_dim, depth)
+        self.continue_head = mlp(z_dim, hidden_dim, 1, depth)
+        self.policy_head = mlp(z_dim, hidden_dim, 2 * action_dim, depth)
         self.physical_head = (
-            mlp(latent_dim, hidden_dim, len(self.physical_feature_indices), depth)
+            mlp(z_dim, hidden_dim, len(self.physical_feature_indices), depth)
             if self.physical_feature_indices
             else None
         )
         self.q_heads = nn.ModuleList(
-            mlp(latent_dim + action_dim, hidden_dim, head_dim, depth, dropout=q_dropout) for _ in range(num_q)
+            mlp(z_dim + action_dim, hidden_dim, head_dim, depth, dropout=q_dropout) for _ in range(num_q)
         )
         self._zero_init_distribution_heads()
 
@@ -251,10 +333,18 @@ class LatentWorldModel(nn.Module):
 
     def encode(self, obs: torch.Tensor, target: bool = False) -> torch.Tensor:
         encoder = self.target_encoder if target else self.encoder
-        return encoder(obs)
+        z = encoder(obs)
+        if self.command_dim:
+            z = torch.cat([z, obs.index_select(-1, self._command_index_t)], dim=-1)
+        return z
 
     def next(self, z: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        return self.dynamics(torch.cat([z, actions], dim=-1))
+        z_next = self.dynamics(torch.cat([z, actions], dim=-1))
+        if self.command_dim:
+            # The command is exogenous -- the operator sets it, the dynamics do not predict
+            # it -- so carry it forward unchanged instead of asking dynamics to reproduce it.
+            z_next = torch.cat([z_next, z[..., -self.command_dim:]], dim=-1)
+        return z_next
 
     def reward(self, z: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         logits = self.reward_logits(z, actions)
@@ -466,7 +556,13 @@ class LatentWorldModel(nn.Module):
                     return_type="min",
                 )
 
-            consistency_loss = consistency_loss + weight * F.mse_loss(z_next, z_target)
+            # Compare the LEARNED latent only. next() carries the command forward from step t,
+            # while z_target holds the command at t+1; on a command-resample step those differ,
+            # and penalising that would charge the dynamics for an unpredictable exogenous
+            # change. Slicing is a no-op when the skip-connection is off.
+            consistency_loss = consistency_loss + weight * F.mse_loss(
+                z_next[..., : self.latent_dim], z_target[..., : self.latent_dim]
+            )
             reward_loss = reward_loss + weight * soft_ce(reward_logits, reward_t, self.dreg).mean()
             value_target = target_q.unsqueeze(0).expand(q_logits.shape[0], *target_q.shape)
             value_loss = value_loss + weight * soft_ce(q_logits.reshape(-1, q_logits.shape[-1]), value_target.reshape(-1, 1), self.dreg).mean()
