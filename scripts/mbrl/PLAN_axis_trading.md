@@ -324,3 +324,195 @@ the conflation was the bigger one.
 - **Compare each arm to the CONTROL AT MATCHED ENV STEPS**: landing_fail_rate, fall_rate_post, and
   post-settle tracking per axis. There is no single scalar bar because the control's own value moves
   (3% / 56% at 402k; 47% / 30% at 406k).
+
+---
+
+# RULE: never use training-distribution error for model selection or drift detection
+
+Measured 2026-09-08 with `scripts/mbrl/kstep_openloop_error.py` (open-loop k-step rollouts on real
+buffer sequences, 986,355 valid H=8 sequences, n=512, CPU-only):
+
+| | phys RMSE k=1 -> k=8 | reward \|err\| k=1 -> k=8 | behaviour (lateral, from-spawn) |
+|---|---|---|---|
+| 402k (keeper) | 0.0985 -> 0.1247 | 0.0273 -> 0.0339 | 3% landing failure, fall_rate_post 0.00 |
+| 406k (+4k steps) | 0.0836 -> 0.1137 | 0.0216 -> 0.0285 | **47% landing failure, fall_rate_post 0.79** |
+
+**406k is BETTER than the keeper on its own training distribution on both heads, while being
+catastrophically worse in behaviour.** So "watch the model losses" would have shown nothing, and
+on-distribution error cannot rank checkpoints or detect the drift. Model selection and drift
+detection must use OFF-distribution fixed-command evaluation.
+
+## Where the model actually fails: off-distribution, and only in the reward head
+
+Same latent, same erratic rollout, 406k:
+
+| head | on-distribution | under sustained lateral cmd | degradation |
+|---|---|---|---|
+| reward | 0.0216 | 0.1215 | **5.6x** |
+| physical | 0.0836 | 0.1079 | **1.3x** |
+| | | differential | **4.4x** |
+
+Because both heads read the same latent on the same rollout, "erratic behaviour is harder to
+predict" applies equally to both and cannot produce a 4.4x differential. This is the reward-head
+command-handling blind spot, and it is the strongest evidence for #6a.
+
+Do NOT quote a relative-error ratio here (it came out 35x): the env reward under a lateral command
+is 0.0357 against the buffer's 0.2213, so dividing by a 6x-smaller denominator inflates the figure
+and invites the objection that any head looks bad when the true reward is near zero. Quote the
+absolute per-head degradation and the differential.
+
+**The SIGN of the under-command error is NOT measured.** `model_reward_abs_error` is unsigned, so
+|err| 0.1215 against a true 0.0357 is consistent with predicting either +0.157 or -0.084, and the
+buffer's reward range (-0.2818 .. 0.3214) admits both. On-distribution the signed bias is only
+-0.8% to -3.0% of target (slightly PESSIMISTIC), so there is no general optimism to extrapolate.
+The planner ranking stalled states higher favours over-prediction but is confounded by the Q
+bootstrap. Log signed reward error in `play.py` diagnostics before any writeup asserts a direction.
+
+## Horizon integration
+Consecutive-step error correlation ALONG the rollout is ~0.21-0.30 for both heads in both
+checkpoints (gains 2.17-2.35x over H=8 vs 2.83x if independent). There is NO reward-vs-physical
+asymmetry in horizon correlation -- an earlier claim of one came from 5-step-spaced wall-clock
+one-step error, which got the ordering backwards. Open-loop error grows only 24-36% from k=1 to
+k=8, so the model is not diverging over the planning horizon.
+
+---
+
+# E1-E4 RESULTS: from-settled lateral, 64 envs, max_steps 1000, command_start_step 50 (2026-09-09)
+
+All four `objective=off` unless stated, all eight objective flags passed EXPLICITLY (every checkpoint
+bakes in W 0.5 / yaw 8.0 / gate 0.1, so an unspecified flag is inherited).
+
+| run | ckpt | objective | landing_fail | n_landed | fall_rate_post | mean_len_post | post-settle lateral | fails by |
+|---|---|---|---|---|---|---|---|---|
+| E1 | 406k | off | 0.000 | 64 | **0.625** | 673 | 24.2% +- 1.6% | SINKING (base_h term 0.203) |
+| E2 | 406k | lin W0.25 | 0.000 | 64 | **0.750** | 557 | **106.2% +- 0.2%** | ROLL-OVER (orient term 0.312) |
+| E3 | **402k keeper** | off | 0.000 | 64 | **0.000** | 1000 | 56.2% +- 0.5% | nothing fires |
+| E4 | 408k Phase B | off | 0.094 | 58 | 0.034 | 978 | **84.3% +- 0.5%** | spawn settle only |
+| (ref) | 402k keeper | off, FROM-SPAWN | 0.031 | 62 | 0.000 | 1000 | 55.6% +- 0.6% | 2/64 landing |
+
+## What each answers
+
+**E1/E2 -- the explicit velocity objective solves SUSTAIN at zero training.** 24.2% -> 106.2%,
+sustained 94-102% at every 50-step sample across the full 1000 steps, no decay. (The earlier "90%"
+from an 8-env smoke was an ONSET transient and did not survive; this one is a real regime.) It works
+by reading velocity from the physical head, bypassing the reward head.
+BUT it CHANGES THE FAILURE MODE: base_height termination 0.203 -> 0.000, bad_orientation 0.062 ->
+0.312. E1 falls by sinking; E2 falls by rolling over. fall_rate_post 0.625 -> 0.750 is NOT
+significant (p=0.182) but that non-difference hides a complete mechanism change.
+
+**E3 -- the keeper is the only artifact stable in BOTH initiation modes.** 0/64 falls from settled
+with nothing firing at all, 2/64 landing deaths from spawn, ~56% either way. This is why 402k stays
+the keeper.
+
+**E4 -- the deadband model sustains markedly better: 84.3% vs the keeper's 56.2%, +28 points.**
+Its 6 failures are all inside the zero-command hold (length < 50), i.e. it fails to survive the spawn
+settle 9.4% of the time even with NO command; once settled it is near-flawless (2/58 falls, 978 mean
+length, no aggregate terminations). vs keeper: landing 6/64 vs 0/64 is significant (p=0.028);
+fall_rate_post 2/58 vs 0/64 is not (p=0.224).
+
+## LATERAL ONLY -- this cannot pick between 402k and 408k
+
+Taking old-harness numbers as valid where no landing failures occurred (the old metric was exact
+there -- 402k lateral 56.2 old vs 55.6 new, 408k 85.2 old vs 84.3 new, both confirmed):
+
+| | fwd | back | lat | yaw | mean4 | worst |
+|---|---|---|---|---|---|---|
+| 402k keeper | 90.6 | **87.0** | 56.2 | 75.5 | 77.3 | **56.2** |
+| 408k Phase B | 89.6 | **45.9** | 85.2 | 78.2 | 74.7 | 45.9 |
+
+408k wins lateral by 28 points and loses backward by 41. **402k keeps the keeper slot on worst-axis.**
+The decisive missing measurement is BACKWARD on the new harness for both -- that is the axis that
+decides it, not lateral. This is the axis-trading pattern again, now measurable.
+
+## Reward-head blind spot: confirmed on the keeper, cleanest form
+
+| | physical on-dist -> under cmd | reward on-dist -> under cmd |
+|---|---|---|
+| 402k (E3) | 0.0985 -> 0.0943 = **0.96x** | 0.0273 -> 0.1651 = **6.05x** |
+| 406k (E1) | 0.0836 -> 0.1079 = 1.29x | 0.0216 -> 0.1215 = 5.63x |
+
+On the keeper the physical head does not degrade AT ALL under a sustained lateral command while the
+reward head degrades 6x. Same latent, same rollout, so erraticness cannot explain it.
+Reward-head accuracy is DECOUPLED FROM BEHAVIOUR IN BOTH DIRECTIONS: the keeper has the worst reward
+error of the three runs (0.1651) with the best behaviour, and 406k beats the keeper on-distribution
+while behaving far worse. Sign of the under-command error is still unmeasured.
+
+## Lean-magnitude hypothesis: DEAD
+
+| | \|pg_y\| mean | \|pg_y\| sd | orient term | fall_post |
+|---|---|---|---|---|
+| E1 | 0.0824 | 0.0181 | 0.062 | 0.625 |
+| E2 | 0.1091 | 0.0154 | 0.312 | 0.750 |
+| E3 | 0.1316 | 0.0131 | 0.000 | 0.000 |
+| E4 | 0.1362 | 0.0158 | 0.000 | 0.034 |
+
+Lean MAGNITUDE is anti-correlated with falling -- E3/E4 lean the most and fall least. If lean matters
+it is STEADINESS (the sd column runs the other way), which is a hypothesis for its own test, not a
+claim on four points.
+
+## Landing failure has TWO sub-cases. Keep them apart; they have different fixes.
+
+Landing failure is governed by one continuous quantity — how deep the spawn drop goes against the
+hard `minimum_height = 0.20` cut — and it is monotone in the margin:
+
+| | dip @ step10 | margin | landing fail |
+|---|---|---|---|
+| 406k, ZERO command | 0.2498 | 5.0 cm | 0/64 = 0.0% |
+| 402k keeper, lateral | 0.2510 | 5.1 cm | 0/64 = 0.0% |
+| 408k Phase B, lateral | 0.2280 | 2.8 cm | 6/64 = 9.4% |
+| 406k, lateral FROM SPAWN | 0.2162 | 1.6 cm | 30/64 = 46.9% |
+
+But the margin is eaten by two independent causes, and only one of them is fixable at deployment:
+
+**(i) Command-induced deepening.** A lateral command applied during the drop takes ~3.4 cm off the
+margin (406k: 0.2498 with no command -> 0.2162 with lateral 0.3), which is what turns 0% into 47%.
+FIX: the settle gate — withhold the command/objective until the robot has settled (~20 steps). This
+is a real deployment fix and `--command_start_step` already demonstrates it: from-settled,
+landing_fail went to 0.000 for both 406k and 402k.
+
+**(ii) The checkpoint's OWN dip depth at zero command.** 408k dips to 0.2280 with NO command at all
+(6/64 = 9.4%), where 402k and 406k both reach ~0.250 and never fail. There is no command to
+withhold, so **the settle gate does nothing for this**. FIX: artifact selection — landing-at-
+zero-command is its own column per artifact — or a spawn-height change, which would also mask the
+defect and is therefore not preferred.
+
+Do not quote the settle gate as fixing landing generally. It fixes (i) only. An earlier note in this
+doc said a few cm of spawn margin "would erase it for every artifact" — that conflated the two and
+is wrong for (ii).
+
+## Queue (reordered 2026-09-09, all from-settled, 64 envs, ~46 min each)
+1. **BACKWARD axis on 402k and 408k** — promoted above everything else: 408k leads lateral 84.3 vs
+   56.2 but its backward was 45.9 vs the keeper's 87.0 (old harness, valid there — no landing
+   failures in either). If backward really is ~46, 408k cannot be the artifact whatever lateral does,
+   so this one run can moot a whole branch rather than polish it.
+2. 402k + lin W 0.25 — does the objective lift the keeper's 56% without breaking its 0/64 falls?
+   Report E3's termination columns and lean SD (not just the mean) beside it; stability is what is
+   at risk.
+3. 408k + lin W 0.25 — push 84% toward 100% with its stability intact (only if 1 clears it).
+4. A2-406k + lin W 0.25 — orientation penalty -10 as the roll-over lever. NOTE: `model_reward_abs_error`
+   is confounded for A2 (trained at -10, env applies -1.0), so use behavioural columns only.
+5. W 0.10 on 406k — lighter term: sustain with fewer falls?
+6. lin 8 + yaw 8, W 0.25, gate 0.1 — combo commands need both.
+7. Settle-gated objective as a planner/evaluator option — deployment fix for sub-case (i).
+
+Prerequisite code, none GPU-bound: log SIGNED reward error in `play.py` diagnostics (the
+under-command direction is still unmeasured, so no writeup may assert over- or under-prediction);
+one eval at `--diagnostics_interval 1` on the keeper for true lag-1 error correlation.
+
+## Cleanup item (do NOT apply mid-sweep): sweeper's `off` banner is misleading
+
+`OBJECTIVE_FLAGS["off"]` passes only `--planner_velocity_objective_weight 0.0`, so the remaining seven
+objective args INHERIT from the checkpoint and the startup banner prints e.g.
+
+    [INFO] VelObjective weight=0.0 form=exp lin_w=0.0 yaw_w=8.0 yaw_gate=0.1 yaw_deadband=0.0
+
+This is FUNCTIONALLY CORRECT -- `_latent_velocity_objective_reward` returns zeros immediately when
+`planner_velocity_objective_weight <= 0.0`, before lin/yaw weights are read -- so the inherited
+yaw_w=8.0 is inert and the objective really is off. But the banner reads as though the yaw term were
+live, which is exactly how the Phase A contamination looked, and anyone auditing a log later would
+reasonably flag it. Hand-built runs (JOB 1, E1-E4) pass all eight explicitly and print all zeros.
+
+FIX: make `OBJECTIVE_FLAGS["off"]` pass all eight flags zeroed, so off-runs are unambiguous in the
+log as well as in behaviour. Do not apply while a sweep is in flight -- the sweeper spawns play.py
+fresh per eval, so an edit mid-sweep would split the run across two versions and a bug would kill the
+remaining evals.
