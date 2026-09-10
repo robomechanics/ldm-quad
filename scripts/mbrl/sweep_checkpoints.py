@@ -351,7 +351,18 @@ def main() -> None:
     last_swept_step = -1
     while True:
         if explicit:
-            pending = explicit
+            # Honour the resume set here too. Without this, relaunching an interrupted explicit-list
+            # sweep re-runs every checkpoint and appends DUPLICATE rows -- on a 25-eval sweep that is
+            # hours of GPU plus a corrupted CSV. `seen` holds basenames from the CSV's checkpoint
+            # column, so compare basenames.
+            pending = [p for p in explicit if os.path.basename(p) not in seen]
+            _skipped = len(explicit) - len(pending)
+            if _skipped:
+                print(f"[ckpt-sweep] resume: skipping {_skipped} checkpoint(s) already present for "
+                      f"objective={a.objective} mode={mode_name(a.command_start_step)}", flush=True)
+            if not pending:
+                print("[ckpt-sweep] nothing left to sweep", flush=True)
+                break
         else:
             pending = sorted(
                 (f for f in os.listdir(ck_dir) if re.match(r"model_\d+\.pt$", f) and f not in seen),
