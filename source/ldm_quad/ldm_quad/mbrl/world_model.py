@@ -316,7 +316,12 @@ def expand_state_dict_for_command_skip(old_sd: dict, model: "LatentWorldModel") 
             grafted.append(key)
         else:
             out[key] = value
-    missing = [k for k in new_sd if k not in out]
+    # History-context tensors are ADDED, not widened; the context graft
+    # (mbrl/checkpoint.py) validates and initialises them, so they may be absent here.
+    missing = [
+        k for k in new_sd
+        if k not in out and not (k.endswith("context_weight") or k.startswith("history_encoder."))
+    ]
     if missing:
         raise ValueError(f"checkpoint is missing {len(missing)} key(s), e.g. {missing[:4]}")
     print(f"[#6a] grafted {len(grafted)} first-layer(s) for command_dim={cd}: {sorted(grafted)}", flush=True)

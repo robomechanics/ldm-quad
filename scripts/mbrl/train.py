@@ -537,6 +537,11 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
 import ldm_quad.tasks  # noqa: F401
+from ldm_quad.mbrl.checkpoint import (
+    graft_context_free_state_dict,
+    is_context_free_state_dict,
+    remap_optimizer_state_for_added_params,
+)
 from ldm_quad.mbrl.history import RollingHistory
 from ldm_quad.mbrl import (
     DynamicsEnsemble,
@@ -1054,16 +1059,50 @@ def load_training_checkpoint(
                   flush=True)
             model_state = expand_state_dict_for_command_skip(model_state, model)
             grafted = True
-    model.load_state_dict(model_state)
+    # SIT warm start: a history-context model resuming a context-free checkpoint. The context
+    # projections and history encoder are ADDED tensors (zero-init projections, so behaviour
+    # is unchanged at load); every other key must match exactly or this raises.
+    context_graft_keys: list[str] = []
+    if getattr(model, "context_dim", 0) > 0 and is_context_free_state_dict(model_state):
+        ckpt_args = checkpoint.get("args") if isinstance(checkpoint.get("args"), dict) else {}
+        if int(ckpt_args.get("history_context_dim") or 0) > 0:
+            raise ValueError(
+                f"{path}: args say history_context_dim={ckpt_args.get('history_context_dim')} "
+                "but the state_dict has no history/context tensors"
+            )
+        context_graft_keys = graft_context_free_state_dict(model, model_state)
+        print(f"[MBRL] SIT grafted context-free checkpoint into context_dim={model.context_dim} "
+              f"model; {len(context_graft_keys)} new tensor(s) left at init "
+              f"(context projections zero -> outputs unchanged at load)", flush=True)
+    else:
+        model.load_state_dict(model_state)
     print(f"[MBRL] Model weights restored in {time.monotonic() - model_load_start_time:.2f}s", flush=True)
     if load_optim:
         optim_load_start_time = time.monotonic()
         optimizer_state = checkpoint.get("optimizer")
-        if optimizer_state is not None:
-            optimizer.load_state_dict(optimizer_state)
         policy_optimizer_state = checkpoint.get("policy_optimizer")
-        if policy_optimizer is not None and policy_optimizer_state is not None:
-            policy_optimizer.load_state_dict(policy_optimizer_state)
+        if context_graft_keys:
+            # Saved Adam state is keyed by position and lacks the added tensors; remap it so
+            # base weights keep their moments and only the new tensors start at step 0.
+            # Shape-mismatched state from a simultaneous #6a graft is dropped here.
+            params_by_name = dict(model.named_parameters())
+            added = [params_by_name[k] for k in context_graft_keys if k in params_by_name]
+            for _label, _opt, _saved in (
+                ("model", optimizer, optimizer_state),
+                ("policy", policy_optimizer, policy_optimizer_state),
+            ):
+                if _opt is None or _saved is None:
+                    continue
+                _kept, _fresh, _dropped = remap_optimizer_state_for_added_params(
+                    _opt, _saved, added, allow_shape_mismatch=grafted
+                )
+                print(f"[MBRL] SIT {_label} optimizer state remapped: kept={_kept} "
+                      f"fresh(new tensors)={_fresh} dropped(widened)={_dropped}", flush=True)
+        else:
+            if optimizer_state is not None:
+                optimizer.load_state_dict(optimizer_state)
+            if policy_optimizer is not None and policy_optimizer_state is not None:
+                policy_optimizer.load_state_dict(policy_optimizer_state)
         if grafted:
             # Adam state is per-TENSOR and was saved at the old width. Keeping it is worse than
             # dropping it: the moments would not even be reshaped (load_state_dict only casts),
@@ -1780,6 +1819,12 @@ def main() -> None:
             "policy_scaled_entropy": 0.0,
             "policy_q_scale": 1.0,
         }
+        if getattr(model, "history_encoder", None) is not None:
+            # metrics.csv takes its header from the first row and writes later rows in dict order,
+            # so seed the keys in the order training produces them (policy_bc_logmu included).
+            latest_losses.update(
+                {"policy_bc_logmu": 0.0, "history_encoder_grad_norm": 0.0, "context_weight_norm": 0.0}
+            )
     elif args_cli.model_type == "state":
         latest_losses = {
             "loss": 0.0,
@@ -2071,6 +2116,16 @@ def main() -> None:
                     loss, metrics = model.loss(batch)
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                sit_metrics: dict[str, float] = {}
+                if getattr(model, "history_encoder", None) is not None:
+                    # SIT: the context path only learns once the zero-init projections move, so
+                    # watch that gradient actually reaches the history encoder and projections.
+                    with torch.no_grad():
+                        sit_metrics["history_encoder_grad_norm"] = float(torch.norm(torch.stack([
+                            p.grad.norm() for p in model.history_encoder.parameters() if p.grad is not None
+                        ] or [torch.zeros((), device=loss.device)])).item())
+                        _ctx_w = [p for n, p in model.named_parameters() if n.endswith("context_weight") and p.requires_grad]
+                        sit_metrics["context_weight_norm"] = float(torch.norm(torch.stack([p.norm() for p in _ctx_w])).item())
                 model_params = model.model_parameters() if hasattr(model, "model_parameters") else model.parameters()
                 torch.nn.utils.clip_grad_norm_(
                     model_params,
@@ -2098,6 +2153,9 @@ def main() -> None:
                     torch.nn.utils.clip_grad_norm_(model.policy_parameters(), args_cli.grad_clip_norm)
                     policy_optimizer.step()
                     metrics.update(policy_metrics)
+                # Appended LAST: metrics.csv writes each row in dict order against the first
+                # row's header, so these must follow the policy metrics (see latest_losses init).
+                metrics.update(sit_metrics)
                 if hasattr(model, "soft_update_targets"):
                     model.soft_update_targets()
                 latest_losses = metrics

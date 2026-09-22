@@ -31,6 +31,7 @@ def _load(name: str):
 LatentWorldModel = _load("world_model").LatentWorldModel
 ReplayBuffer = _load("replay").ReplayBuffer
 RollingHistory = _load("history").RollingHistory
+_ckpt = _load("checkpoint")
 
 OBS_DIM = 12
 ACTION_DIM = 4
@@ -265,9 +266,7 @@ def _parse_indices(text: str) -> list[int]:
     return [int(i) for i in str(text).split(",") if str(i).strip()]
 
 
-@pytest.mark.skipif(not os.path.exists(BASELINE_CKPT), reason="baseline checkpoint not present")
-def test_warm_start_real_checkpoint():
-    ckpt = torch.load(BASELINE_CKPT, map_location="cpu", weights_only=False)
+def baseline_kwargs(ckpt: dict) -> dict:
     args, sd = ckpt["args"], ckpt["model"]
     obs_dim = sd["encoder.0.0.weight"].shape[1]
     latent_dim = args.get("latent_dim", 128)
@@ -282,6 +281,20 @@ def test_warm_start_real_checkpoint():
         physical_feature_indices=_parse_indices(args.get("latent_physical_indices", "")),
         command_indices=_parse_indices(args.get("command_skip_indices", "")),
     )
+    return kwargs
+
+
+@pytest.fixture(scope="module")
+def baseline_ckpt():
+    if not os.path.exists(BASELINE_CKPT):
+        pytest.skip("baseline checkpoint not present")
+    return torch.load(BASELINE_CKPT, map_location="cpu", weights_only=False)
+
+
+def test_warm_start_real_checkpoint(baseline_ckpt):
+    sd = baseline_ckpt["model"]
+    kwargs = baseline_kwargs(baseline_ckpt)
+    obs_dim, action_dim = kwargs["obs_dim"], kwargs["action_dim"]
     base = LatentWorldModel(**kwargs)
     base.load_state_dict(sd, strict=True)
     base.eval()
@@ -490,3 +503,124 @@ def test_loss_smoke(context_dim):
             assert online[k].grad.abs().sum() > 0, k
     else:
         assert context_weights(model) == {} and model.history_encoder is None
+
+
+# --------------------------------------------------------------------------- train.py graft
+def _train_optimizers(model: LatentWorldModel):
+    """Same param groups as train.py builds for --model_type latent."""
+    optimizer = torch.optim.Adam(
+        [
+            {"params": list(model.encoder_parameters()), "lr": 3e-4},
+            {"params": list(model.non_encoder_model_parameters()), "lr": 3e-4},
+        ],
+        lr=3e-4,
+    )
+    policy_optimizer = torch.optim.Adam(model.policy_parameters(), lr=3e-4, eps=1e-5)
+    return optimizer, policy_optimizer
+
+
+def test_checkpoint_graft_real(baseline_ckpt):
+    sd = baseline_ckpt["model"]
+    kwargs = baseline_kwargs(baseline_ckpt)
+    assert _ckpt.is_context_free_state_dict(sd)
+    base = LatentWorldModel(**kwargs)
+    base.load_state_dict(sd, strict=True)
+    base.eval()
+    model = LatentWorldModel(**kwargs, context_dim=CONTEXT_DIM, history_len=48)
+    new_keys = _ckpt.graft_context_free_state_dict(model, sd)
+    assert set(new_keys) == {k for k in model.state_dict() if _ckpt.is_context_graft_key(k)}
+    assert not _ckpt.is_context_free_state_dict(model.state_dict())
+    model.eval()
+    torch.manual_seed(0)
+    obs = torch.randn(32, kwargs["obs_dim"])
+    a = torch.rand(32, kwargs["action_dim"]) * 2 - 1
+    ref, got = model_outputs(base, obs, a, None), model_outputs(model, obs, a, None)
+    for key in ref:
+        assert torch.equal(got[key], ref[key]), key
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    ["drop_base_key", "extra_key", "has_context_key"],
+)
+def test_checkpoint_graft_rejects_mismatch(baseline_ckpt, corrupt):
+    sd = dict(baseline_ckpt["model"])
+    kwargs = baseline_kwargs(baseline_ckpt)
+    if corrupt == "drop_base_key":
+        sd.pop("reward_head.0.bias")
+    elif corrupt == "extra_key":
+        sd["some_new_head.0.weight"] = torch.zeros(1)
+    else:  # partially context-aware checkpoint: must not be treated as a clean graft
+        sd["policy_head.context_weight"] = torch.zeros(kwargs["hidden_dim"], CONTEXT_DIM)
+    model = LatentWorldModel(**kwargs, context_dim=CONTEXT_DIM, history_len=48)
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    with pytest.raises(ValueError):
+        _ckpt.graft_context_free_state_dict(model, sd)
+    after = model.state_dict()
+    assert all(torch.equal(before[k], after[k]) for k in before), "model mutated by a rejected graft"
+
+
+def test_optimizer_remap_real(baseline_ckpt):
+    kwargs = baseline_kwargs(baseline_ckpt)
+    base = LatentWorldModel(**kwargs)
+    base.load_state_dict(baseline_ckpt["model"])
+    base_opt, base_popt = _train_optimizers(base)
+    base_opt.load_state_dict(baseline_ckpt["optimizer"])
+    base_popt.load_state_dict(baseline_ckpt["policy_optimizer"])
+
+    model = LatentWorldModel(**kwargs, context_dim=CONTEXT_DIM, history_len=48)
+    new_keys = _ckpt.graft_context_free_state_dict(model, baseline_ckpt["model"])
+    opt, popt = _train_optimizers(model)
+    # A plain load is exactly what train.py used to do; it must fail, not misassign.
+    with pytest.raises(ValueError):
+        _train_optimizers(model)[0].load_state_dict(baseline_ckpt["optimizer"])
+
+    named = dict(model.named_parameters())
+    added = [named[k] for k in new_keys if k in named]
+    kept, fresh, dropped = _ckpt.remap_optimizer_state_for_added_params(opt, baseline_ckpt["optimizer"], added)
+    pkept, pfresh, pdropped = _ckpt.remap_optimizer_state_for_added_params(
+        popt, baseline_ckpt["policy_optimizer"], added
+    )
+    assert dropped == pdropped == 0
+    assert kept == len(baseline_ckpt["optimizer"]["state"]) and pkept == len(baseline_ckpt["policy_optimizer"]["state"])
+    assert pfresh == 1  # policy_head.context_weight
+    in_opt = {id(p) for g in opt.param_groups for p in g["params"]}
+    assert fresh == sum(1 for p in added if id(p) in in_opt)  # target/detach copies are not optimised
+    assert fresh == len(list(model.history_encoder.parameters())) + 3 + kwargs["num_q"]  # enc, dyn, reward + q heads
+
+    # Every base tensor carries exactly the moments the context-free optimizer has for it.
+    base_named = dict(base.named_parameters())
+    for o_new, o_base in ((opt, base_opt), (popt, base_popt)):
+        for group in o_new.param_groups:
+            for p in group["params"]:
+                name = next(n for n, q in named.items() if q is p)
+                if name in new_keys:
+                    assert p not in o_new.state or not o_new.state[p]
+                    continue
+                st, st_ref = o_new.state[p], o_base.state[base_named[name]]
+                assert torch.equal(st["exp_avg"], st_ref["exp_avg"]), name
+                assert torch.equal(st["exp_avg_sq"], st_ref["exp_avg_sq"]), name
+    assert [g["lr"] for g in opt.param_groups] == [g["lr"] for g in base_opt.param_groups]
+
+    # Two real updates: context projections move off zero on step 1; the history encoder
+    # only receives gradient once they are nonzero (step 2).
+    model.train()
+    H, B = 3, 16
+    acts, trans = torch.randn(B, 48, kwargs["action_dim"]), torch.randn(B, 48, kwargs["obs_dim"])
+    batch = {
+        "obs": torch.randn(H + 1, B, kwargs["obs_dim"]),
+        "actions": torch.rand(H, B, kwargs["action_dim"]) * 2 - 1,
+        "rewards": torch.randn(H, B, 1),
+        "continues": torch.ones(H, B, 1),
+        "history_actions": acts, "history_transitions": trans,
+        "history_pad_mask": torch.zeros(B, 48, dtype=torch.bool),
+    }
+    hist_grad = []
+    for _ in range(2):
+        opt.zero_grad(set_to_none=True)
+        loss, _, _ = model.loss(batch)
+        loss.backward()
+        hist_grad.append(sum(float(p.grad.abs().sum()) for p in model.history_encoder.parameters() if p.grad is not None))
+        opt.step()
+    assert hist_grad[0] == 0.0 and hist_grad[1] > 0.0, hist_grad
+    assert named["encoder.0.context_weight"].abs().sum() > 0
