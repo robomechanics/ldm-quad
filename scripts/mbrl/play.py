@@ -300,6 +300,7 @@ from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 
 import ldm_quad.tasks  # noqa: F401
+from ldm_quad.mbrl.history import RollingHistory
 from ldm_quad.eval.terrain_mismatch import apply_terrain_mismatch
 from ldm_quad.mbrl import DynamicsEnsemble, LatentWorldModel, ReplayBuffer, StateWorldModel, build_planner, load_policy_prior
 
@@ -701,6 +702,7 @@ def prediction_error_metrics(
     rewards: torch.Tensor,
     next_obs: torch.Tensor,
     continues: torch.Tensor,
+    context: torch.Tensor | None = None,
 ) -> dict[str, float]:
     # model_obs_mse / model_obs_rmse / model_velocity_mse are deliberately ABSENT here, not 0.0.
     # The latent world model is decoder-free, so there is no predicted observation to score; only
@@ -719,16 +721,16 @@ def prediction_error_metrics(
         return metrics
 
     if model_type == "latent":
-        z = model.encode(obs)
-        z_next = model.next(z, actions)
-        z_target = model.encode(next_obs)
+        z = model.encode(obs, context=context)
+        z_next = model.next(z, actions, context=context)
+        z_target = model.encode(next_obs, context=context)
         # Compare the LEARNED latent only, matching LatentWorldModel.loss: with the #6a command
         # skip-connection next() carries the command forward from step t while z_target holds the
         # command at t+1, so including those columns would charge the dynamics for an exogenous
         # command change. Slicing is a no-op when the skip-connection is off.
         _lat = int(getattr(model, "latent_dim", z_next.shape[-1]))
         latent_error = (z_next[..., :_lat] - z_target[..., :_lat]).square().mean()
-        reward_pred = model.reward(z, actions)
+        reward_pred = model.reward(z, actions, context=context)
         continue_logits = model.continue_logits(z_next)
         metrics["model_latent_consistency_mse"] = float(latent_error.item())
         if getattr(model, "physical_head", None) is not None and getattr(model, "physical_feature_indices", None):
@@ -787,7 +789,10 @@ def online_adapt_step(
         if model_type == "latent":
             if not replay.can_sample_sequences(args_cli.adapt_batch_size, horizon):
                 break
-            batch = replay.sample_sequences(args_cli.adapt_batch_size, horizon, device)
+            batch = replay.sample_sequences(
+                args_cli.adapt_batch_size, horizon, device,
+                history_len=int(model.history_len) if getattr(model, "context_dim", 0) > 0 else 0,
+            )
             loss, batch_metrics, _ = model.loss(batch)
         elif model_type == "state" and replay.can_sample_sequences(args_cli.adapt_batch_size, horizon):
             batch = replay.sample_sequences(args_cli.adapt_batch_size, horizon, device)
@@ -927,6 +932,13 @@ def main() -> None:
                 # built without it mismatches the first Linear of every head. (Same class of bug
                 # as the objective-inheritance asymmetry that silently contaminated Phase A/A2.)
                 command_indices=parse_index_list(checkpoint_args.get("command_skip_indices", "")),
+                context_dim=checkpoint_args.get("history_context_dim", 0),
+                history_len=checkpoint_args.get("history_len", 48),
+                history_d_model=checkpoint_args.get("history_d_model", 64),
+                history_nhead=checkpoint_args.get("history_nhead", 4),
+                history_layers=checkpoint_args.get("history_layers", 1),
+                history_ff=checkpoint_args.get("history_ff", 256),
+                history_dropout=checkpoint_args.get("history_dropout", 0.1),
             ).to(device)
         elif model_type == "state":
             model = StateWorldModel(
@@ -1142,6 +1154,10 @@ def main() -> None:
     adapt_optimizer = build_adapt_optimizer(model)
     adapt_horizon = int(args_cli.adapt_horizon or checkpoint_args.get("horizon", 1))
     adapt_gradient_updates = 0
+    history = (
+        RollingHistory(obs.shape[0], model.history_len, action_dim, obs.shape[-1], device)
+        if model is not None and getattr(model, "context_dim", 0) > 0 else None
+    )
 
     try:
         dt = env.step_dt
@@ -1291,14 +1307,18 @@ def main() -> None:
                     raise RuntimeError(f"step {steps}: obs/command buffer desync {_d:.3e}")
 
         with torch.no_grad():
+            history_context = history.context(model) if history is not None else None
             if args_cli.prior_only:
                 if action_prior is None:
                     raise RuntimeError("--prior_only requires a prior checkpoint in the MBRL checkpoint or --prior_checkpoint.")
                 actions = action_prior(obs)
             elif args_cli.policy_only:
-                actions = planner.policy_action(obs)
+                actions = planner.policy_action(obs, context=history_context) if history is not None else planner.policy_action(obs)
             else:
-                actions = planner.plan(obs, eval_mode=True, t0=steps == 0)
+                actions = (
+                    planner.plan(obs, eval_mode=True, t0=steps == 0, context=history_context)
+                    if history is not None else planner.plan(obs, eval_mode=True, t0=steps == 0)
+                )
             if args_cli.showcase:
                 actions = apply_showcase_action_mismatches(actions, showcase_groups)
                 if showcase_push_available:
@@ -1384,7 +1404,7 @@ def main() -> None:
             except Exception:
                 pass
             diag_metrics.update(tracking_metrics(obs))
-            diag_metrics.update(prediction_error_metrics(model, model_type, obs, actions, rewards, next_obs, continues))
+            diag_metrics.update(prediction_error_metrics(model, model_type, obs, actions, rewards, next_obs, continues, context=history_context))
             if planner is not None:
                 diag_metrics.update({name: float(value) for name, value in planner.last_diagnostics.items()})
 
@@ -1407,6 +1427,8 @@ def main() -> None:
             horizon=adapt_horizon,
         )
         adapt_gradient_updates += updates
+        if history is not None:
+            history.append(actions, next_obs - obs, done)
 
         if diagnostics is not None and (steps % max(1, args_cli.diagnostics_interval) == 0):
             diag_metrics.update(adapt_metrics)

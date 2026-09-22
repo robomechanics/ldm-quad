@@ -537,6 +537,7 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
 import ldm_quad.tasks  # noqa: F401
+from ldm_quad.mbrl.history import RollingHistory
 from ldm_quad.mbrl import (
     DynamicsEnsemble,
     LatentWorldModel,
@@ -821,41 +822,6 @@ def model_policy_actions(
     if torch.isfinite(action_low).all() and torch.isfinite(action_high).all():
         actions = clip_actions(actions, action_low, action_high)
     return actions
-
-
-class RollingHistory:
-    """Per-env ring buffer of recent (action, obs-transition) tokens for the history encoder.
-
-    Fed one vectorized step at a time during rollout/eval, cleared per-env on episode
-    reset. Provides the ``(actions, transitions, pad_mask)`` window the history encoder
-    consumes. Order within the window does not matter (the encoder is permutation
-    invariant and mean-pools valid steps).
-    """
-
-    def __init__(self, num_envs: int, history_len: int, action_dim: int, obs_dim: int, device: torch.device):
-        self.history_len = history_len
-        self.actions = torch.zeros((num_envs, history_len, action_dim), device=device)
-        self.transitions = torch.zeros((num_envs, history_len, obs_dim), device=device)
-        self.valid = torch.zeros((num_envs, history_len), dtype=torch.bool, device=device)
-        self.ptr = 0
-
-    def clear(self) -> None:
-        self.valid.zero_()
-        self.ptr = 0
-
-    def append(self, actions: torch.Tensor, transitions: torch.Tensor, done: torch.Tensor | None = None) -> None:
-        self.actions[:, self.ptr] = actions.detach()
-        self.transitions[:, self.ptr] = transitions.detach()
-        self.valid[:, self.ptr] = True
-        self.ptr = (self.ptr + 1) % self.history_len
-        if done is not None and done.any():
-            # A finished episode starts fresh; drop its (now cross-boundary) history.
-            self.valid[done.view(-1)] = False
-
-    def context(self, model: torch.nn.Module) -> torch.Tensor | None:
-        if not hasattr(model, "encode_context"):
-            return None
-        return model.encode_context(self.actions, self.transitions, ~self.valid)
 
 
 def infer_episode_horizon_steps(env: gym.Env, env_cfg: object) -> float:
@@ -1204,7 +1170,10 @@ def run_heldout_eval(
                 flush=True,
             )
         eval_context = eval_history.context(model) if eval_history is not None and model is not None else None
-        actions = planner.plan(obs, eval_mode=True, t0=steps == 0, context=eval_context)
+        actions = (
+            planner.plan(obs, eval_mode=True, t0=steps == 0, context=eval_context)
+            if eval_history is not None else planner.plan(obs, eval_mode=True, t0=steps == 0)
+        )
         next_obs_raw, rewards, terminated, truncated, _ = env.step(actions)
         next_obs = flatten_obs(next_obs_raw, device)
         rewards = to_tensor(rewards, device).float().view(-1)
