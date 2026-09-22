@@ -282,7 +282,8 @@ class ReplayBuffer:
         When ``history_len > 0`` the batch also carries the ``history_len`` transitions
         that immediately precede each sampled start (same env and episode), for the
         system-id history encoder. History steps that fall before the episode start or
-        outside the filled buffer are zeroed and flagged via ``history_pad_mask``.
+        outside the filled buffer are flagged via ``history_pad_mask`` (masked, not zeroed:
+        their slots hold unrelated rows, so always pass the mask to the encoder).
         """
 
         stride = max(int(self._last_batch_size), 1)
@@ -322,7 +323,7 @@ class ReplayBuffer:
         for steps that are not a valid same-env/same-episode predecessor.
         """
         # Relative step offsets [-history_len, ..., -1] (chronological, most recent last).
-        rel = torch.arange(history_len) - history_len
+        rel = torch.arange(history_len, device=start_t.device) - history_len
         hist_idx = (start_t.unsqueeze(1) + rel.unsqueeze(0) * stride) % self.capacity
 
         transitions = (self.next_obs[hist_idx] - self.obs[hist_idx]).to(device)
