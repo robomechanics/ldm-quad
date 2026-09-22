@@ -39,7 +39,11 @@ HISTORY_LEN = 8
 BATCH = 6
 
 
-def make_model(context_dim: int = CONTEXT_DIM, seed: int = 0) -> LatentWorldModel:
+def context_weights(model: LatentWorldModel) -> dict[str, torch.Tensor]:
+    return {k: v for k, v in model.named_parameters() if k.endswith("context_weight")}
+
+
+def make_model(context_dim: int = CONTEXT_DIM, seed: int = 0, randomize: bool = True) -> LatentWorldModel:
     torch.manual_seed(seed)
     model = LatentWorldModel(
         obs_dim=OBS_DIM,
@@ -55,16 +59,20 @@ def make_model(context_dim: int = CONTEXT_DIM, seed: int = 0) -> LatentWorldMode
         history_nhead=4,
         history_ff=64,
     )
-    # Reward/Q final layers are zero-initialised (TD-MPC2), which would make their
-    # outputs trivially context-independent. Randomise them so the tests measure wiring.
-    for head in [model.reward_head, *model.q_heads]:
-        final = [m for m in head if isinstance(m, nn.Linear)][-1]
-        nn.init.normal_(final.weight, std=0.1)
-        nn.init.normal_(final.bias, std=0.1)
-    # A nonzero null context so "equals null()" is a real check, not 0 == 0.
-    if model.history_encoder is not None:
+    if randomize:
         with torch.no_grad():
-            model.history_encoder.null_context.normal_()
+            # Reward/Q final layers and the context projections are zero-initialised, which
+            # would make outputs trivially context-independent. Randomise them so the
+            # sensitivity tests measure wiring, not initialisation.
+            for head in [model.reward_head, *model.q_heads]:
+                final = [m for m in head if isinstance(m, nn.Linear)][-1]
+                nn.init.normal_(final.weight, std=0.1)
+                nn.init.normal_(final.bias, std=0.1)
+            for w in context_weights(model).values():
+                nn.init.normal_(w, std=0.5)
+            # A nonzero null context so "equals null()" is a real check, not 0 == 0.
+            if model.history_encoder is not None:
+                model.history_encoder.null_context.normal_()
     model.eval()  # dropout off -> deterministic
     return model
 
@@ -170,32 +178,130 @@ def test_prediction_sensitivity():
 
 
 # --------------------------------------------------------------------------- 3
-@pytest.mark.xfail(
-    strict=True,
-    raises=RuntimeError,
-    reason=(
-        "Context is concatenated into the first Linear of every conditioned MLP, so the input "
-        "width changes and a context-free checkpoint cannot be loaded. Planned fix: a "
-        "zero-initialised additive context projection into each first layer (not implemented)."
-    ),
-)
+# One first layer per conditioned MLP; the target/detach copies carry their own.
+NEW_CONTEXT_KEYS = {
+    "encoder.0.context_weight",
+    "target_encoder.0.context_weight",
+    "dynamics.0.context_weight",
+    "reward_head.context_weight",
+    "policy_head.context_weight",
+    *(f"{p}.{i}.context_weight" for p in ("q_heads", "target_q_heads", "detach_q_heads") for i in range(2)),
+}
+
+
+def warm_start(base_sd: dict, **kwargs) -> LatentWorldModel:
+    model = LatentWorldModel(**kwargs)
+    missing, unexpected = model.load_state_dict(base_sd, strict=False)
+    assert unexpected == []
+    new = {k for k in missing if not k.startswith("history_encoder.")}
+    assert new == {k for k in model.state_dict() if k.endswith("context_weight")}, new
+    model.sync_detached_qs()
+    return model.eval()
+
+
+def model_outputs(model: LatentWorldModel, obs, a, context):
+    with torch.no_grad():
+        z = model.encode(obs, context=context)
+        return {
+            "encode": z,
+            "encode_target": model.encode(obs, context=context, target=True),
+            "next": model.next(z, a, context=context),
+            "reward_logits": model.reward_logits(z, a, context=context),
+            "Q_logits": model.Q_logits(z, a, context=context),
+            "Q_logits_target": model.Q_logits(z, a, target=True, context=context),
+            "policy_mean": model._policy_stats(z, context=context)[0],
+        }
+
+
 def test_warm_start_equivalence():
-    base = make_model(context_dim=0, seed=0)
-    ctx_model = make_model(context_dim=CONTEXT_DIM, seed=1)
-    missing, unexpected = ctx_model.load_state_dict(base.state_dict(), strict=False)
-    assert not unexpected
-    assert all(k.startswith("history_encoder.") for k in missing), missing
-    ctx_model.eval()
+    base = make_model(context_dim=0, seed=0, randomize=True)
+    ctx_model = warm_start(
+        base.state_dict(),
+        obs_dim=OBS_DIM, action_dim=ACTION_DIM, latent_dim=32, hidden_dim=64, depth=2, num_bins=21,
+        simnorm_dim=8, context_dim=CONTEXT_DIM, history_len=HISTORY_LEN,
+        history_d_model=32, history_nhead=4, history_ff=64,
+    )
+    assert {k for k in context_weights(ctx_model)} | {
+        k for k in ctx_model.state_dict() if "target_" in k and k.endswith("context_weight")
+    } >= {k for k in NEW_CONTEXT_KEYS if not k.startswith(("target_", "detach_"))}
+    assert set(ctx_model.state_dict()) - set(base.state_dict()) - {
+        k for k in ctx_model.state_dict() if k.startswith("history_encoder.")
+    } == NEW_CONTEXT_KEYS
 
     obs = torch.randn(BATCH, OBS_DIM)
     a = torch.randn(BATCH, ACTION_DIM).clamp(-1, 1)
+    ref = model_outputs(base, obs, a, None)
+    acts, trans = random_history()
     with torch.no_grad():
-        null = ctx_model.history_encoder.null().expand(BATCH, -1)
-        z_base = base.encode(obs)
-        z_ctx = ctx_model.encode(obs, context=null)
-        assert torch.allclose(z_base, z_ctx)
-        assert torch.allclose(base.next(z_base, a), ctx_model.next(z_ctx, a, context=null))
-        assert torch.allclose(base.reward(z_base, a), ctx_model.reward(z_ctx, a, context=null))
+        inferred = ctx_model.encode_context(acts, trans)
+    contexts = {
+        "none(null)": None,
+        "random": torch.nn.functional.normalize(torch.randn(BATCH, CONTEXT_DIM), dim=-1),
+        "inferred": inferred,
+    }
+    for name, ctx in contexts.items():
+        got = model_outputs(ctx_model, obs, a, ctx)
+        for key in ref:
+            assert torch.equal(got[key], ref[key]), f"{key} differs from the context-free model under {name} context"
+
+    # The projection is actually wired in: a nonzero weight must change the outputs.
+    ctx = contexts["random"]
+    for param_name in ["encoder.0.context_weight", "dynamics.0.context_weight", "reward_head.context_weight",
+                       "q_heads.0.context_weight", "policy_head.context_weight"]:
+        w = dict(ctx_model.named_parameters())[param_name]
+        with torch.no_grad():
+            w.normal_()
+        got = model_outputs(ctx_model, obs, a, ctx)
+        with torch.no_grad():
+            w.zero_()
+        changed = [k for k in ref if not torch.equal(got[k], ref[k])]
+        assert changed, f"{param_name} is not wired into any output"
+
+
+BASELINE_CKPT = os.path.join(ROOT, "logs", "mbrl", "best_walker", "stageL_omni_326k.pt")
+
+
+def _parse_indices(text: str) -> list[int]:
+    return [int(i) for i in str(text).split(",") if str(i).strip()]
+
+
+@pytest.mark.skipif(not os.path.exists(BASELINE_CKPT), reason="baseline checkpoint not present")
+def test_warm_start_real_checkpoint():
+    ckpt = torch.load(BASELINE_CKPT, map_location="cpu", weights_only=False)
+    args, sd = ckpt["args"], ckpt["model"]
+    obs_dim = sd["encoder.0.0.weight"].shape[1]
+    latent_dim = args.get("latent_dim", 128)
+    action_dim = sd["q_heads.0.0.weight"].shape[1] - latent_dim
+    # Mirrors play.py's reconstruction from checkpoint["args"].
+    kwargs = dict(
+        obs_dim=obs_dim, action_dim=action_dim, latent_dim=latent_dim, hidden_dim=args["hidden_dim"],
+        depth=args["model_depth"], num_q=args.get("num_q", 5), discount=args["discount"],
+        tau=args.get("target_tau", 0.01), rho=args.get("rho", 0.5), entropy_coef=args.get("entropy_coef", 1e-4),
+        num_bins=args.get("num_bins", 101), vmin=args.get("vmin", -10.0), vmax=args.get("vmax", 10.0),
+        simnorm_dim=args.get("simnorm_dim", 8), q_dropout=args.get("q_dropout", 0.01),
+        physical_feature_indices=_parse_indices(args.get("latent_physical_indices", "")),
+        command_indices=_parse_indices(args.get("command_skip_indices", "")),
+    )
+    base = LatentWorldModel(**kwargs)
+    base.load_state_dict(sd, strict=True)
+    base.eval()
+    ctx_model = warm_start(sd, **kwargs, context_dim=CONTEXT_DIM, history_len=48)
+    # enc, dyn, reward, policy, target_enc + q/target_q/detach_q per head
+    assert len(context_weights(ctx_model)) == 5 + 3 * kwargs["num_q"]
+    assert len(list(ctx_model.policy_parameters())) == len(list(base.policy_parameters())) + 1
+
+    torch.manual_seed(0)
+    obs = torch.randn(64, obs_dim)
+    a = torch.rand(64, action_dim) * 2 - 1
+    ref = model_outputs(base, obs, a, None)
+    for ctx in (None, torch.nn.functional.normalize(torch.randn(64, CONTEXT_DIM), dim=-1)):
+        got = model_outputs(ctx_model, obs, a, ctx)
+        for key in ref:
+            assert torch.equal(got[key], ref[key]), key
+        with torch.no_grad():
+            z = ctx_model.encode(obs, context=ctx)
+            assert torch.equal(ctx_model.physical_features(z), base.physical_features(ref["encode"]))
+            assert torch.equal(ctx_model.continue_logits(z), base.continue_logits(ref["encode"]))
 
 
 # --------------------------------------------------------------------------- 4
@@ -345,3 +451,42 @@ def test_loss_then_policy_loss_end_to_end():
     torch.manual_seed(0)
     pl_explicit, _ = model.policy_loss(rollout_zs, context=cached)
     assert torch.allclose(pl_cached, pl_explicit), "policy_loss did not use the context cached by loss()"
+
+
+@pytest.mark.parametrize("context_dim", [CONTEXT_DIM, 0])
+def test_loss_smoke(context_dim):
+    """loss() + policy_loss() on a fake [H+1, B, dim] batch, with and without history."""
+    model = make_model(context_dim=context_dim, randomize=False)
+    model.train()
+    H, B = 3, 16
+    batch = {
+        "obs": torch.randn(H + 1, B, OBS_DIM),
+        "actions": torch.rand(H, B, ACTION_DIM) * 2 - 1,
+        "rewards": torch.randn(H, B, 1),
+        "continues": torch.ones(H, B, 1),
+    }
+    if context_dim:
+        acts, trans = random_history(batch=B)
+        batch |= {"history_actions": acts, "history_transitions": trans,
+                  "history_pad_mask": torch.rand(B, HISTORY_LEN) < 0.3}
+    loss, metrics, zs = model.loss(batch)
+    assert torch.isfinite(loss)
+    loss.backward()
+    pl, _ = model.policy_loss(zs)
+    assert torch.isfinite(pl)
+    pl.backward()
+    if context_dim:
+        params = dict(model.named_parameters())
+        online = {k: v for k, v in context_weights(model).items() if not k.startswith(("target_", "detach_"))}
+        assert all(v.requires_grad and v.grad is not None for v in online.values())
+        assert not any(v.requires_grad for k, v in context_weights(model).items() if k not in online)
+        # Zero-init projections still get a gradient (dL/dh @ context), so they can learn.
+        # Reward/Q heads are the exception at a FRESH init: their final layer is zero, so
+        # dL/dh is zero for the whole first layer, base weights included.
+        for k, v in online.items():
+            base_first = params[k.replace("context_weight", "0.weight")]
+            assert (v.grad.abs().sum() > 0) == (base_first.grad.abs().sum() > 0), k
+        for k in ("encoder.0.context_weight", "dynamics.0.context_weight", "policy_head.context_weight"):
+            assert online[k].grad.abs().sum() > 0, k
+    else:
+        assert context_weights(model) == {} and model.history_encoder is None

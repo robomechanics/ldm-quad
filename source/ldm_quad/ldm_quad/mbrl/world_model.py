@@ -19,7 +19,43 @@ class DistributionalRegressionCfg:
         return (self.vmax - self.vmin) / max(self.num_bins - 1, 1)
 
 
-def mlp(input_dim: int, hidden_dim: int, output_dim: int, depth: int, dropout: float = 0.0) -> nn.Sequential:
+class ContextSequential(nn.Sequential):
+    """``nn.Sequential`` whose first Linear also takes an additive context term.
+
+    ``first(x) + context @ context_weight.T`` is formed before the first LayerNorm /
+    activation. ``context_weight`` is zero-initialised, so a freshly built context model
+    is bit-identical to the context-free one for ANY context, and a context-free
+    checkpoint loads with unchanged key names (only ``*.context_weight`` is new).
+    It is a Parameter rather than a child module so indexing/iterating the Sequential
+    (e.g. "last Linear" lookups) still sees only the original layers. When the first
+    child is itself a ContextSequential (latent_mlp) the context is forwarded to it.
+    """
+
+    def __init__(self, *layers: nn.Module, context_dim: int = 0):
+        super().__init__(*layers)
+        first = self[0]
+        if context_dim > 0 and not isinstance(first, ContextSequential):
+            self.context_weight = nn.Parameter(torch.zeros(first.out_features, context_dim))
+        else:
+            self.register_parameter("context_weight", None)
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
+        layers = iter(self)
+        first = next(layers)
+        if isinstance(first, ContextSequential):
+            h = first(x, context)
+        else:
+            h = first(x)
+            if self.context_weight is not None and context is not None:
+                h = h + F.linear(context, self.context_weight)
+        for layer in layers:
+            h = layer(h)
+        return h
+
+
+def mlp(
+    input_dim: int, hidden_dim: int, output_dim: int, depth: int, dropout: float = 0.0, context_dim: int = 0
+) -> nn.Sequential:
     layers: list[nn.Module] = []
     dim = input_dim
     for _ in range(depth):
@@ -30,7 +66,7 @@ def mlp(input_dim: int, hidden_dim: int, output_dim: int, depth: int, dropout: f
             layers.append(nn.Dropout(dropout))
         dim = hidden_dim
     layers.append(nn.Linear(dim, output_dim))
-    return nn.Sequential(*layers)
+    return ContextSequential(*layers, context_dim=context_dim)
 
 
 class SimNorm(nn.Module):
@@ -51,11 +87,13 @@ class SimNorm(nn.Module):
         return x.view(*shape)
 
 
-def latent_mlp(input_dim: int, hidden_dim: int, latent_dim: int, depth: int, simnorm_dim: int) -> nn.Sequential:
-    layers: list[nn.Module] = [mlp(input_dim, hidden_dim, latent_dim, depth)]
+def latent_mlp(
+    input_dim: int, hidden_dim: int, latent_dim: int, depth: int, simnorm_dim: int, context_dim: int = 0
+) -> nn.Sequential:
+    layers: list[nn.Module] = [mlp(input_dim, hidden_dim, latent_dim, depth, context_dim=context_dim)]
     if simnorm_dim > 1:
         layers.append(SimNorm(simnorm_dim))
-    return nn.Sequential(*layers)
+    return ContextSequential(*layers)
 
 
 def symlog(x: torch.Tensor) -> torch.Tensor:
@@ -380,23 +418,27 @@ class LatentWorldModel(nn.Module):
             if self.context_dim > 0
             else None
         )
-        # The system-id context is concatenated to every conditioned component, mirroring
-        # TD-MPC2's learnable task embedding e = h(s,e), d(z,a,e), R(z,a,e), Q(z,a,e), p(z,e).
+        # The system-id context conditions every component TD-MPC2 conditions on its task
+        # embedding e: h(s,e), d(z,a,e), R(z,a,e), Q(z,a,e), p(z,e). It is ADDED at each first
+        # layer through a zero-initialised projection (ContextSequential) rather than
+        # concatenated, so base-MLP shapes and key names match a context-free checkpoint and
+        # a warm-started model reproduces it exactly until the projections learn.
         # continue/physical heads read the (already context-aware) latent directly.
         ctx = self.context_dim
         z_dim = self.z_dim
-        self.encoder = latent_mlp(obs_dim + ctx, hidden_dim, latent_dim, depth, simnorm_dim)
-        self.dynamics = latent_mlp(z_dim + action_dim + ctx, hidden_dim, latent_dim, depth, simnorm_dim)
-        self.reward_head = mlp(z_dim + action_dim + ctx, hidden_dim, head_dim, depth)
+        self.encoder = latent_mlp(obs_dim, hidden_dim, latent_dim, depth, simnorm_dim, context_dim=ctx)
+        self.dynamics = latent_mlp(z_dim + action_dim, hidden_dim, latent_dim, depth, simnorm_dim, context_dim=ctx)
+        self.reward_head = mlp(z_dim + action_dim, hidden_dim, head_dim, depth, context_dim=ctx)
         self.continue_head = mlp(z_dim, hidden_dim, 1, depth)
-        self.policy_head = mlp(z_dim + ctx, hidden_dim, 2 * action_dim, depth)
+        self.policy_head = mlp(z_dim, hidden_dim, 2 * action_dim, depth, context_dim=ctx)
         self.physical_head = (
             mlp(z_dim, hidden_dim, len(self.physical_feature_indices), depth)
             if self.physical_feature_indices
             else None
         )
         self.q_heads = nn.ModuleList(
-            mlp(z_dim + action_dim + ctx, hidden_dim, head_dim, depth, dropout=q_dropout) for _ in range(num_q)
+            mlp(z_dim + action_dim, hidden_dim, head_dim, depth, dropout=q_dropout, context_dim=ctx)
+            for _ in range(num_q)
         )
         self._zero_init_distribution_heads()
 
@@ -436,24 +478,25 @@ class LatentWorldModel(nn.Module):
         for detach_param, param in zip(self.detach_q_heads.parameters(), self.q_heads.parameters(), strict=True):
             detach_param.copy_(param)
 
-    def _apply_context(self, x: torch.Tensor, context: torch.Tensor | None) -> torch.Tensor:
-        """Concatenate the system-id context onto a component input.
+    def _resolve_context(self, x: torch.Tensor, context: torch.Tensor | None) -> torch.Tensor | None:
+        """System-id context for a component whose input is ``x``.
 
-        No-op when the history encoder is disabled. When ``context`` is ``None`` the
+        ``None`` when the history encoder is disabled. When ``context`` is ``None`` the
         learned (normalized) null context is broadcast over ``x``'s leading dims;
         otherwise ``context`` must already match those leading dims (callers that
-        expand the latent per candidate expand the context the same way)."""
+        expand the latent per candidate expand the context the same way). The context
+        enters each conditioned MLP additively at its first layer (ContextSequential)."""
         if self.context_dim == 0:
-            return x
+            return None
         if context is None:
             assert self.history_encoder is not None
             null = self.history_encoder.null().to(dtype=x.dtype, device=x.device)
             context = null.expand(*x.shape[:-1], self.context_dim)
-        return torch.cat([x, context], dim=-1)
+        return context
 
     def encode(self, obs: torch.Tensor, context: torch.Tensor | None = None, target: bool = False) -> torch.Tensor:
         encoder = self.target_encoder if target else self.encoder
-        z = encoder(self._apply_context(obs, context))
+        z = encoder(obs, self._resolve_context(obs, context))
         if self.command_dim:
             z = torch.cat([z, obs.index_select(-1, self._command_index_t)], dim=-1)
         return z
@@ -472,7 +515,8 @@ class LatentWorldModel(nn.Module):
         return self.history_encoder(history_actions, history_transitions, history_pad_mask)
 
     def next(self, z: torch.Tensor, actions: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
-        z_next = self.dynamics(self._apply_context(torch.cat([z, actions], dim=-1), context))
+        inputs = torch.cat([z, actions], dim=-1)
+        z_next = self.dynamics(inputs, self._resolve_context(inputs, context))
         if self.command_dim:
             # The command is exogenous; keep it fixed during a model rollout.
             z_next = torch.cat([z_next, z[..., -self.command_dim:]], dim=-1)
@@ -483,7 +527,8 @@ class LatentWorldModel(nn.Module):
         return two_hot_inv(logits, self.dreg)
 
     def reward_logits(self, z: torch.Tensor, actions: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
-        return self.reward_head(self._apply_context(torch.cat([z, actions], dim=-1), context))
+        inputs = torch.cat([z, actions], dim=-1)
+        return self.reward_head(inputs, self._resolve_context(inputs, context))
 
     def continue_logits(self, z: torch.Tensor) -> torch.Tensor:
         return self.continue_head(z)
@@ -494,7 +539,7 @@ class LatentWorldModel(nn.Module):
         return self.physical_head(z)
 
     def _policy_stats(self, z: torch.Tensor, context: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-        mean, log_std = self.policy_head(self._apply_context(z, context)).chunk(2, dim=-1)
+        mean, log_std = self.policy_head(z, self._resolve_context(z, context)).chunk(2, dim=-1)
         log_std = torch.tanh(log_std)
         log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (log_std + 1.0)
         return mean, log_std
@@ -566,8 +611,9 @@ class LatentWorldModel(nn.Module):
             heads = self.detach_q_heads
         else:
             heads = self.q_heads
-        inputs = self._apply_context(torch.cat([z, actions], dim=-1), context)
-        return torch.stack([head(inputs) for head in heads], dim=0)
+        inputs = torch.cat([z, actions], dim=-1)
+        context = self._resolve_context(inputs, context)
+        return torch.stack([head(inputs, context) for head in heads], dim=0)
 
     def encoder_parameters(self):
         yield from self.encoder.parameters()
