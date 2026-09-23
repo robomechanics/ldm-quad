@@ -159,7 +159,7 @@ case "$ACTION" in
     SEED="${SEED:-43}"
     CTX_DIM="${CTX_DIM:-16}"; HIST_LEN="${HIST_LEN:-48}"
     WARMUP="${WARMUP:-1000}"
-    TRAIN_STEPS="${TRAIN_STEPS:-340300}"      # 20k adapter steps
+    TRAIN_STEPS="${TRAIN_STEPS:-340300}"      # 20k adapter steps; checkpoint every 2500 (8 kept)
     GAIN_LO="${GAIN_LO:-0.6}"; GAIN_HI="${GAIN_HI:-1.0}"
     FRIC_LO="${FRIC_LO:-0.25}"; FRIC_HI="${FRIC_HI:-0.8}"
     ADAPTER_WD="${ADAPTER_WD:-0.0}"
@@ -184,7 +184,7 @@ case "$ACTION" in
       --sit_adapter_weight_decay "$ADAPTER_WD" "${ADAPTER_LR_FLAG[@]}" \
       --dyn_motor_gain_range "$GAIN_LO" "$GAIN_HI" --dyn_friction_range "$FRIC_LO" "$FRIC_HI" \
       --resume_checkpoint "$FROZEN" --no-auto_resume_replay --resume_warmup_steps "$WARMUP" \
-      --save_interval 2000 --max_checkpoints 50 --save_replay --eval_interval 50 \
+      --save_interval 2500 --max_checkpoints 50 --save_replay --eval_interval 50 \
       --wandb --wandb_project "$PROJECT" --wandb_name "$WANDB_NAME" \
       --train_steps "$TRAIN_STEPS" "${CMD[@]}"
     ;;

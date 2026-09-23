@@ -130,6 +130,16 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--dump_replay",
+    type=str,
+    default=None,
+    help=(
+        "Record every transition of this run into a ReplayBuffer and save it here in train.py's "
+        "replay_latest.pt format (continues = not terminated, resets = done, raw commanded actions, "
+        "dyn_params), e.g. as a held-out buffer for scripts/mbrl/eval_context_offline.py."
+    ),
+)
+parser.add_argument(
     "--dyn_switch_step",
     type=int,
     default=None,
@@ -1238,6 +1248,10 @@ def main() -> None:
             print("[WARN] TensorBoard is not installed; writing diagnostics CSV only.", flush=True)
     if args_cli.online_adapt and model is None:
         raise RuntimeError("--online_adapt requires an MBRL world model; it cannot run with --prior_only.")
+    dump_replay = (
+        ReplayBuffer(obs.shape[0] * int(args_cli.max_steps), obs.shape[-1], action_dim)
+        if args_cli.dump_replay else None
+    )
     adapt_replay = (
         ReplayBuffer(args_cli.adapt_buffer_capacity, obs.shape[-1], action_dim)
         if args_cli.online_adapt or args_cli.diagnostics
@@ -1548,6 +1562,17 @@ def main() -> None:
             if planner is not None:
                 diag_metrics.update({name: float(value) for name, value in planner.last_diagnostics.items()})
 
+        if dump_replay is not None:
+            dump_replay.add_batch(
+                obs.detach(),
+                actions.detach(),
+                rewards.view(-1, 1).detach(),
+                next_obs.detach(),
+                (~terminated_t).float().view(-1, 1).detach(),
+                resets=done.detach(),
+                dyn_params=step_dyn_params.detach() if step_dyn_params is not None else None,
+            )
+
         if adapt_replay is not None:
             adapt_replay.add_batch(
                 obs.detach().cpu(),
@@ -1743,6 +1768,17 @@ def main() -> None:
             f"foot_friction={float(dyn.foot_friction.nanmean()) if args_cli.dyn_friction_range else float('nan'):.3f}",
             flush=True,
         )
+
+    if dump_replay is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(args_cli.dump_replay)) or ".", exist_ok=True)
+        _tmp = f"{args_cli.dump_replay}.tmp"
+        torch.save(
+            {"replay": dump_replay.state_dict(), "recent_returns": list(completed_returns),
+             "recent_lengths": list(completed_lengths), "recent_step_rewards": []},
+            _tmp,
+        )
+        os.replace(_tmp, args_cli.dump_replay)
+        print(f"[EVAL] dumped replay: {len(dump_replay)} transitions -> {args_cli.dump_replay}", flush=True)
 
     eval_returns = completed_returns[: args_cli.num_episodes]
     eval_lengths = completed_lengths[: args_cli.num_episodes]
