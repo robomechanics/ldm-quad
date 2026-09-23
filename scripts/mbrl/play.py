@@ -107,6 +107,57 @@ parser.add_argument(
     help="Linearly ramp runtime motor weakness over this many steps after --mismatch_start_step.",
 )
 parser.add_argument(
+    "--dyn_motor_gain_range",
+    type=float,
+    nargs=2,
+    default=None,
+    metavar=("LO", "HI"),
+    help=(
+        "Per-env motor gain ~ U(LO, HI), redrawn at every episode reset (same as train.py): multiplies the "
+        "joint-position action scale inside the action term, so the policy's raw command stays in the "
+        "observation, the history and the adapt replay. Pin a held-out value with LO == HI."
+    ),
+)
+parser.add_argument(
+    "--dyn_friction_range",
+    type=float,
+    nargs=2,
+    default=None,
+    metavar=("LO", "HI"),
+    help=(
+        "Per-env robot friction (static = dynamic) ~ U(LO, HI), redrawn at every episode reset (same as "
+        "train.py). Terrain is 1.0 with multiply combine, so effective foot friction = value."
+    ),
+)
+parser.add_argument(
+    "--dyn_switch_step",
+    type=int,
+    default=None,
+    help=(
+        "Within-episode dynamics switch: at this global step set every env's gain and/or friction to "
+        "--dyn_switch_motor_gain / --dyn_switch_friction, with no reset (robot state and history kept). "
+        "Before it the pinned --dyn_*_range values apply (1.0 = nominal when the range is not given); "
+        "envs that reset afterwards keep the switched value."
+    ),
+)
+parser.add_argument("--dyn_switch_motor_gain", type=float, default=None, help="Motor gain after --dyn_switch_step.")
+parser.add_argument("--dyn_switch_friction", type=float, default=None, help="Foot friction after --dyn_switch_step.")
+parser.add_argument(
+    "--context_mode",
+    choices=["null", "rolling", "frozen", "truncated"],
+    default="rolling",
+    help=(
+        "History-context policy for a history checkpoint (ignored otherwise). null: zero null context "
+        "(== the context-free walker). rolling: last --context_len transitions (default). frozen: rolling "
+        "until --context_freeze_step, then each env holds that step's context; envs that reset after it "
+        "get the null context. truncated: rolling, but every env's window is cleared at "
+        "--context_truncate_step (oracle arm when it coincides with --dyn_switch_step)."
+    ),
+)
+parser.add_argument("--context_freeze_step", type=int, default=None, help="Global step at which --context_mode frozen freezes.")
+parser.add_argument("--context_truncate_step", type=int, default=None, help="Global step at which --context_mode truncated clears every window.")
+parser.add_argument("--context_len", type=int, default=None, help="History window used at eval (<= the model's history_len; older slots padded).")
+parser.add_argument(
     "--showcase",
     action="store_true",
     default=False,
@@ -300,7 +351,8 @@ from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 
 import ldm_quad.tasks  # noqa: F401
-from ldm_quad.mbrl.history import RollingHistory
+from ldm_quad.mbrl.dynamics_rand import DynamicsRandomizer
+from ldm_quad.mbrl.history import ContextController
 from ldm_quad.eval.terrain_mismatch import apply_terrain_mismatch
 from ldm_quad.mbrl import DynamicsEnsemble, LatentWorldModel, ReplayBuffer, StateWorldModel, build_planner, load_policy_prior
 
@@ -612,6 +664,17 @@ DIAGNOSTIC_FIELDS = [
     "planner_predicted_return_margin_mean",
     "planner_predicted_return_margin_min",
     "planner_prior_accept_rate",
+    # Appended last: per-env dynamics parameters (--dyn_*), the within-episode switch flag,
+    # and the eval-time context statistics (--context_mode). Empty when not in use.
+    "dyn_motor_gain_mean",
+    "dyn_motor_gain_min",
+    "dyn_motor_gain_max",
+    "dyn_foot_friction_mean",
+    "dyn_foot_friction_min",
+    "dyn_foot_friction_max",
+    "dyn_switch_active",
+    "context_norm_mean",
+    "context_drift_mean",
 ]
 
 
@@ -885,6 +948,35 @@ def main() -> None:
     device = torch.device(env.unwrapped.device)
     obs, _ = env.reset()
     obs = flatten_obs(obs, device)
+    if args_cli.dyn_switch_step is not None:
+        if args_cli.dyn_switch_motor_gain is None and args_cli.dyn_switch_friction is None:
+            raise ValueError("--dyn_switch_step needs --dyn_switch_motor_gain and/or --dyn_switch_friction")
+        # A switched axis must be live before the switch; unpinned means nominal (asset default 1.0).
+        if args_cli.dyn_switch_motor_gain is not None and args_cli.dyn_motor_gain_range is None:
+            args_cli.dyn_motor_gain_range = [1.0, 1.0]
+        if args_cli.dyn_switch_friction is not None and args_cli.dyn_friction_range is None:
+            args_cli.dyn_friction_range = [1.0, 1.0]
+    dyn = DynamicsRandomizer(
+        obs.shape[0], device,
+        motor_gain_range=args_cli.dyn_motor_gain_range,
+        friction_range=args_cli.dyn_friction_range,
+        seed=args_cli.seed,
+    )
+    dyn.attach(env)
+    dyn_stats = None
+    if dyn.enabled:
+        print(
+            f"[DYN] per-env randomisation, redrawn at reset: motor_gain={args_cli.dyn_motor_gain_range or 'off'} "
+            f"foot_friction={args_cli.dyn_friction_range or 'off'}",
+            flush=True,
+        )
+        _robot = env.unwrapped.scene["robot"]
+        dyn_stats = {
+            "robot": _robot,
+            "feet": _robot.find_bodies(".*_foot")[0],
+            # one accumulator per phase: the whole run, or pre/post --dyn_switch_step
+            "phases": {},
+        }
     action_shape = env.action_space.shape
     action_dim = int(action_shape[-1]) if len(action_shape) > 0 else int(np.prod(action_shape))
     action_low, action_high, action_bounds_finite = get_action_bounds(env.action_space, device, action_dim)
@@ -1154,10 +1246,22 @@ def main() -> None:
     adapt_optimizer = build_adapt_optimizer(model)
     adapt_horizon = int(args_cli.adapt_horizon or checkpoint_args.get("horizon", 1))
     adapt_gradient_updates = 0
-    history = (
-        RollingHistory(obs.shape[0], model.history_len, action_dim, obs.shape[-1], device)
-        if model is not None and getattr(model, "context_dim", 0) > 0 else None
+    history = None
+    _context_flags = (
+        args_cli.context_mode != "rolling" or args_cli.context_len is not None
+        or args_cli.context_freeze_step is not None or args_cli.context_truncate_step is not None
     )
+    if model is not None and getattr(model, "context_dim", 0) > 0:
+        history = ContextController(
+            obs.shape[0], int(model.history_len), action_dim, obs.shape[-1], device,
+            mode=args_cli.context_mode,
+            context_len=args_cli.context_len,
+            freeze_step=args_cli.context_freeze_step,
+            truncate_step=args_cli.context_truncate_step,
+        )
+        print(f"[CTX] {history.describe()}", flush=True)
+    elif _context_flags:
+        print("[CTX] checkpoint has no history encoder; --context_* flags ignored.", flush=True)
 
     try:
         dt = env.step_dt
@@ -1306,6 +1410,22 @@ def main() -> None:
                 if _d > 1e-5:
                     raise RuntimeError(f"step {steps}: obs/command buffer desync {_d:.3e}")
 
+        if args_cli.dyn_switch_step is not None and steps == args_cli.dyn_switch_step:
+            _fr_before = dyn.read_back_friction()
+            _gain_term = getattr(dyn, "_action_term", None)
+            _sc_before = float(_gain_term._scale.mean()) if _gain_term is not None else float("nan")
+            dyn.switch(motor_gain=args_cli.dyn_switch_motor_gain, friction=args_cli.dyn_switch_friction)
+            _fr_after = dyn.read_back_friction()
+            _sc_after = float(_gain_term._scale.mean()) if _gain_term is not None else float("nan")
+            print(
+                f"[DYN] switch applied at step {steps} (no reset): "
+                f"motor_gain -> {args_cli.dyn_switch_motor_gain} (action scale mean {_sc_before:.4f} -> {_sc_after:.4f}); "
+                f"friction -> {args_cli.dyn_switch_friction} (PhysX read-back mean "
+                f"{float(_fr_before.mean()) if _fr_before is not None else float('nan'):.3f} -> "
+                f"{float(_fr_after.mean()) if _fr_after is not None else float('nan'):.3f}, changed at step {steps})",
+                flush=True,
+            )
+
         with torch.no_grad():
             history_context = history.context(model) if history is not None else None
             if args_cli.prior_only:
@@ -1352,6 +1472,7 @@ def main() -> None:
                     f"command_obs={command_obs[0].detach().cpu().tolist() if command_obs is not None else None}"
                 )
 
+        step_dyn_params = dyn.params() if dyn.enabled else None
         next_obs_raw, rewards, terminated, truncated, _ = env.step(actions)
         next_obs = flatten_obs(next_obs_raw, device)
         rewards = to_tensor(rewards, device).float().view(-1)
@@ -1359,6 +1480,25 @@ def main() -> None:
         truncated_t = to_tensor(truncated, device).bool().view(-1)
         done = terminated_t | truncated_t
         continues = (~done).float().view(-1, 1)
+        if dyn_stats is not None:
+            # Foot-slip proxy: horizontal foot speed while the foot is on the ground (sphere
+            # centre within 3 cm of the plane). Clean sim state, not the noisy observation.
+            _rd = dyn_stats["robot"].data
+            _fz = _rd.body_pos_w[:, dyn_stats["feet"], 2]
+            _fv = _rd.body_lin_vel_w[:, dyn_stats["feet"], :2].norm(dim=-1)
+            _contact = _fz < 0.03
+            if args_cli.dyn_switch_step is None:
+                _phase = "all"
+            else:
+                _phase = "pre_switch" if steps < args_cli.dyn_switch_step else "post_switch"
+            _ph = dyn_stats["phases"].setdefault(
+                _phase, {"steps": 0, "falls": 0, "vx_sum": 0.0, "slip_sum": 0.0, "contact_n": 0}
+            )
+            _ph["slip_sum"] += float(_fv[_contact].sum())
+            _ph["contact_n"] += int(_contact.sum())
+            _ph["vx_sum"] += float(_rd.root_lin_vel_b[:, 0].mean())
+            _ph["falls"] += int(terminated_t.sum())
+            _ph["steps"] += 1
 
         diag_metrics: dict[str, float] = {}
         if diagnostics is not None and _command_idx is not None:
@@ -1416,6 +1556,7 @@ def main() -> None:
                 next_obs.detach().cpu(),
                 continues.detach().cpu(),
                 resets=done.detach().cpu(),
+                dyn_params=step_dyn_params.detach().cpu() if step_dyn_params is not None else None,
             )
 
         adapt_metrics, updates = online_adapt_step(
@@ -1434,6 +1575,11 @@ def main() -> None:
             diag_metrics.update(adapt_metrics)
             diag_metrics["adapt_gradient_updates"] = float(adapt_gradient_updates)
             diag_metrics["adapt_buffer_size"] = float(len(adapt_replay) if adapt_replay is not None else 0)
+            diag_metrics.update(dyn.metrics())  # empty when randomisation is off
+            if args_cli.dyn_switch_step is not None:
+                diag_metrics["dyn_switch_active"] = float(steps >= args_cli.dyn_switch_step)
+            if history is not None:
+                diag_metrics.update(history.metrics())
             diagnostics.write(steps, diag_metrics)
 
         episode_returns += rewards
@@ -1495,6 +1641,7 @@ def main() -> None:
             episode_lengths[done_mask] = 0.0
             if planner is not None:
                 planner.reset(done_mask)
+            dyn.resample(done_mask)
 
         obs = next_obs
         steps += 1
@@ -1575,6 +1722,27 @@ def main() -> None:
         else:
             print(f"[EVAL] split settle_steps={_effective_settle:.0f} "
                   f"landing_fail_rate={_land_fail:.4f} landed=0/{_n} -- NO episode survived landing")
+
+    if dyn_stats is not None:
+        _n_env = obs.shape[0]
+        for _phase, _ph in dyn_stats["phases"].items():
+            _st = _ph["steps"]
+            if _st == 0:
+                continue
+            print(
+                f"[DYN] summary phase={_phase} "
+                f"steps={_st} envs={_n_env} falls={_ph['falls']} "
+                f"falls_per_env_per_1000_steps={1000.0 * _ph['falls'] / (_st * _n_env):.2f} "
+                f"vx_mean={_ph['vx_sum'] / _st:.4f} "
+                f"foot_slip_mps={_ph['slip_sum'] / max(_ph['contact_n'], 1):.4f} "
+                f"contact_frac={_ph['contact_n'] / (_st * _n_env * max(len(dyn_stats['feet']), 1)):.3f}",
+                flush=True,
+            )
+        print(
+            f"[DYN] params at end: motor_gain={float(dyn.motor_gain.nanmean()) if args_cli.dyn_motor_gain_range else float('nan'):.3f} "
+            f"foot_friction={float(dyn.foot_friction.nanmean()) if args_cli.dyn_friction_range else float('nan'):.3f}",
+            flush=True,
+        )
 
     eval_returns = completed_returns[: args_cli.num_episodes]
     eval_lengths = completed_lengths[: args_cli.num_episodes]

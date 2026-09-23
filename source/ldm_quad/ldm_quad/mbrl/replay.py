@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 
+DYN_PARAM_DIM = 2  # len(dynamics_rand.PARAM_NAMES); kept literal so this file stays import-free
+
 
 class ReplayBuffer:
     """Vectorized transition replay buffer.
@@ -28,6 +30,10 @@ class ReplayBuffer:
         # cold-start verdict. NaN = not recorded (legacy buffers).
         self.clean_vel = torch.full((capacity, 3), float("nan"), dtype=torch.float32, device=self.device)
         self.planner_std = torch.full((capacity, action_dim), float("nan"), dtype=torch.float32, device=self.device)
+        # True per-transition dynamics parameters (mbrl/dynamics_rand.py PARAM_NAMES: motor_gain,
+        # foot_friction) active in the env when the transition was collected. Probe targets only,
+        # never a model input. NaN = axis not randomised / not recorded (legacy buffers).
+        self.dyn_params = torch.full((capacity, DYN_PARAM_DIM), float("nan"), dtype=torch.float32, device=self.device)
         self.next_obs = torch.zeros((capacity, obs_dim), dtype=torch.float32, device=self.device)
         self.rewards = torch.zeros((capacity, 1), dtype=torch.float32, device=self.device)
         self.continues = torch.zeros((capacity, 1), dtype=torch.float32, device=self.device)
@@ -55,6 +61,7 @@ class ReplayBuffer:
             "planner_mean": self.planner_mean.cpu(),
             "planner_std": self.planner_std.cpu(),
             "clean_vel": self.clean_vel.cpu(),
+            "dyn_params": self.dyn_params.cpu(),
             "next_obs": self.next_obs.cpu(),
             "rewards": self.rewards.cpu(),
             "continues": self.continues.cpu(),
@@ -84,6 +91,10 @@ class ReplayBuffer:
                 f"current capacity={self.capacity} obs_dim={self.obs.shape[-1]} action_dim={self.actions.shape[-1]}"
             )
 
+        if "dyn_params" in state_dict:
+            self.dyn_params.copy_(state_dict["dyn_params"])
+        else:
+            self.dyn_params.fill_(float("nan"))
         # legacy buffers predate clean_vel -> leave the NaN sentinel in place
         if "clean_vel" in state_dict:
             self.clean_vel.copy_(state_dict["clean_vel"])
@@ -124,6 +135,7 @@ class ReplayBuffer:
         planner_mean: torch.Tensor | None = None,
         planner_std: torch.Tensor | None = None,
         clean_vel: torch.Tensor | None = None,
+        dyn_params: torch.Tensor | None = None,
     ) -> None:
         obs = obs.to(self.device, non_blocking=True)
         actions = actions.to(self.device, non_blocking=True)
@@ -148,6 +160,10 @@ class ReplayBuffer:
             clean_vel = torch.full_like(self.clean_vel[:batch_size], float("nan"))
         else:
             clean_vel = clean_vel.to(self.device, non_blocking=True)
+        if dyn_params is None:
+            dyn_params = torch.full_like(self.dyn_params[:batch_size], float("nan"))
+        else:
+            dyn_params = dyn_params.to(self.device, torch.float32, non_blocking=True)
 
         self._last_batch_size = batch_size
         if self._env_episode_ids.numel() != batch_size:
@@ -162,6 +178,7 @@ class ReplayBuffer:
             planner_mean = planner_mean[-self.capacity :]
             planner_std = planner_std[-self.capacity :]
             clean_vel = clean_vel[-self.capacity :]
+            dyn_params = dyn_params[-self.capacity :]
             batch_size = self.capacity
 
         env_ids = torch.arange(batch_size, dtype=torch.long, device=self.device)
@@ -176,6 +193,7 @@ class ReplayBuffer:
             self.planner_mean[start:end] = planner_mean
             self.planner_std[start:end] = planner_std
             self.clean_vel[start:end] = clean_vel
+            self.dyn_params[start:end] = dyn_params
             self.rewards[start:end] = rewards
             self.next_obs[start:end] = next_obs
             self.continues[start:end] = continues
@@ -190,6 +208,7 @@ class ReplayBuffer:
             self.planner_mean[start:] = planner_mean[:first]
             self.planner_std[start:] = planner_std[:first]
             self.clean_vel[start:] = clean_vel[:first]
+            self.dyn_params[start:] = dyn_params[:first]
             self.rewards[start:] = rewards[:first]
             self.next_obs[start:] = next_obs[:first]
             self.continues[start:] = continues[:first]
@@ -201,6 +220,7 @@ class ReplayBuffer:
             self.planner_mean[:second] = planner_mean[first:]
             self.planner_std[:second] = planner_std[first:]
             self.clean_vel[:second] = clean_vel[first:]
+            self.dyn_params[:second] = dyn_params[first:]
             self.rewards[:second] = rewards[first:]
             self.next_obs[:second] = next_obs[first:]
             self.continues[:second] = continues[first:]
@@ -305,6 +325,8 @@ class ReplayBuffer:
             "planner_std": self.planner_std[transition_indices].to(device),
             "rewards": self.rewards[transition_indices].to(device),
             "continues": self.continues[transition_indices].to(device),
+            # Parameters active at the sampled START transition (probe target, not a model input).
+            "dyn_params": self.dyn_params[start_t].to(device),
         }
         if history_len > 0:
             batch.update(self._gather_history(start_t, history_len, stride, device))

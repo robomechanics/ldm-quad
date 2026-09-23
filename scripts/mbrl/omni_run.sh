@@ -36,12 +36,15 @@
 # O1 also enables the TD-M(PC)^2 BC term (--tdmpc2_bc_coef 0.1; A/B: same speed, longer episodes).
 #
 # NOTE: x0.2/x0.3/x0.4 were trained at action scale 0.25; the env default is now 0.40, so
-# run.sh play passes the right --action_scale per stage to replay each one faithfully.
+# omni_run.sh play passes the right --action_scale per stage to replay each one faithfully.
+#
+# The frozen walker (stageL_omni_326k.pt) and its SIT context adapter are used through
+# scripts/mbrl/frozen_walker_run.sh; this file is the curriculum that produced it.
 #
 # Usage:
-#   ./run.sh                 # print the curriculum manifest
-#   ./run.sh play  [stage]   # play a kept walker (x0p2|x0p3|x0p4|x0p4f; default x0p4f)
-#   ./run.sh train           # full training recipe (all params) to continue the curriculum
+#   ./omni_run.sh                 # print the curriculum manifest
+#   ./omni_run.sh play  [stage]   # play a kept walker (x0p2|x0p3|x0p4|x0p4f; default x0p4f)
+#   ./omni_run.sh train           # full training recipe (all params) to continue the curriculum
 #                            # (defaults to command 0.4, baked action scale 0.40, from current best)
 #   Train overrides (env):   CMD_X= RESUME= TRAIN_STEPS= SEED= WANDB_NAME=
 set -uo pipefail
@@ -83,7 +86,7 @@ case "$ACTION" in
     # skill (Stage T 56%, PPO 37%, both fall). Either accept it, or gate yaw on |x|.
     # NOTE: LAUNCH VIA systemd-run --user (NOT a VS Code terminal, NOT nohup/setsid):
     #   systemd-run --user --unit=stageM-mixing --collect \
-    #     --working-directory=$PWD bash -c 'exec bash scripts/mbrl/run.sh train >> LOG 2>&1'
+    #     --working-directory=$PWD bash -c 'exec bash scripts/mbrl/omni_run.sh train >> LOG 2>&1'
     # Root cause of the 2026-08-30/31 kills was NOT grid5 (measured: 1.2GB total, 7x175MB).
     # It was cpptools: ros2_ws/src/quad-sdk/.vscode/c_cpp_properties.json had
     # "limitSymbolsToIncludedHeaders": false with recursive globs over /opt/ros/jazzy/include/**
@@ -116,7 +119,7 @@ case "$ACTION" in
     # sampling gave the top 0.05 band only ~6% of data, i.e. starvation, not skill).
     # ==============================================================================
     # ---------------- REPRODUCING THE STAGE M RESULT (2026-09-01) ----------------
-    # run.sh alone does NOT reproduce the kept artifact. To reproduce exactly:
+    # omni_run.sh alone does NOT reproduce the kept artifact. To reproduce exactly:
     #  1) STOP POINT: this recipe says TRAIN_STEPS=371000, but the run was STOPPED at
     #     env_steps=348450. The KEPT artifact is model_best.pt @ step ~333750
     #     (stable_tracking 0.457, saved 2026-09-01 08:50). Training past ~334k made it
@@ -125,7 +128,7 @@ case "$ACTION" in
     #  2) REWARD IS NOT IN THIS FILE. alive=0.10, track w=8.0/std=0.11 and action
     #     scale=0.40 are baked into flat_env_cfg.py (pinned at commit 895797e).
     #     config.txt records reward_alive_weight/reward_track_weight as None for this
-    #     reason -- they never pass through run.sh. Check out that revision to reproduce.
+    #     reason -- they never pass through omni_run.sh. Check out that revision to reproduce.
     #  3) --updates_per_step 8 below is DEAD: --utd 0.25 overrides it via
     #     train.py:1119 round(utd*num_envs) = round(0.25*64) = 16. config.txt records 16.
     #  4) Needs logs/mbrl/best_walker/stageL_omni_326k.pt (125MB, not in git).
@@ -316,8 +319,9 @@ Policies preserved standalone in logs/mbrl/best_walker/ (see its README.md).
   L       T + lateral +-0.35   0.40   stageL_omni_326k.pt               combo 94/97/98%
   M       full x[-0.3,0.5]      0.40   (TRAINING NOW, resumes L @326k)   <- frozen task
 
-  ./run.sh play  [x0p2|x0p3|x0p4|x0p4f]   # play a kept walker (default x0p4f)
-  ./run.sh train                          # omni O1 recipe (WANDER=1 default; WANDER=0 CMD_X= for fixed)
+  ./omni_run.sh play  [x0p2|x0p3|x0p4|x0p4f]   # play a kept walker (default x0p4f)
+  ./frozen_walker_run.sh                       # the frozen walker + SIT adapter (see that file)
+  ./omni_run.sh train                          # omni O1 recipe (WANDER=1 default; WANDER=0 CMD_X= for fixed)
                                           # overrides: RESUME= TRAIN_STEPS= SEED= BC_COEF= YAW_W= YAW_STD= X_MIN/MAX= Y_MIN/MAX= YAW_MIN/MAX=
 EOF
     ;;

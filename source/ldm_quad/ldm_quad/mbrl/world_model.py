@@ -146,6 +146,9 @@ class RunningScale(nn.Module):
         self.tau = tau
         self.register_buffer("value", torch.ones(1, dtype=torch.float32))
         self.register_buffer("_percentiles", torch.tensor([5.0, 95.0], dtype=torch.float32))
+        # Frozen (SIT adapter mode): keep the loaded scale. The EMA tracks the Q spread of the
+        # current buffer, and a narrow buffer would otherwise rescale the actor loss.
+        self.frozen = False
 
     def _positions(self, x_shape: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         positions = self._percentiles.to(dtype=torch.float32, device=self.value.device) * (x_shape - 1) / 100.0
@@ -166,6 +169,8 @@ class RunningScale(nn.Module):
 
     @torch.no_grad()
     def update(self, x: torch.Tensor) -> None:
+        if self.frozen:
+            return
         percentiles = self._percentile(x.detach())
         value = torch.clamp(percentiles[1] - percentiles[0], min=1.0)
         self.value.data.lerp_(value.to(self.value.device), self.tau)
@@ -184,7 +189,9 @@ class HistoryEncoder(nn.Module):
     transition ``next_obs - obs`` (the sysid cue: "this action in this regime produced
     this change"). Tokens are embedded, passed through a small TransformerEncoder with
     no causal mask, mean-pooled over valid steps, and compressed to a fixed context
-    vector. Empty histories fall back to a learned ``null_context``.
+    vector. Empty histories fall back to ``null_context``, a fixed zero buffer (not learned):
+    with the additive context projections, an empty history therefore reproduces the
+    context-free model exactly, which is what defines the null-context arm.
     """
 
     def __init__(
@@ -211,7 +218,7 @@ class HistoryEncoder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers, nn.LayerNorm(d_model))
         self.final_fc = nn.Linear(d_model, context_dim)
-        self.null_context = nn.Parameter(torch.zeros(context_dim))
+        self.register_buffer("null_context", torch.zeros(context_dim))
 
     def forward(
         self,
@@ -473,10 +480,15 @@ class LatentWorldModel(nn.Module):
 
     @torch.no_grad()
     def soft_update_targets(self) -> None:
+        # Only tensors that are being trained are tracked. With every online tensor trainable
+        # (the default) this is the plain EMA; in SIT adapter mode the frozen base targets keep
+        # their loaded values exactly instead of creeping toward the frozen online weights.
         for target_param, param in zip(self.target_encoder.parameters(), self.encoder.parameters(), strict=True):
-            target_param.lerp_(param, self.tau)
+            if param.requires_grad:
+                target_param.lerp_(param, self.tau)
         for target_param, param in zip(self.target_q_heads.parameters(), self.q_heads.parameters(), strict=True):
-            target_param.lerp_(param, self.tau)
+            if param.requires_grad:
+                target_param.lerp_(param, self.tau)
 
     @torch.no_grad()
     def sync_detached_qs(self) -> None:
@@ -643,6 +655,40 @@ class LatentWorldModel(nn.Module):
 
     def policy_parameters(self):
         yield from self.policy_head.parameters()
+
+    def adapter_parameters(self):
+        """SIT adapter tensors trained by the world-model optimizer: the history encoder and the
+        online context projections of encoder, dynamics, reward and Q heads (not target/detach
+        copies, not the policy's)."""
+        if self.history_encoder is not None:
+            yield from self.history_encoder.parameters()
+        for module in (self.encoder, self.dynamics, self.reward_head, *self.q_heads):
+            for name, param in module.named_parameters():
+                if name.endswith("context_weight"):
+                    yield param
+
+    def policy_adapter_parameters(self):
+        if self.context_dim > 0:
+            yield self.policy_head.context_weight
+
+    def freeze_base_for_adapter(self) -> tuple[int, int]:
+        """Freeze every online weight except the SIT adapter, and the actor-loss Q scale.
+
+        Returns (trainable, frozen) parameter counts."""
+        if self.context_dim == 0:
+            raise ValueError("adapter-only training needs a history-context model (context_dim > 0)")
+        adapter = {id(p) for p in self.adapter_parameters()} | {id(p) for p in self.policy_adapter_parameters()}
+        trainable = frozen = 0
+        for param in self.parameters():
+            if id(param) in adapter:
+                param.requires_grad_(True)
+                trainable += param.numel()
+            else:
+                if param.requires_grad:
+                    frozen += param.numel()
+                param.requires_grad_(False)
+        self.q_scale.frozen = True
+        return trainable, frozen
 
     def policy_loss(
         self,

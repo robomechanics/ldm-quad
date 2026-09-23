@@ -36,3 +36,104 @@ class RollingHistory:
         if not hasattr(model, "encode_context"):
             return None
         return model.encode_context(self.actions, self.transitions, ~self.valid)
+
+
+CONTEXT_MODES = ("null", "rolling", "frozen", "truncated")
+
+
+class ContextController:
+    """Evaluation-time context policy over a :class:`RollingHistory` (play.py ``--context_mode``).
+
+    Same interface as RollingHistory (``context(model)``, ``append(...)``); ``append`` is called
+    once per env step and advances the step counter ``t`` that the modes key on.
+
+    null      zero null context every step (with a pinned-zero null_context this is exactly the
+              context-free walker).
+    rolling   the last ``context_len`` valid transitions of each env (default mode).
+    frozen    rolling until global step ``freeze_step``; from then on each env keeps the context
+              it had at that step. An env that resets after the freeze gets the null context for
+              the rest of the run (its pre-freeze identity belongs to a finished episode).
+    truncated rolling, but at global step ``truncate_step`` every env's window is cleared, so the
+              context is rebuilt from post-truncation transitions only (the oracle arm when the
+              truncation coincides with a dynamics switch).
+
+    ``context_len`` <= history_len keeps only the most recent K' slots; older ones are padded.
+    """
+
+    def __init__(
+        self,
+        num_envs: int,
+        history_len: int,
+        action_dim: int,
+        obs_dim: int,
+        device: torch.device,
+        mode: str = "rolling",
+        context_len: int | None = None,
+        freeze_step: int | None = None,
+        truncate_step: int | None = None,
+    ):
+        if mode not in CONTEXT_MODES:
+            raise ValueError(f"context_mode must be one of {CONTEXT_MODES}, got {mode!r}")
+        if mode == "frozen" and freeze_step is None:
+            raise ValueError("context_mode=frozen needs a freeze step")
+        if mode == "truncated" and truncate_step is None:
+            raise ValueError("context_mode=truncated needs a truncate step")
+        context_len = history_len if context_len is None else int(context_len)
+        if not 1 <= context_len <= history_len:
+            raise ValueError(f"context_len must be in [1, {history_len}], got {context_len}")
+        self.history = RollingHistory(num_envs, history_len, action_dim, obs_dim, device)
+        self.mode = mode
+        self.context_len = context_len
+        self.freeze_step = freeze_step
+        self.truncate_step = truncate_step
+        self.t = 0
+        self._frozen: torch.Tensor | None = None
+        self._null_after_freeze = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        self._prev: torch.Tensor | None = None
+        self._last: torch.Tensor | None = None
+
+    def pad_mask(self) -> torch.Tensor:
+        """``[N, K]`` True for padded slots: invalid, or older than the ``context_len`` newest."""
+        k = self.history.history_len
+        slots = torch.arange(k, device=self.history.valid.device)
+        age = (self.history.ptr - 1 - slots) % k  # 0 = most recent write
+        return ~self.history.valid | (age >= self.context_len).unsqueeze(0)
+
+    def _null(self, model: torch.nn.Module, n: int) -> torch.Tensor:
+        return model.history_encoder.null().unsqueeze(0).expand(n, -1)
+
+    def context(self, model: torch.nn.Module) -> torch.Tensor | None:
+        if not hasattr(model, "encode_context") or getattr(model, "history_encoder", None) is None:
+            return None
+        n = self.history.valid.shape[0]
+        if self.mode == "null":
+            ctx = self._null(model, n).clone()
+        elif self.mode == "frozen" and self._frozen is not None:
+            ctx = torch.where(self._null_after_freeze.unsqueeze(-1), self._null(model, n), self._frozen)
+        else:
+            ctx = model.encode_context(self.history.actions, self.history.transitions, self.pad_mask())
+            if self.mode == "frozen" and self.t >= self.freeze_step:
+                self._frozen = ctx.detach().clone()
+        self._prev, self._last = self._last, ctx.detach()
+        return ctx
+
+    def append(self, actions: torch.Tensor, transitions: torch.Tensor, done: torch.Tensor | None = None) -> None:
+        self.history.append(actions, transitions, done)
+        if done is not None and self.mode == "frozen" and self._frozen is not None:
+            self._null_after_freeze |= done.view(-1).bool()
+        self.t += 1
+        if self.mode == "truncated" and self.t == self.truncate_step:
+            self.history.valid.zero_()  # the NEXT context sees post-truncation transitions only
+
+    def metrics(self) -> dict[str, float]:
+        if self._last is None:
+            return {}
+        drift = 0.0 if self._prev is None else float((self._last - self._prev).norm(dim=-1).mean())
+        return {"context_norm_mean": float(self._last.norm(dim=-1).mean()), "context_drift_mean": drift}
+
+    def describe(self) -> str:
+        extra = {
+            "frozen": f" freeze_step={self.freeze_step} (global step; post-freeze resets -> null context)",
+            "truncated": f" truncate_step={self.truncate_step} (every env's window cleared at that step)",
+        }.get(self.mode, "")
+        return f"context_mode={self.mode} context_len={self.context_len}/{self.history.history_len}{extra}"

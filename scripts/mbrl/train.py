@@ -221,6 +221,53 @@ parser.add_argument("--history_nhead", type=int, default=4, help="History transf
 parser.add_argument("--history_layers", type=int, default=1, help="History transformer encoder layers.")
 parser.add_argument("--history_ff", type=int, default=256, help="History transformer feedforward dimension.")
 parser.add_argument("--history_dropout", type=float, default=0.1, help="History transformer dropout probability.")
+parser.add_argument(
+    "--sit_adapter_lr",
+    type=float,
+    default=None,
+    help="Adapter-mode learning rate for every SIT tensor (world-model and policy groups). Default: the usual lrs.",
+)
+parser.add_argument(
+    "--sit_adapter_weight_decay",
+    type=float,
+    default=0.0,
+    help="Adapter-mode decoupled (AdamW-style) weight decay on the SIT tensors. Default 0.",
+)
+parser.add_argument(
+    "--dyn_motor_gain_range",
+    type=float,
+    nargs=2,
+    default=None,
+    metavar=("LO", "HI"),
+    help=(
+        "Per-env motor gain ~ U(LO, HI), redrawn at every episode reset: multiplies the joint-position "
+        "action scale inside the action term (the policy's raw command stays in obs/replay/history). "
+        "Off by default. Pin a value with LO == HI."
+    ),
+)
+parser.add_argument(
+    "--dyn_friction_range",
+    type=float,
+    nargs=2,
+    default=None,
+    metavar=("LO", "HI"),
+    help=(
+        "Per-env robot friction (static = dynamic) ~ U(LO, HI), redrawn at every episode reset, on every "
+        "robot collision shape. Terrain is 1.0 with multiply combine, so effective foot friction = value. "
+        "Off by default."
+    ),
+)
+parser.add_argument(
+    "--sit_train_mode",
+    choices=["full", "adapter"],
+    default="full",
+    help=(
+        "full: train every weight (default, today's behaviour). adapter: train ONLY history_encoder.* "
+        "and the online *.context_weight projections; every base weight stays frozen, so the loaded "
+        "walker cannot degrade. Launch path for the SIT fine-tune: --history_context_dim 16 "
+        "--sit_train_mode adapter --resume_checkpoint <context-free ckpt> --no-auto_resume_replay."
+    ),
+)
 parser.add_argument("--hidden_dim", type=int, default=512, help="Model hidden dimension.")
 parser.add_argument("--model_depth", type=int, default=3, help="Number of hidden layers per ensemble member.")
 parser.add_argument("--ensemble_size", type=int, default=5, help="Number of dynamics models in the ensemble.")
@@ -540,8 +587,10 @@ import ldm_quad.tasks  # noqa: F401
 from ldm_quad.mbrl.checkpoint import (
     graft_context_free_state_dict,
     is_context_free_state_dict,
-    remap_optimizer_state_for_added_params,
+    latent_optimizer_param_groups,
+    remap_optimizer_state,
 )
+from ldm_quad.mbrl.dynamics_rand import PARAM_NAMES as DYN_PARAM_NAMES, DynamicsRandomizer
 from ldm_quad.mbrl.history import RollingHistory
 from ldm_quad.mbrl import (
     DynamicsEnsemble,
@@ -1026,6 +1075,19 @@ def infer_replay_checkpoint_path(resume_checkpoint: str | None) -> str | None:
     return replay_path if os.path.exists(replay_path) else None
 
 
+def apply_sit_adapter_hparams(optimizer: torch.optim.Optimizer, policy_optimizer: torch.optim.Optimizer | None) -> None:
+    """Adapter-mode lr / decoupled weight decay on every SIT group. Re-applied after a resume,
+    because loading optimizer state restores the checkpoint's group hyperparameters."""
+    for opt in (optimizer, policy_optimizer):
+        if opt is None:
+            continue
+        for group in opt.param_groups:
+            if args_cli.sit_adapter_lr is not None:
+                group["lr"] = float(args_cli.sit_adapter_lr)
+            group["weight_decay"] = float(args_cli.sit_adapter_weight_decay)
+            group["decoupled_weight_decay"] = True
+
+
 def load_training_checkpoint(
     path: str,
     model: torch.nn.Module,
@@ -1034,6 +1096,7 @@ def load_training_checkpoint(
     *,
     device: torch.device,
     load_optim: bool,
+    sit_train_mode: str = "full",
 ) -> tuple[TrainState, dict[str, object]]:
     expanded_path = os.path.expanduser(path)
     if not zipfile.is_zipfile(expanded_path):
@@ -1081,23 +1144,31 @@ def load_training_checkpoint(
         optim_load_start_time = time.monotonic()
         optimizer_state = checkpoint.get("optimizer")
         policy_optimizer_state = checkpoint.get("policy_optimizer")
-        if context_graft_keys:
-            # Saved Adam state is keyed by position and lacks the added tensors; remap it so
-            # base weights keep their moments and only the new tensors start at step 0.
-            # Shape-mismatched state from a simultaneous #6a graft is dropped here.
+        _ckpt_args = checkpoint.get("args") if isinstance(checkpoint.get("args"), dict) else {}
+        saved_mode = str(_ckpt_args.get("sit_train_mode") or "full")
+        if context_graft_keys or saved_mode != sit_train_mode:
+            # Saved Adam state is keyed by POSITION over whatever tensors the checkpoint's
+            # optimizers held. Describe that set with live Parameters and remap by identity:
+            # tensors in both keep their moments, new ones start at step 0, state for tensors
+            # this run does not optimise (frozen in adapter mode) is dropped. A context-free
+            # checkpoint was a full-mode run without the SIT tensors. Shape-mismatched state from
+            # a simultaneous #6a graft is dropped here too.
             params_by_name = dict(model.named_parameters())
-            added = [params_by_name[k] for k in context_graft_keys if k in params_by_name]
-            for _label, _opt, _saved in (
-                ("model", optimizer, optimizer_state),
-                ("policy", policy_optimizer, policy_optimizer_state),
+            added = {id(params_by_name[k]) for k in context_graft_keys if k in params_by_name}
+            saved_groups, saved_policy = latent_optimizer_param_groups(
+                model, "full" if context_graft_keys else saved_mode, exclude=added
+            )
+            for _label, _opt, _saved, _order in (
+                ("model", optimizer, optimizer_state, saved_groups),
+                ("policy", policy_optimizer, policy_optimizer_state, [saved_policy]),
             ):
                 if _opt is None or _saved is None:
                     continue
-                _kept, _fresh, _dropped = remap_optimizer_state_for_added_params(
-                    _opt, _saved, added, allow_shape_mismatch=grafted
-                )
-                print(f"[MBRL] SIT {_label} optimizer state remapped: kept={_kept} "
-                      f"fresh(new tensors)={_fresh} dropped(widened)={_dropped}", flush=True)
+                _c = remap_optimizer_state(_opt, _saved, _order, allow_shape_mismatch=grafted)
+                print(f"[MBRL] SIT {_label} optimizer state remapped (checkpoint mode={saved_mode}"
+                      f"{' context-free' if context_graft_keys else ''} -> {sit_train_mode}): "
+                      f"kept={_c['kept']} fresh={_c['fresh']} dropped_frozen={_c['dropped_absent']} "
+                      f"dropped_widened={_c['dropped_shape']}", flush=True)
         else:
             if optimizer_state is not None:
                 optimizer.load_state_dict(optimizer_state)
@@ -1172,6 +1243,7 @@ def run_heldout_eval(
     progress_interval: int = 0,
     max_seconds: float = 0.0,
     model: torch.nn.Module | None = None,
+    dyn: DynamicsRandomizer | None = None,
 ) -> dict[str, float]:
     obs_raw, _ = env.reset()
     obs = flatten_obs(obs_raw, device)
@@ -1239,6 +1311,8 @@ def run_heldout_eval(
             episode_returns[done_mask] = 0.0
             episode_lengths[done_mask] = 0.0
             planner.reset(done_mask)
+            if dyn is not None:
+                dyn.resample(done_mask)
 
         if eval_history is not None:
             eval_history.append(actions, next_obs - obs, done)
@@ -1295,6 +1369,8 @@ def main() -> None:
         raise ValueError(f"--early_stop_metric {args_cli.early_stop_metric} requires --online_eval.")
     if args_cli.online_eval and args_cli.online_eval_interval <= 0:
         raise ValueError("--online_eval_interval must be positive when --online_eval is enabled.")
+    if args_cli.sit_train_mode == "adapter" and (args_cli.model_type != "latent" or args_cli.history_context_dim <= 0):
+        raise ValueError("--sit_train_mode adapter needs --model_type latent and --history_context_dim > 0.")
     env_cfg = parse_env_cfg(
         args_cli.task,
         device=args_cli.device,
@@ -1317,6 +1393,26 @@ def main() -> None:
     obs, _ = env.reset()
     obs = flatten_obs(obs, device)
     num_envs = obs.shape[0]
+    dyn = DynamicsRandomizer(
+        num_envs, device,
+        motor_gain_range=args_cli.dyn_motor_gain_range,
+        friction_range=args_cli.dyn_friction_range,
+        seed=args_cli.seed,
+    )
+    dyn.attach(env)
+    if dyn.enabled:
+        _mat = dyn.default_materials
+        _mat_note = (
+            f" robot material before randomisation static={float(_mat[..., 0].mean()):.3f} "
+            f"dynamic={float(_mat[..., 1].mean()):.3f} (terrain 1.0, multiply -> effective = robot value)"
+            if _mat is not None else ""
+        )
+        print(
+            f"[MBRL] Dynamics randomisation per env, redrawn at every reset: "
+            f"motor_gain={args_cli.dyn_motor_gain_range or 'off'} foot_friction={args_cli.dyn_friction_range or 'off'}"
+            f"{_mat_note}; replay stores dyn_params={list(DYN_PARAM_NAMES)}",
+            flush=True,
+        )
     if args_cli.utd is not None:
         args_cli.updates_per_step = max(1, int(round(args_cli.utd * num_envs)))
     action_shape = env.action_space.shape
@@ -1395,14 +1491,21 @@ def main() -> None:
                 physical=args_cli.latent_physical_coef,
             ),
         ).to(device)
+        if args_cli.sit_train_mode == "adapter":
+            _trainable, _frozen = model.freeze_base_for_adapter()
+            print(f"[MBRL] SIT adapter mode: trainable={_trainable} params "
+                  f"(history_encoder + online context_weight) frozen={_frozen} base params", flush=True)
+        (_enc_params, _nonenc_params), _policy_params = latent_optimizer_param_groups(model, args_cli.sit_train_mode)
         optimizer = torch.optim.Adam(
             [
-                {"params": list(model.encoder_parameters()), "lr": args_cli.lr * args_cli.enc_lr_scale},
-                {"params": list(model.non_encoder_model_parameters()), "lr": args_cli.lr},
+                {"params": _enc_params, "lr": args_cli.lr * args_cli.enc_lr_scale},
+                {"params": _nonenc_params, "lr": args_cli.lr},
             ],
             lr=args_cli.lr,
         )
-        policy_optimizer = torch.optim.Adam(model.policy_parameters(), lr=args_cli.policy_lr, eps=1e-5)
+        policy_optimizer = torch.optim.Adam(_policy_params, lr=args_cli.policy_lr, eps=1e-5)
+        if args_cli.sit_train_mode == "adapter":
+            apply_sit_adapter_hparams(optimizer, policy_optimizer)
     elif args_cli.model_type == "state":
         model = StateWorldModel(
             obs_dim=obs_dim,
@@ -1448,7 +1551,16 @@ def main() -> None:
             policy_optimizer,
             device=device,
             load_optim=bool(args_cli.resume_load_optim),
+            sit_train_mode=args_cli.sit_train_mode,
         )
+        if args_cli.sit_train_mode == "adapter":
+            apply_sit_adapter_hparams(optimizer, policy_optimizer)
+            print(
+                f"[MBRL] SIT adapter mode: q_scale frozen at {float(model.q_scale.value):.4f}; adapter "
+                f"lr={[g['lr'] for g in optimizer.param_groups]}+policy {[g['lr'] for g in policy_optimizer.param_groups]} "
+                f"weight_decay={args_cli.sit_adapter_weight_decay} (decoupled)",
+                flush=True,
+            )
         if train_state.env_steps >= args_cli.train_steps:
             raise ValueError(
                 f"--train_steps={args_cli.train_steps} is not greater than resumed env_steps={train_state.env_steps}. "
@@ -1674,6 +1786,7 @@ def main() -> None:
         model_policy_candidate_count=args_cli.num_pi_trajs if args_cli.model_type in {"state", "latent"} else 0,
     )
     print("[MBRL] Planner built", flush=True)
+    eval_dyn: DynamicsRandomizer | None = None
     eval_env = None
     eval_planner = None
     if args_cli.online_eval:
@@ -1707,12 +1820,21 @@ def main() -> None:
             )
             if eval_action_dim != action_dim:
                 raise ValueError(f"Eval action_dim={eval_action_dim} does not match train action_dim={action_dim}.")
+            if dyn.enabled:
+                eval_dyn = DynamicsRandomizer(
+                    int(args_cli.online_eval_num_envs), device,
+                    motor_gain_range=args_cli.dyn_motor_gain_range,
+                    friction_range=args_cli.dyn_friction_range,
+                    seed=args_cli.seed + 10000,
+                )
+                eval_dyn.attach(eval_env)
         else:
             print(
                 "[MBRL] Online eval will reuse the training env to avoid constructing a second Isaac env.",
                 flush=True,
             )
             eval_env = env
+            eval_dyn = dyn if dyn.enabled else None
             eval_action_low = action_low
             eval_action_high = action_high
             eval_action_bounds_finite = action_bounds_finite
@@ -1797,9 +1919,30 @@ def main() -> None:
         print(
             "[MBRL] System-id history encoder enabled "
             f"context_dim={args_cli.history_context_dim} history_len={args_cli.history_len} "
-            f"d_model={args_cli.history_d_model} heads={args_cli.history_nhead} layers={args_cli.history_layers}",
+            f"d_model={args_cli.history_d_model} heads={args_cli.history_nhead} layers={args_cli.history_layers} "
+            f"sit_train_mode={args_cli.sit_train_mode}",
             flush=True,
         )
+    # base_weight_drift: max |w - w_at_load| over a fixed set of base first layers, logged in both
+    # SIT modes (must stay exactly 0.0 in adapter mode).
+    drift_reference: dict[str, torch.Tensor] = {}
+    adapter_freeze_check: dict[str, torch.Tensor] | None = None
+    if use_history:
+        _named = dict(model.named_parameters())
+        drift_reference = {
+            name: _named[name].detach().clone()
+            for name in ("encoder.0.0.weight", "dynamics.0.0.weight", "reward_head.0.weight",
+                         "policy_head.0.weight", "q_heads.0.0.weight")
+            if name in _named
+        }
+        if args_cli.sit_train_mode == "adapter":
+            # One-time exact check after the first update: every non-adapter tensor, including
+            # the target/detach copies of base weights, must be bit-identical to its loaded value.
+            adapter_freeze_check = {
+                name: param.detach().clone()
+                for name, param in _named.items()
+                if not name.endswith("context_weight") and not name.startswith("history_encoder.")
+            }
 
     episode_returns = torch.zeros(num_envs, dtype=torch.float32, device=device)
     episode_lengths = torch.zeros(num_envs, dtype=torch.float32, device=device)
@@ -1823,7 +1966,8 @@ def main() -> None:
             # metrics.csv takes its header from the first row and writes later rows in dict order,
             # so seed the keys in the order training produces them (policy_bc_logmu included).
             latest_losses.update(
-                {"policy_bc_logmu": 0.0, "history_encoder_grad_norm": 0.0, "context_weight_norm": 0.0}
+                {"policy_bc_logmu": 0.0, "history_encoder_grad_norm": 0.0, "context_weight_norm": 0.0,
+                 "base_weight_drift": 0.0}
             )
     elif args_cli.model_type == "state":
         latest_losses = {
@@ -2002,6 +2146,8 @@ def main() -> None:
                 latest_planner_diagnostics.update(planner.last_diagnostics)
             planner_was_active = planner_ready
 
+            # Parameters in force for THIS transition (resampled below, after the reset).
+            step_dyn_params = dyn.params() if dyn.enabled else None
             next_obs_raw, rewards, terminated, truncated, _ = env.step(actions)
             next_obs = flatten_obs(next_obs_raw, device)
             rewards = to_tensor(rewards, device).float().view(-1, 1)
@@ -2041,7 +2187,9 @@ def main() -> None:
                 planner_mean=step_planner_mean,
                 planner_std=step_planner_std,
                 clean_vel=step_clean_vel,
+                dyn_params=step_dyn_params,
             )
+            dyn.resample(done.view(-1))
 
             recent_step_rewards.append(float(rewards.mean().item()))
             episode_returns += rewards.squeeze(-1)
@@ -2153,11 +2301,28 @@ def main() -> None:
                     torch.nn.utils.clip_grad_norm_(model.policy_parameters(), args_cli.grad_clip_norm)
                     policy_optimizer.step()
                     metrics.update(policy_metrics)
+                if drift_reference:
+                    with torch.no_grad():
+                        _named_now = dict(model.named_parameters())
+                        sit_metrics["base_weight_drift"] = max(
+                            float((_named_now[name] - ref).abs().max()) for name, ref in drift_reference.items()
+                        )
                 # Appended LAST: metrics.csv writes each row in dict order against the first
                 # row's header, so these must follow the policy metrics (see latest_losses init).
                 metrics.update(sit_metrics)
                 if hasattr(model, "soft_update_targets"):
                     model.soft_update_targets()
+                if adapter_freeze_check is not None:
+                    _named_now = dict(model.named_parameters())
+                    _changed = [n for n, ref in adapter_freeze_check.items() if not torch.equal(_named_now[n], ref)]
+                    if _changed:
+                        raise RuntimeError(
+                            f"SIT adapter mode: {len(_changed)} frozen tensor(s) changed after the first "
+                            f"update, e.g. {_changed[:4]}"
+                        )
+                    print(f"[MBRL] SIT adapter mode: all {len(adapter_freeze_check)} frozen tensors "
+                          "bit-identical after the first update OK", flush=True)
+                    adapter_freeze_check = None
                 latest_losses = metrics
                 train_state.gradient_updates += 1
             model.eval()
@@ -2199,10 +2364,14 @@ def main() -> None:
                     max_steps=args_cli.online_eval_max_steps,
                     progress_interval=args_cli.online_eval_progress_interval,
                     max_seconds=args_cli.online_eval_max_seconds,
+                    dyn=eval_dyn,
                 )
                 if eval_env is env:
                     obs_raw, _ = env.reset()
                     obs = flatten_obs(obs_raw, device)
+                    if history is not None:
+                        history.clear()  # every env just started a new episode
+                    dyn.resample(torch.ones(num_envs, dtype=torch.bool, device=device))
                     episode_returns.zero_()
                     episode_lengths.zero_()
                     planner.reset()
@@ -2272,6 +2441,8 @@ def main() -> None:
                 **latest_eval_metrics,
                 **latest_planner_diagnostics,
                 **latest_losses,
+                # Appended last and only when enabled, so metrics.csv is unchanged with dyn off.
+                **dyn.metrics(),
             }
             append_metrics(metrics_path, row)
             writer.add_scalar("Reward / total_reward_mean", estimated_return_100, train_state.env_steps)

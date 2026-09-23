@@ -24,7 +24,7 @@ class UnitreeGo2RandFlatEnvCfg(UnitreeGo2RoughEnvCfg):
         # task drives the faster gait that clears the reward-only ~0.33 ceiling to ~0.39 m/s
         # at command 0.4. Parent rough_env_cfg sets 0.25; the older x0.2/x0.3/x0.4-v0p31
         # curriculum checkpoints were trained at 0.25 and must be replayed with
-        # --action_scale 0.25 (run.sh play does this per stage).
+        # --action_scale 0.25 (omni_run.sh play does this per stage).
         self.actions.joint_pos.scale = 0.40
 
         # override rewards
@@ -61,7 +61,10 @@ class UnitreeGo2RandFlatEnvCfg(UnitreeGo2RoughEnvCfg):
         # change terrain to flat
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
-        # disable startup randomization terms that are incompatible with the installed Isaac Lab event API
+        # disable the stock startup randomization terms. Robot friction and motor gain are
+        # randomised per env by ldm_quad/mbrl/dynamics_rand.py (--dyn_friction_range,
+        # --dyn_motor_gain_range) so the true values can be logged; the stock material event
+        # assigns random buckets per SHAPE, which gives no single per-env value.
         self.events.physics_material = None
         self.events.add_base_mass = None
         self.events.base_com = None

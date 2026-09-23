@@ -9,14 +9,14 @@ becomes a logged OUTPUT (adr_state.json / adr_history.csv) instead of hand-picke
 
 WHY ORCHESTRATION AND NOT AN IN-LOOP HOOK
 -----------------------------------------
-Nothing in the training path changes. run.sh already accepts every boundary as an env
+Nothing in the training path changes. omni_run.sh already accepts every boundary as an env
 override, so this only sets env vars and reads the sweep CSV -- both proven code paths.
 train.py's own --online_eval hangs (verified 2026-09-03), so in-loop eval is not an option
 anyway.
 
 Widening the command range does NOT invalidate the replay buffer: rewards are unchanged, the
 old data is still correctly labelled, it just does not yet cover the new region. So the buffer
-resumes across rounds (--auto_resume_replay, run.sh default) and there is no cold-refill cost.
+resumes across rounds (--auto_resume_replay, omni_run.sh default) and there is no cold-refill cost.
 This is why a REWARD change (Stage R) needs a fresh buffer but a RANGE change does not.
 
   python scripts/mbrl/adr_loop.py --resume_from <ckpt> --start_steps 364000 --rounds 20
@@ -141,7 +141,7 @@ def main() -> None:
             "REPLAY_RESUME": "1",
         })
         t0 = time.time()
-        rc = subprocess.call(["bash", "scripts/mbrl/run.sh", "train"], cwd=REPO, env=env)
+        rc = subprocess.call(["bash", "scripts/mbrl/omni_run.sh", "train"], cwd=REPO, env=env)
         run_dir = newest_run_dir(t0)
         if rc != 0 or run_dir is None:
             print(f"[adr] training failed rc={rc}; stopping", flush=True)

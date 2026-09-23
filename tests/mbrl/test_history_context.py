@@ -624,3 +624,329 @@ def test_optimizer_remap_real(baseline_ckpt):
         opt.step()
     assert hist_grad[0] == 0.0 and hist_grad[1] > 0.0, hist_grad
     assert named["encoder.0.context_weight"].abs().sum() > 0
+
+
+# --------------------------------------------------------------------------- adapter mode
+def test_adapter_mode_real(baseline_ckpt):
+    """--sit_train_mode adapter: graft stageL, 3 updates, base (incl. target/detach) bit-frozen."""
+    kwargs = baseline_kwargs(baseline_ckpt)
+    model = LatentWorldModel(**kwargs, context_dim=CONTEXT_DIM, history_len=48)
+    new_keys = _ckpt.graft_context_free_state_dict(model, baseline_ckpt["model"])
+    trainable, frozen = model.freeze_base_for_adapter()
+    adapter_ids = {id(p) for p in model.adapter_parameters()} | {id(p) for p in model.policy_adapter_parameters()}
+    assert trainable == sum(p.numel() for p in model.parameters() if id(p) in adapter_ids)
+    assert all(p.requires_grad == (id(p) in adapter_ids) for p in model.parameters())
+
+    # Same construction and load remap as train.py.
+    (enc, nonenc), pol = _ckpt.latent_optimizer_param_groups(model, "adapter")
+    opt = torch.optim.Adam([{"params": enc, "lr": 3e-4}, {"params": nonenc, "lr": 3e-4}], lr=3e-4)
+    popt = torch.optim.Adam(pol, lr=3e-4, eps=1e-5)
+    named = dict(model.named_parameters())
+    added = {id(named[k]) for k in new_keys if k in named}
+    saved_groups, saved_policy = _ckpt.latent_optimizer_param_groups(model, "full", exclude=added)
+    c = _ckpt.remap_optimizer_state(opt, baseline_ckpt["optimizer"], saved_groups)
+    pc = _ckpt.remap_optimizer_state(popt, baseline_ckpt["policy_optimizer"], [saved_policy])
+    assert c["kept"] == pc["kept"] == 0
+    assert c["dropped_absent"] == len(baseline_ckpt["optimizer"]["state"])
+    assert pc["dropped_absent"] == len(baseline_ckpt["policy_optimizer"]["state"])
+    assert c["fresh"] == len(enc) + len(nonenc) and pc["fresh"] == 1 == len(pol)
+    assert not opt.state and not popt.state  # fresh Adam for the adapter
+
+    frozen_ref = {n: p.detach().clone() for n, p in named.items()
+                  if not n.endswith("context_weight") and not n.startswith("history_encoder.")}
+    adapter_ref = {n: p.detach().clone() for n, p in named.items() if id(p) in adapter_ids}
+    target_ctx = [n for n in named if n.startswith(("target_encoder.", "target_q_heads.")) and n.endswith("context_weight")]
+
+    torch.manual_seed(0)
+    H, B, K = 3, 16, 48
+    batch = {
+        "obs": torch.randn(H + 1, B, kwargs["obs_dim"]),
+        "actions": torch.rand(H, B, kwargs["action_dim"]) * 2 - 1,
+        "planner_mean": torch.full((H, B, kwargs["action_dim"]), float("nan")),
+        "planner_std": torch.full((H, B, kwargs["action_dim"]), float("nan")),
+        "rewards": torch.randn(H, B, 1),
+        "continues": torch.ones(H, B, 1),
+        "history_actions": torch.rand(B, K, kwargs["action_dim"]) * 2 - 1,
+        "history_transitions": torch.randn(B, K, kwargs["obs_dim"]) * 0.1,
+        "history_pad_mask": torch.rand(B, K) < 0.2,
+    }
+    # Episode-start samples have an all-padded window: they must use the pinned zero null.
+    batch["history_pad_mask"][:2] = True
+    q_scale_at_load = model.q_scale.value.clone()
+    model.train()
+    for _ in range(3):  # the train.py update, verbatim order
+        loss, _, zs = model.loss(batch)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.model_parameters(), 20.0)
+        opt.step()
+        model.sync_detached_qs()
+        pl, _ = model.policy_loss(zs, planner_mean=batch["planner_mean"], planner_std=batch["planner_std"])
+        popt.zero_grad(set_to_none=True)
+        pl.backward()
+        torch.nn.utils.clip_grad_norm_(model.policy_parameters(), 20.0)
+        popt.step()
+        model.soft_update_targets()
+
+    named = dict(model.named_parameters())
+    changed_base = [n for n, ref in frozen_ref.items() if not torch.equal(named[n], ref)]
+    assert changed_base == [], changed_base  # includes target_* and detach_* base tensors
+    unmoved = [n for n, ref in adapter_ref.items() if torch.equal(named[n], ref)]
+    assert unmoved == [], unmoved
+    assert all(named[n].abs().sum() > 0 for n in target_ctx), "target context weights should EMA-track"
+
+    # What adapter mode does and does NOT guarantee for the walker:
+    model.eval()
+    base = LatentWorldModel(**kwargs)
+    base.load_state_dict(baseline_ckpt["model"])
+    base.eval()
+    obs = torch.randn(256, kwargs["obs_dim"])
+    with torch.no_grad():
+        ref = base.pi(base.encode(obs), deterministic=True)
+        zeroed = LatentWorldModel(**kwargs, context_dim=CONTEXT_DIM, history_len=48)
+        zeroed.load_state_dict(model.state_dict())
+        for n, p in zeroed.named_parameters():
+            if n.endswith("context_weight"):
+                p.zero_()
+        zeroed.eval()
+        # (a) with the projections removed the base network is exactly stageL
+        assert torch.equal(zeroed.pi(zeroed.encode(obs), deterministic=True), ref)
+        # (b) null_context is a fixed zero buffer, so an empty history IS stageL, even after
+        #     training -- the null-context arm is exactly the frozen walker.
+        null_act = model.pi(model.encode(obs), deterministic=True)
+        # (c) a real history context does change the policy (that is the adapter's job).
+        ctx = torch.nn.functional.normalize(torch.randn(256, CONTEXT_DIM), dim=-1)
+        ctx_act = model.pi(model.encode(obs, context=ctx), deterministic=True, context=ctx)
+    assert torch.equal(model.history_encoder.null_context, torch.zeros(CONTEXT_DIM))
+    assert "history_encoder.null_context" not in dict(model.named_parameters())
+    assert torch.equal(null_act, ref)
+    assert not torch.equal(ctx_act, ref)
+    # D2: the actor-loss Q scale is frozen at its loaded value in adapter mode.
+    assert model.q_scale.frozen and torch.equal(model.q_scale.value, q_scale_at_load)
+
+
+# --------------------------------------------------------------------------- dynamics randomisation
+_dyn = _load("dynamics_rand")
+
+
+class _FakeTerm:
+    action_dim = ACTION_DIM
+
+    def __init__(self, n):
+        self._scale = 0.4  # JointAction stores a float unless the cfg gives per-joint scales
+
+
+class _FakeView:
+    def __init__(self, n, shapes=27):
+        self.mat = torch.ones(n, shapes, 3)
+        self.mat[..., 2] = 0.0
+        self.set_calls = []
+
+    def get_material_properties(self):
+        return self.mat.clone()
+
+    def set_material_properties(self, materials, env_ids):
+        self.set_calls.append(env_ids.clone())
+        self.mat[env_ids] = materials[env_ids]
+
+
+class _FakeEnv:
+    def __init__(self, n):
+        self.term, self.view = _FakeTerm(n), _FakeView(n)
+        term, view = self.term, self.view
+
+        class _AM:
+            def get_term(self, name):
+                return term
+
+        class _Robot:
+            root_physx_view = view
+
+        self.action_manager = _AM()
+        self.scene = {"robot": _Robot()}
+        self.unwrapped = self
+
+
+def test_dynamics_randomizer_off_is_inert():
+    env = _FakeEnv(6)
+    dr = _dyn.DynamicsRandomizer(6, "cpu")
+    dr.attach(env)
+    dr.resample(torch.ones(6, dtype=torch.bool))
+    assert not dr.enabled and dr.metrics() == {}
+    assert env.term._scale == 0.4 and env.view.set_calls == []  # simulator untouched
+    assert dr.params().shape == (6, len(_dyn.PARAM_NAMES)) and torch.isnan(dr.params()).all()
+
+
+def test_dynamics_randomizer_axes():
+    n = 16
+    env = _FakeEnv(n)
+    dr = _dyn.DynamicsRandomizer(n, "cpu", motor_gain_range=(0.6, 1.0), friction_range=(0.25, 0.8), seed=0)
+    dr.attach(env)
+    p = dr.params()
+    g, f = p[:, 0], p[:, 1]
+    assert ((g >= 0.6) & (g <= 1.0)).all() and ((f >= 0.25) & (f <= 0.8)).all()
+    assert g.unique().numel() > 1 and f.unique().numel() > 1  # per env, not one global draw
+    # motor gain lives in the action term: scale = 0.4 * g per env, every joint
+    assert torch.allclose(env.term._scale, 0.4 * g.unsqueeze(-1).expand(n, ACTION_DIM))
+    # friction written to every shape, static and dynamic, restitution untouched
+    assert torch.allclose(env.view.mat[..., 0], f.unsqueeze(-1).expand(n, 27))
+    assert torch.allclose(env.view.mat[..., 1], f.unsqueeze(-1).expand(n, 27))
+    assert (env.view.mat[..., 2] == 0).all()
+    assert torch.allclose(dr.read_back_friction(), f)
+    # resample only the done envs
+    done = torch.zeros(n, dtype=torch.bool)
+    done[[2, 9]] = True
+    before = dr.params().clone()
+    dr.resample(done)
+    after = dr.params()
+    assert torch.equal(after[~done], before[~done])
+    assert not torch.equal(after[done], before[done])
+    assert torch.equal(env.view.set_calls[-1], torch.tensor([2, 9]))
+    assert torch.allclose(env.term._scale[:, 0], 0.4 * after[:, 0])
+    m = dr.metrics()
+    assert list(m) == [f"dyn_{a}_{s}" for a in _dyn.PARAM_NAMES for s in ("mean", "min", "max")]
+    # pinned held-out value
+    pinned = _dyn.DynamicsRandomizer(n, "cpu", motor_gain_range=(0.7, 0.7))
+    pinned.attach(_FakeEnv(n))
+    assert torch.allclose(pinned.motor_gain, torch.full((n,), 0.7)) and torch.isnan(pinned.foot_friction).all()
+
+
+def test_replay_dyn_params():
+    buf = ReplayBuffer(NUM_ENVS * ROLLOUT_STEPS * 2, obs_dim=OBS_DIM, action_dim=ACTION_DIM)
+    step = torch.zeros(NUM_ENVS, dtype=torch.long)
+    episode = torch.zeros(NUM_ENVS, dtype=torch.long)
+    lengths = torch.tensor([episode_length(e) for e in range(NUM_ENVS)])
+    for t in range(ROLLOUT_STEPS):
+        env = torch.arange(NUM_ENVS)
+        ident = torch.stack([env, episode, step, torch.full_like(env, t)], dim=-1).float()
+        obs = torch.zeros(NUM_ENVS, OBS_DIM)
+        obs[:, :4] = ident
+        done = step + 1 >= lengths
+        # parameter = a per-(env, episode) code, constant within an episode
+        dyn = torch.stack([env * 10.0 + episode, -(env * 10.0 + episode)], dim=-1)
+        buf.add_batch(obs, ident, torch.zeros(NUM_ENVS, 1), obs.clone(), (~done).float().unsqueeze(-1),
+                      resets=done, dyn_params=dyn)
+        step = torch.where(done, torch.zeros_like(step), step + 1)
+        episode = torch.where(done, episode + 1, episode)
+    batch = buf.sample_sequences(64, 3, device="cpu", history_len=HISTORY_LEN)
+    assert batch["dyn_params"].shape == (64, 2)
+    env_id, ep = batch["obs"][0, :, 0], batch["obs"][0, :, 1]
+    assert torch.equal(batch["dyn_params"][:, 0], env_id * 10 + ep)  # the START transition's parameters
+    # checkpoint round trip, and a legacy buffer without the key loads as NaN
+    sd = buf.state_dict()
+    fresh = ReplayBuffer(buf.capacity, obs_dim=OBS_DIM, action_dim=ACTION_DIM)
+    fresh.load_state_dict(sd)
+    assert torch.equal(fresh.dyn_params[: buf.size], buf.dyn_params[: buf.size])
+    sd.pop("dyn_params")
+    fresh.load_state_dict(sd)
+    assert torch.isnan(fresh.dyn_params).all()
+    # add_batch without dyn_params stores NaN (default-off runs)
+    buf.add_batch(torch.zeros(NUM_ENVS, OBS_DIM), torch.zeros(NUM_ENVS, ACTION_DIM), torch.zeros(NUM_ENVS, 1),
+                  torch.zeros(NUM_ENVS, OBS_DIM), torch.ones(NUM_ENVS, 1))
+    last = (buf.ptr - NUM_ENVS) % buf.capacity
+    assert torch.isnan(buf.dyn_params[last:last + NUM_ENVS]).all()
+
+
+# --------------------------------------------------------------------------- eval context modes
+_hist = _load("history")
+
+
+def _feed(ctrl, steps, n, seed=0, done_at=None):
+    g = torch.Generator().manual_seed(seed)
+    for _ in range(steps):
+        done = None
+        if done_at is not None and ctrl.t in done_at:
+            done = torch.zeros(n, dtype=torch.bool)
+            done[done_at[ctrl.t]] = True
+        ctrl.append(torch.randn(n, ACTION_DIM, generator=g), torch.randn(n, OBS_DIM, generator=g), done)
+
+
+def _ctrl(mode="rolling", n=3, **kw):
+    return _hist.ContextController(n, HISTORY_LEN, ACTION_DIM, OBS_DIM, torch.device("cpu"), mode=mode, **kw)
+
+
+def test_context_mode_null_is_zero():
+    model = make_model(randomize=False)  # null_context is the pinned zero buffer
+    ctrl = _ctrl("null")
+    with torch.no_grad():
+        _feed(ctrl, HISTORY_LEN + 2, 3)
+        c = ctrl.context(model)
+    assert torch.equal(c, torch.zeros(3, CONTEXT_DIM))
+
+
+def test_context_mode_rolling_matches_rolling_history():
+    model = make_model()
+    ctrl, ref = _ctrl("rolling"), RollingHistory(3, HISTORY_LEN, ACTION_DIM, OBS_DIM, torch.device("cpu"))
+    g = torch.Generator().manual_seed(1)
+    with torch.no_grad():
+        for _ in range(HISTORY_LEN + 3):
+            a, tr = torch.randn(3, ACTION_DIM, generator=g), torch.randn(3, OBS_DIM, generator=g)
+            ctrl.append(a, tr)
+            ref.append(a, tr)
+        assert torch.equal(ctrl.context(model), ref.context(model))
+
+
+def test_context_mode_frozen_holds_and_resets_to_null():
+    model = make_model()
+    ctrl = _ctrl("frozen", freeze_step=5)
+    with torch.no_grad():
+        _feed(ctrl, 5, 3)
+        c_freeze = ctrl.context(model)  # t == 5: the frozen value
+        _feed(ctrl, 4, 3, seed=7, done_at={7: [1]})  # env 1 resets after the freeze
+        c_later = ctrl.context(model)
+    assert torch.equal(c_later[[0, 2]], c_freeze[[0, 2]])  # held despite new transitions
+    assert torch.allclose(c_later[1], model.history_encoder.null())
+    assert ctrl.metrics()["context_drift_mean"] >= 0.0
+
+
+def test_context_mode_truncated_clears_every_window():
+    model = make_model()
+    ctrl = _ctrl("truncated", truncate_step=6)
+    g = torch.Generator().manual_seed(2)
+    with torch.no_grad():
+        _feed(ctrl, 6, 3)
+        assert not ctrl.history.valid.any()  # cleared at the truncation step
+        assert torch.allclose(ctrl.context(model), model.history_encoder.null().expand(3, -1))
+        a, tr = torch.randn(3, ACTION_DIM, generator=g), torch.randn(3, OBS_DIM, generator=g)
+        ctrl.append(a, tr)
+        c = ctrl.context(model)
+        only = model.encode_context(a.unsqueeze(1), tr.unsqueeze(1), torch.zeros(3, 1, dtype=torch.bool))
+    assert torch.allclose(c, only, atol=1e-6)  # rebuilt from post-truncation transitions only
+
+
+def test_context_len_pads_older_slots():
+    model = make_model()
+    k = 3
+    ctrl = _ctrl("rolling", context_len=k)
+    g = torch.Generator().manual_seed(3)
+    acts, trans = [], []
+    with torch.no_grad():
+        for _ in range(HISTORY_LEN + 2):
+            a, tr = torch.randn(3, ACTION_DIM, generator=g), torch.randn(3, OBS_DIM, generator=g)
+            acts.append(a)
+            trans.append(tr)
+            ctrl.append(a, tr)
+        assert (~ctrl.pad_mask()).sum(dim=1).tolist() == [k, k, k]
+        c = ctrl.context(model)
+        recent = model.encode_context(
+            torch.stack(acts[-k:], dim=1), torch.stack(trans[-k:], dim=1), torch.zeros(3, k, dtype=torch.bool)
+        )
+    assert torch.allclose(c, recent, atol=1e-6)  # set encoder: order-free, older slots ignored
+    with pytest.raises(ValueError):
+        _ctrl("rolling", context_len=HISTORY_LEN + 1)
+
+
+def test_dyn_switch_pins_axis():
+    n = 8
+    env = _FakeEnv(n)
+    dr = _dyn.DynamicsRandomizer(n, "cpu", motor_gain_range=(1.0, 1.0), friction_range=(1.0, 1.0))
+    dr.attach(env)
+    dr.switch(friction=0.3)
+    assert torch.allclose(dr.read_back_friction(), torch.full((n,), 0.3))
+    assert torch.allclose(dr.motor_gain, torch.ones(n))  # untouched axis not redrawn
+    dr.resample(torch.tensor([2]))  # a post-switch reset keeps the switched value
+    assert torch.allclose(dr.foot_friction, torch.full((n,), 0.3))
+    dr.switch(motor_gain=0.6)
+    assert torch.allclose(env.term._scale, torch.full((n, ACTION_DIM), 0.4 * 0.6))
+    with pytest.raises(ValueError):
+        _dyn.DynamicsRandomizer(n, "cpu").switch(friction=0.3)

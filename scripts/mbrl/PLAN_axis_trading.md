@@ -44,7 +44,7 @@ Each arrow below is a stop: post the mean_length-first tables, then decide.
 ## Phase A = #15c (~10k steps, warm)
 Resume `logs/mbrl/history/stageT2_warmbuffer_TRADING_CONFIRMED/checkpoints/model_396000.pt` WITH its
 `replay_latest.pt`. Current reward. Gated yaw objective ON in collection (exp, W 0.5, lin 0, yaw 8, G 0.1).
-#9 storage on, #10 on, save_interval 2000, sweeper attached. Update run.sh as the Phase A recipe.
+#9 storage on, #10 on, save_interval 2000, sweeper attached. Update omni_run.sh as the Phase A recipe.
 Launch via `systemd-run --user`.
 
 ## Phase B = #16 (~20k steps, warm)
