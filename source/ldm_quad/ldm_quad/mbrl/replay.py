@@ -137,33 +137,37 @@ class ReplayBuffer:
         clean_vel: torch.Tensor | None = None,
         dyn_params: torch.Tensor | None = None,
     ) -> None:
-        obs = obs.to(self.device, non_blocking=True)
-        actions = actions.to(self.device, non_blocking=True)
-        rewards = rewards.to(self.device, non_blocking=True)
-        next_obs = next_obs.to(self.device, non_blocking=True)
-        continues = continues.to(self.device, non_blocking=True)
+        # non_blocking only when the buffer is on the GPU. A non_blocking GPU->CPU copy returns before
+        # the data lands, and the slice assignment below would store whatever the host memory held
+        # (seen: every field of a CPU buffer fed CUDA tensors was garbage).
+        nb = self.device.type == "cuda"
+        obs = obs.to(self.device, non_blocking=nb)
+        actions = actions.to(self.device, non_blocking=nb)
+        rewards = rewards.to(self.device, non_blocking=nb)
+        next_obs = next_obs.to(self.device, non_blocking=nb)
+        continues = continues.to(self.device, non_blocking=nb)
         if resets is not None:
-            resets = resets.to(self.device, non_blocking=True)
+            resets = resets.to(self.device, non_blocking=nb)
 
         batch_size = obs.shape[0]
         # TD-M(PC)^2: planner Gaussian for this batch, NaN where unavailable.
         if planner_mean is None:
             planner_mean = torch.full_like(self.planner_mean[:batch_size], float("nan"))
         else:
-            planner_mean = planner_mean.to(self.device, non_blocking=True)
+            planner_mean = planner_mean.to(self.device, non_blocking=nb)
         if planner_std is None:
             planner_std = torch.full_like(self.planner_std[:batch_size], float("nan"))
         else:
-            planner_std = planner_std.to(self.device, non_blocking=True)
+            planner_std = planner_std.to(self.device, non_blocking=nb)
 
         if clean_vel is None:
             clean_vel = torch.full_like(self.clean_vel[:batch_size], float("nan"))
         else:
-            clean_vel = clean_vel.to(self.device, non_blocking=True)
+            clean_vel = clean_vel.to(self.device, non_blocking=nb)
         if dyn_params is None:
             dyn_params = torch.full_like(self.dyn_params[:batch_size], float("nan"))
         else:
-            dyn_params = dyn_params.to(self.device, torch.float32, non_blocking=True)
+            dyn_params = dyn_params.to(self.device, torch.float32, non_blocking=nb)
 
         self._last_batch_size = batch_size
         if self._env_episode_ids.numel() != batch_size:

@@ -950,3 +950,19 @@ def test_dyn_switch_pins_axis():
     assert torch.allclose(env.term._scale, torch.full((n, ACTION_DIM), 0.4 * 0.6))
     with pytest.raises(ValueError):
         _dyn.DynamicsRandomizer(n, "cpu").switch(friction=0.3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_cpu_replay_fed_cuda_tensors_is_exact():
+    """Regression: a CPU buffer fed CUDA tensors used non_blocking D2H copies and stored garbage."""
+    buf = ReplayBuffer(4096, obs_dim=OBS_DIM, action_dim=ACTION_DIM, device="cpu")
+    for _ in range(20):
+        obs = torch.randn(64, OBS_DIM, device="cuda") @ torch.eye(OBS_DIM, device="cuda")
+        act = torch.randn(64, ACTION_DIM, device="cuda")
+        dyn = torch.rand(64, 2, device="cuda")
+        start = buf.ptr
+        buf.add_batch(obs, act, torch.randn(64, 1, device="cuda"), obs * 2, torch.ones(64, 1, device="cuda"),
+                      dyn_params=dyn)
+        assert torch.equal(buf.obs[start:start + 64], obs.cpu())
+        assert torch.equal(buf.actions[start:start + 64], act.cpu())
+        assert torch.equal(buf.dyn_params[start:start + 64], dyn.cpu())
