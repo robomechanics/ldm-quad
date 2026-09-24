@@ -370,6 +370,7 @@ class LatentWorldModel(nn.Module):
         history_layers: int = 1,
         history_ff: int = 256,
         history_dropout: float = 0.1,
+        context_components: str = "all",
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -437,19 +438,26 @@ class LatentWorldModel(nn.Module):
         # a warm-started model reproduces it exactly until the projections learn.
         # continue/physical heads read the (already context-aware) latent directly.
         ctx = self.context_dim
+        # Where the context is wired in at CONSTRUCTION. "all": every conditioned component (above).
+        # "dynamics_only" (payAttentionDrift's structure): only d(z, a, c) sees it; the encoder,
+        # reward, Q and policy are the context-free model's, so no other context_weight exists.
+        if context_components not in ("all", "dynamics_only"):
+            raise ValueError(f"context_components must be 'all' or 'dynamics_only', got {context_components!r}")
+        self.context_components = context_components
+        ctx_heads = ctx if context_components == "all" else 0
         z_dim = self.z_dim
-        self.encoder = latent_mlp(obs_dim, hidden_dim, latent_dim, depth, simnorm_dim, context_dim=ctx)
+        self.encoder = latent_mlp(obs_dim, hidden_dim, latent_dim, depth, simnorm_dim, context_dim=ctx_heads)
         self.dynamics = latent_mlp(z_dim + action_dim, hidden_dim, latent_dim, depth, simnorm_dim, context_dim=ctx)
-        self.reward_head = mlp(z_dim + action_dim, hidden_dim, head_dim, depth, context_dim=ctx)
+        self.reward_head = mlp(z_dim + action_dim, hidden_dim, head_dim, depth, context_dim=ctx_heads)
         self.continue_head = mlp(z_dim, hidden_dim, 1, depth)
-        self.policy_head = mlp(z_dim, hidden_dim, 2 * action_dim, depth, context_dim=ctx)
+        self.policy_head = mlp(z_dim, hidden_dim, 2 * action_dim, depth, context_dim=ctx_heads)
         self.physical_head = (
             mlp(z_dim, hidden_dim, len(self.physical_feature_indices), depth)
             if self.physical_feature_indices
             else None
         )
         self.q_heads = nn.ModuleList(
-            mlp(z_dim + action_dim, hidden_dim, head_dim, depth, dropout=q_dropout, context_dim=ctx)
+            mlp(z_dim + action_dim, hidden_dim, head_dim, depth, dropout=q_dropout, context_dim=ctx_heads)
             for _ in range(num_q)
         )
         self._zero_init_distribution_heads()
@@ -668,8 +676,37 @@ class LatentWorldModel(nn.Module):
                     yield param
 
     def policy_adapter_parameters(self):
-        if self.context_dim > 0:
+        if self.policy_head.context_weight is not None:
             yield self.policy_head.context_weight
+
+    CONTEXT_MASKS = ("none", "dynamics_only", "dynamics_strict")
+    _MASKED_HEADS = {
+        "dynamics_only": ("reward_head", "q_heads", "target_q_heads", "detach_q_heads", "policy_head"),
+        "dynamics_strict": ("encoder", "target_encoder", "reward_head", "q_heads", "target_q_heads",
+                            "detach_q_heads", "policy_head"),
+    }
+
+    @torch.no_grad()
+    def restrict_context(self, mask: str = "none") -> list[str]:
+        """Evaluation-time ablation of where the system-id context acts (zeroes projections).
+
+        ``dynamics_only`` zeroes the reward head, every Q-head copy and the policy head: the
+        planner's objective is the context-free model's, but the ENCODER still sees the context,
+        so the latent those heads read is context-shifted. ``dynamics_strict`` also zeroes the
+        encoder (and its target), so the context acts only inside the dynamics MLP. Heads that were
+        co-adapted with the context through z are not recovered by masking either way.
+        Returns the zeroed parameter names.
+        """
+        if mask not in self.CONTEXT_MASKS:
+            raise ValueError(f"mask must be one of {self.CONTEXT_MASKS}, got {mask!r}")
+        if mask == "none" or self.context_dim == 0:
+            return []
+        zeroed = []
+        for name, param in self.named_parameters():
+            if name.endswith("context_weight") and name.split(".")[0] in self._MASKED_HEADS[mask]:
+                param.zero_()
+                zeroed.append(name)
+        return zeroed
 
     def freeze_base_for_adapter(self) -> tuple[int, int]:
         """Freeze every online weight except the SIT adapter, and the actor-loss Q scale.

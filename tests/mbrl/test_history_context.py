@@ -966,3 +966,114 @@ def test_cpu_replay_fed_cuda_tensors_is_exact():
         assert torch.equal(buf.obs[start:start + 64], obs.cpu())
         assert torch.equal(buf.actions[start:start + 64], act.cpu())
         assert torch.equal(buf.dyn_params[start:start + 64], dyn.cpu())
+
+
+def test_restrict_context_dynamics_only():
+    model = make_model()  # context weights randomised
+    before = {n: p.clone() for n, p in model.named_parameters()}
+    zeroed = model.restrict_context("dynamics_only")
+    after = dict(model.named_parameters())
+    heads = ("reward_head", "q_heads", "target_q_heads", "detach_q_heads", "policy_head")
+    expect = {n for n in before if n.endswith("context_weight") and n.split(".")[0] in heads}
+    assert set(zeroed) == expect and len(expect) == 2 + 2 * 3  # reward + policy + 2 Q heads x (online, target, detach)
+    for n, p in after.items():
+        if n in expect:
+            assert torch.equal(p, torch.zeros_like(p)), n
+        else:
+            assert torch.equal(p, before[n]), n  # encoder/dynamics context and every base weight untouched
+    # objective is context-free, rollout is context-conditioned
+    obs, a = torch.randn(BATCH, OBS_DIM), torch.randn(BATCH, ACTION_DIM).clamp(-1, 1)
+    acts, trans = random_history()
+    with torch.no_grad():
+        c = model.encode_context(acts, trans)
+        z = model.encode(obs, context=c)
+        assert torch.equal(model.reward_logits(z, a, context=c), model.reward_logits(z, a, context=None))
+        assert torch.equal(model.Q_logits(z, a, context=c), model.Q_logits(z, a, context=None))
+        assert torch.equal(model._policy_stats(z, context=c)[0], model._policy_stats(z, context=None)[0])
+        assert not torch.equal(model.next(z, a, context=c), model.next(z, a, context=None))
+        assert not torch.equal(model.encode(obs, context=c), model.encode(obs, context=None))
+    assert model.restrict_context("none") == []
+    with pytest.raises(ValueError):
+        model.restrict_context("reward_only")
+    strict = make_model()
+    z_names = strict.restrict_context("dynamics_strict")
+    assert {n.split(".")[0] for n in z_names} == {"encoder", "target_encoder", "reward_head", "q_heads",
+                                                    "target_q_heads", "detach_q_heads", "policy_head"}
+    with torch.no_grad():
+        c = strict.encode_context(acts, trans)
+        assert torch.equal(strict.encode(obs, context=c), strict.encode(obs, context=None))
+        z = strict.encode(obs)
+        assert not torch.equal(strict.next(z, a, context=c), strict.next(z, a, context=None))
+
+
+# --------------------------------------------------------------------------- v2: context in dynamics only
+def test_dynamics_only_construction_keys():
+    m = LatentWorldModel(obs_dim=OBS_DIM, action_dim=ACTION_DIM, latent_dim=32, hidden_dim=64, depth=2,
+                         num_bins=21, context_dim=CONTEXT_DIM, history_len=HISTORY_LEN,
+                         history_d_model=32, history_ff=64, context_components="dynamics_only")
+    ctx_keys = {k for k in m.state_dict() if k.endswith("context_weight")}
+    assert ctx_keys == {"dynamics.0.context_weight"}
+    assert list(m.policy_adapter_parameters()) == []
+    assert {id(p) for p in m.adapter_parameters()} == (
+        {id(m.dynamics[0].context_weight)} | {id(p) for p in m.history_encoder.parameters()})
+    with pytest.raises(ValueError):
+        LatentWorldModel(obs_dim=OBS_DIM, action_dim=ACTION_DIM, context_dim=4, history_len=4,
+                         context_components="reward_only")
+
+
+def test_dynamics_only_warm_start_and_adapter_real(baseline_ckpt):
+    kwargs = baseline_kwargs(baseline_ckpt)
+    base = LatentWorldModel(**kwargs)
+    base.load_state_dict(baseline_ckpt["model"])
+    base.eval()
+    m = LatentWorldModel(**kwargs, context_dim=CONTEXT_DIM, history_len=48, context_components="dynamics_only")
+    new_keys = _ckpt.graft_context_free_state_dict(m, baseline_ckpt["model"])
+    assert {k for k in new_keys if not k.startswith("history_encoder.")} == {"dynamics.0.context_weight"}
+    m.eval()
+    torch.manual_seed(0)
+    obs = torch.randn(32, kwargs["obs_dim"])
+    a = torch.rand(32, kwargs["action_dim"]) * 2 - 1
+    ref = model_outputs(base, obs, a, None)
+    for ctx in (None, torch.nn.functional.normalize(torch.randn(32, CONTEXT_DIM), dim=-1)):
+        got = model_outputs(m, obs, a, ctx)
+        for key in ref:
+            assert torch.equal(got[key], ref[key]), key  # warm start is exact
+
+    trainable, frozen = m.freeze_base_for_adapter()
+    assert trainable == m.dynamics[0].context_weight.numel() + sum(p.numel() for p in m.history_encoder.parameters())
+    (enc, nonenc), pol = _ckpt.latent_optimizer_param_groups(m, "adapter")
+    assert pol == [] and nonenc == [m.dynamics[0].context_weight]
+    opt = torch.optim.Adam([{"params": enc, "lr": 3e-4}, {"params": nonenc, "lr": 3e-4}], lr=3e-4)
+    named = dict(m.named_parameters())
+    added = {id(named[k]) for k in new_keys if k in named}
+    saved_groups, _ = _ckpt.latent_optimizer_param_groups(m, "full", exclude=added)
+    c = _ckpt.remap_optimizer_state(opt, baseline_ckpt["optimizer"], saved_groups)
+    assert c["kept"] == 0 and c["fresh"] == len(enc) + len(nonenc)
+
+    frozen_ref = {n: p.detach().clone() for n, p in named.items()
+                  if not n.endswith("context_weight") and not n.startswith("history_encoder.")}
+    H, B, K = 3, 16, 48
+    batch = {
+        "obs": torch.randn(H + 1, B, kwargs["obs_dim"]),
+        "actions": torch.rand(H, B, kwargs["action_dim"]) * 2 - 1,
+        "rewards": torch.randn(H, B, 1), "continues": torch.ones(H, B, 1),
+        "history_actions": torch.rand(B, K, kwargs["action_dim"]) * 2 - 1,
+        "history_transitions": torch.randn(B, K, kwargs["obs_dim"]) * 0.1,
+        "history_pad_mask": torch.zeros(B, K, dtype=torch.bool),
+    }
+    m.train()
+    hist_grad = []
+    for _ in range(2):
+        loss, _, zs = m.loss(batch)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        hist_grad.append(sum(float(p.grad.abs().sum()) for p in m.history_encoder.parameters() if p.grad is not None))
+        opt.step()
+        m.sync_detached_qs()
+        with torch.no_grad():
+            m.policy_loss(zs)  # train.py's no-optimizer path: metrics only
+        m.soft_update_targets()
+    assert hist_grad[0] == 0.0 and hist_grad[1] > 0.0, hist_grad  # only via d(z, a, c), once W moves
+    named = dict(m.named_parameters())
+    assert [n for n, r in frozen_ref.items() if not torch.equal(named[n], r)] == []
+    assert m.dynamics[0].context_weight.abs().sum() > 0

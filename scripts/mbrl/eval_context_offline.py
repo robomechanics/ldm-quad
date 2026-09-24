@@ -84,7 +84,8 @@ def _indices(text) -> list[int]:
     return [int(i) for i in str(text or "").split(",") if str(i).strip()]
 
 
-def build_model(path: str, device: str, graft_context_dim: int = 0, history_len: int = 48):
+def build_model(path: str, device: str, graft_context_dim: int = 0, history_len: int = 48,
+                graft_components: str = "all"):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     a, sd = ckpt["args"], ckpt["model"]
     latent = a.get("latent_dim", 128)
@@ -104,6 +105,7 @@ def build_model(path: str, device: str, graft_context_dim: int = 0, history_len:
             history_d_model=a.get("history_d_model", 64), history_nhead=a.get("history_nhead", 4),
             history_layers=a.get("history_layers", 1), history_ff=a.get("history_ff", 256),
             history_dropout=a.get("history_dropout", 0.1),
+            context_components=a.get("context_components") or graft_components,
         )
     model = wm.LatentWorldModel(**kwargs)
     if ck.is_context_free_state_dict(sd) and ctx_dim:
@@ -387,7 +389,9 @@ def main() -> None:
     # ---- C1: zero-context control on the reference buffer: the three arms must coincide
     control = None
     if args.control_checkpoint and os.path.exists(args.control_checkpoint):
-        cm, _ = build_model(args.control_checkpoint, args.device, graft_context_dim=model.context_dim, history_len=k_len)
+        # same context structure as the evaluated model (dynamics_only checkpoints have fewer projections)
+        cm, _ = build_model(args.control_checkpoint, args.device, graft_context_dim=model.context_dim, history_len=k_len,
+                            graft_components=model.context_components)
         d = ref["_features"]["d"]
         n = d["env"].numel()
         m = torch.arange(n) < min(n, 2048)
@@ -412,7 +416,9 @@ def main() -> None:
         for name, seq, x in (("encoder", model.encoder, obs0), ("dynamics", model.dynamics, za),
                              ("reward_head", model.reward_head, za), ("policy_head", model.policy_head, z),
                              ("q_heads.0", model.q_heads[0], za)):
-            inner = seq[0] if seq.context_weight is None else seq  # latent_mlp nests the MLP
+            inner = seq[0] if isinstance(seq[0], torch.nn.Sequential) else seq  # latent_mlp nests the MLP
+            if inner.context_weight is None:
+                continue  # not conditioned in this checkpoint (context_components=dynamics_only)
             base = inner[0](x).norm(dim=-1).mean()
             term = torch.nn.functional.linear(c2, inner.context_weight).norm(dim=-1).mean()
             term_ratio[name] = float(term / base)

@@ -222,6 +222,16 @@ parser.add_argument("--history_layers", type=int, default=1, help="History trans
 parser.add_argument("--history_ff", type=int, default=256, help="History transformer feedforward dimension.")
 parser.add_argument("--history_dropout", type=float, default=0.1, help="History transformer dropout probability.")
 parser.add_argument(
+    "--context_components",
+    choices=["all", "dynamics_only"],
+    default="all",
+    help=(
+        "Where the history context is wired in at construction (recorded in the checkpoint). all: encoder, "
+        "dynamics, reward, Q and policy. dynamics_only: only the dynamics MLP d(z, a, c), payAttentionDrift's "
+        "structure; the encoder/reward/Q/policy are the context-free model's."
+    ),
+)
+parser.add_argument(
     "--sit_adapter_lr",
     type=float,
     default=None,
@@ -231,7 +241,10 @@ parser.add_argument(
     "--sit_adapter_weight_decay",
     type=float,
     default=0.0,
-    help="Adapter-mode decoupled (AdamW-style) weight decay on the SIT tensors. Default 0.",
+    help=(
+        "Adapter-mode decoupled (AdamW-style) weight decay on the context projections (*.context_weight) "
+        "only; the history encoder is not decayed. Equilibrium |w| ~ drift/wd. Default 0."
+    ),
 )
 parser.add_argument(
     "--dyn_motor_gain_range",
@@ -1075,16 +1088,25 @@ def infer_replay_checkpoint_path(resume_checkpoint: str | None) -> str | None:
     return replay_path if os.path.exists(replay_path) else None
 
 
-def apply_sit_adapter_hparams(optimizer: torch.optim.Optimizer, policy_optimizer: torch.optim.Optimizer | None) -> None:
-    """Adapter-mode lr / decoupled weight decay on every SIT group. Re-applied after a resume,
-    because loading optimizer state restores the checkpoint's group hyperparameters."""
+def apply_sit_adapter_hparams(
+    model: torch.nn.Module, optimizer: torch.optim.Optimizer, policy_optimizer: torch.optim.Optimizer | None
+) -> None:
+    """Adapter-mode lr / decoupled weight decay. Re-applied after a resume, because loading
+    optimizer state restores the checkpoint's group hyperparameters.
+
+    Weight decay acts only on groups made purely of context projections (*.context_weight): it
+    caps their drift-limited growth. The history-encoder transformer is not decayed (with
+    context_components=all its group also holds encoder.0.context_weight, which then is not
+    decayed either)."""
+    projections = {id(p) for n, p in model.named_parameters() if n.endswith("context_weight")}
     for opt in (optimizer, policy_optimizer):
         if opt is None:
             continue
         for group in opt.param_groups:
             if args_cli.sit_adapter_lr is not None:
                 group["lr"] = float(args_cli.sit_adapter_lr)
-            group["weight_decay"] = float(args_cli.sit_adapter_weight_decay)
+            only_projections = bool(group["params"]) and all(id(p) in projections for p in group["params"])
+            group["weight_decay"] = float(args_cli.sit_adapter_weight_decay) if only_projections else 0.0
             group["decoupled_weight_decay"] = True
 
 
@@ -1483,6 +1505,7 @@ def main() -> None:
             history_layers=args_cli.history_layers,
             history_ff=args_cli.history_ff,
             history_dropout=args_cli.history_dropout,
+            context_components=args_cli.context_components,
             loss_weights=WorldModelLossWeights(
                 consistency=args_cli.consistency_coef,
                 reward=args_cli.reward_coef,
@@ -1503,9 +1526,10 @@ def main() -> None:
             ],
             lr=args_cli.lr,
         )
-        policy_optimizer = torch.optim.Adam(_policy_params, lr=args_cli.policy_lr, eps=1e-5)
+        # Adapter mode with context_components=dynamics_only leaves the policy nothing to train.
+        policy_optimizer = torch.optim.Adam(_policy_params, lr=args_cli.policy_lr, eps=1e-5) if _policy_params else None
         if args_cli.sit_train_mode == "adapter":
-            apply_sit_adapter_hparams(optimizer, policy_optimizer)
+            apply_sit_adapter_hparams(model, optimizer, policy_optimizer)
     elif args_cli.model_type == "state":
         model = StateWorldModel(
             obs_dim=obs_dim,
@@ -1554,11 +1578,13 @@ def main() -> None:
             sit_train_mode=args_cli.sit_train_mode,
         )
         if args_cli.sit_train_mode == "adapter":
-            apply_sit_adapter_hparams(optimizer, policy_optimizer)
+            apply_sit_adapter_hparams(model, optimizer, policy_optimizer)
             print(
                 f"[MBRL] SIT adapter mode: q_scale frozen at {float(model.q_scale.value):.4f}; adapter "
-                f"lr={[g['lr'] for g in optimizer.param_groups]}+policy {[g['lr'] for g in policy_optimizer.param_groups]} "
-                f"weight_decay={args_cli.sit_adapter_weight_decay} (decoupled)",
+                f"lr={[g['lr'] for g in optimizer.param_groups]}+policy "
+                f"{[g['lr'] for g in policy_optimizer.param_groups] if policy_optimizer is not None else 'none (nothing to train)'} "
+                f"weight_decay per group={[g['weight_decay'] for g in optimizer.param_groups]} "
+                f"(decoupled; context projections only)",
                 flush=True,
             )
         if train_state.env_steps >= args_cli.train_steps:
@@ -2281,17 +2307,26 @@ def main() -> None:
                 )
                 optimizer.step()
                 if args_cli.model_type == "latent":
-                    assert policy_optimizer is not None
                     model.sync_detached_qs()
-                    policy_loss, policy_metrics = model.policy_loss(
-                        rollout_states,
-                        planner_mean=batch.get("planner_mean"),
-                        planner_std=batch.get("planner_std"),
-                    )
-                    policy_optimizer.zero_grad(set_to_none=True)
-                    policy_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.policy_parameters(), args_cli.grad_clip_norm)
-                    policy_optimizer.step()
+                    if policy_optimizer is None:
+                        # Nothing trainable in the policy (adapter mode, dynamics_only): still log the
+                        # policy metrics so metrics.csv keeps its columns.
+                        with torch.no_grad():
+                            _, policy_metrics = model.policy_loss(
+                                rollout_states,
+                                planner_mean=batch.get("planner_mean"),
+                                planner_std=batch.get("planner_std"),
+                            )
+                    else:
+                        policy_loss, policy_metrics = model.policy_loss(
+                            rollout_states,
+                            planner_mean=batch.get("planner_mean"),
+                            planner_std=batch.get("planner_std"),
+                        )
+                        policy_optimizer.zero_grad(set_to_none=True)
+                        policy_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.policy_parameters(), args_cli.grad_clip_norm)
+                        policy_optimizer.step()
                     metrics.update(policy_metrics)
                 elif args_cli.model_type == "state":
                     assert policy_optimizer is not None

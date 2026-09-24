@@ -89,7 +89,8 @@
 #   ./frozen_walker_run.sh play                 # watch the frozen walker (1 env, 300 steps)
 #   ./frozen_walker_run.sh eval [mismatch] [play.py args...]
 #                                               # headless diagnostics eval, 16 envs x 500 steps
-#   ./frozen_walker_run.sh adapt                # train the SIT adapter on the frozen walker
+#   ./frozen_walker_run.sh adapt                # SIT adapter v1 (context in every head; the sit-adapt-v1 record)
+#   ./frozen_walker_run.sh adapt_v2             # SIT adapter v2 (context in the dynamics only)
 #   Overrides (env): CKPT= (eval/play another checkpoint, e.g. an adapted one)
 #                    OUT= ENVS= STEPS= SEED= TRAIN_STEPS= CTX_DIM= HIST_LEN= WARMUP= WANDB_NAME=
 #                    GAIN_LO= GAIN_HI= FRIC_LO= FRIC_HI= ADAPTER_LR= ADAPTER_WD=
@@ -189,6 +190,64 @@ case "$ACTION" in
       --train_steps "$TRAIN_STEPS" "${CMD[@]}"
     ;;
 
+  adapt_v2)
+    # SIT adapter v2 = payAttentionDrift's structure: the context conditions ONLY the dynamics MLP
+    # d(z, a, c) (--context_components dynamics_only). The encoder, reward, Q and policy are the
+    # frozen walker's own and have no context input at all. Trainable: history_encoder +
+    # dynamics.0.context_weight (512 x 16); the policy has nothing to train. The history encoder
+    # learns through the consistency loss and whatever reads the predicted latent (reward/Q/continue/
+    # physical at t+1).
+    #
+    # Why v2 (sit-adapt-v1 Level 2): with the context in every head, prediction improved but the
+    # planner's reward/Q estimates shifted (plan_best 15.4 vs 19.3) and the walker fell at friction
+    # 1.0 where the frozen walker never does. Masking heads at eval time cannot undo that, because
+    # they were co-adapted through z. v2 keeps the planner's objective exactly the frozen walker's.
+    #
+    # Differences from `adapt` (v1): context_components dynamics_only; friction U(0.25, 1.0), so the
+    # nominal ground (1.0) is in-distribution; decoupled weight decay 0.013 on the context projection.
+    # WEIGHT DECAY 0.013, derived from sit-adapt-v1 model_332500 (the checkpoint whose context/base
+    # ratio was acceptable): dynamics.0.context_weight per-element RMS 0.588. Its measured drift is
+    # |E[m/sqrt(v)]| = 0.0078 per update (322500 -> 332500, 160k updates at lr 3e-4): a weak, noisy
+    # gradient signal, far below Adam's consistent-sign 1.0. With decoupled decay torch applies
+    # w <- w * (1 - lr*wd) per step, so the equilibrium is |w*| = drift / wd (lr cancels):
+    # wd = 0.0078 / 0.588 = 0.0133. Time constant 1/(lr*wd) = 250k updates = 15.7k env steps, so
+    # after 20k steps the RMS is expected near 0.42 (v1 undecayed: about 0.75). The history encoder
+    # is not decayed. The drift estimate comes from v1 (context everywhere); v2's gradient into the
+    # projection differs, so treat 0.013 as a calibrated starting point and watch the ratio.
+    SEED="${SEED:-43}"
+    CTX_DIM="${CTX_DIM:-16}"; HIST_LEN="${HIST_LEN:-48}"
+    WARMUP="${WARMUP:-1000}"
+    TRAIN_STEPS="${TRAIN_STEPS:-340300}"      # 20k adapter steps; checkpoint every 2500 (8 kept)
+    GAIN_LO="${GAIN_LO:-0.6}"; GAIN_HI="${GAIN_HI:-1.0}"
+    FRIC_LO="${FRIC_LO:-0.25}"; FRIC_HI="${FRIC_HI:-1.0}"
+    ADAPTER_WD="${ADAPTER_WD:-0.013}"
+    ADAPTER_LR_FLAG=(); [[ -n "${ADAPTER_LR:-}" ]] && ADAPTER_LR_FLAG=(--sit_adapter_lr "$ADAPTER_LR")
+    WANDB_NAME="${WANDB_NAME:-sit_adapter_v2_dynonly_c${CTX_DIM}_k${HIST_LEN}_s${SEED}}"
+    [[ -f "$FROZEN" ]] || { echo "[frozen] ERROR: missing $FROZEN"; exit 1; }
+    echo "[frozen] SIT adapter v2 (dynamics_only): $FROZEN -> train_steps=$TRAIN_STEPS ctx=$CTX_DIM K=$HIST_LEN warmup=$WARMUP gain=[$GAIN_LO,$GAIN_HI] friction=[$FRIC_LO,$FRIC_HI] wd=$ADAPTER_WD"
+    exec "$PY" -u scripts/mbrl/train.py \
+      --headless --task Flat-Unitree-Go2-train-v0 --num_envs 64 --seed "$SEED" \
+      --buffer_capacity 1000000 --replay_device auto \
+      --model_type latent --latent_dim 256 --num_q 5 --horizon 8 --batch_size 1024 \
+      --utd 0.25 --candidates 512 --elites 64 \
+      --planner mppi --planner_iterations 6 --discount 0.99 \
+      --planner_start_steps 2000 --planner_min_length_fraction 0.0 --planner_recovery_steps 2000 \
+      --planner_recent_episodes 200 --planner_temperature 0.5 \
+      --planner_use_continue_model --planner_continue_threshold 0.5 \
+      --planner_velocity_objective_weight 0.0 --num_pi_trajs 24 \
+      --q_dropout 0.1 --entropy_coef 0.0003 --tdmpc2_bc_coef 0.1 \
+      --reward_yaw_weight 4.0 --reward_yaw_std 0.5 --reward_track_std 0.2 \
+      --eval_tracking_yaw_weight 0.5 \
+      --history_context_dim "$CTX_DIM" --history_len "$HIST_LEN" --sit_train_mode adapter \
+      --context_components dynamics_only \
+      --sit_adapter_weight_decay "$ADAPTER_WD" "${ADAPTER_LR_FLAG[@]}" \
+      --dyn_motor_gain_range "$GAIN_LO" "$GAIN_HI" --dyn_friction_range "$FRIC_LO" "$FRIC_HI" \
+      --resume_checkpoint "$FROZEN" --no-auto_resume_replay --resume_warmup_steps "$WARMUP" \
+      --save_interval 2500 --max_checkpoints 50 --save_replay --eval_interval 50 \
+      --wandb --wandb_project "$PROJECT" --wandb_name "$WANDB_NAME" \
+      --train_steps "$TRAIN_STEPS" "${CMD[@]}"
+    ;;
+
   manifest|*)
     cat <<'EOF'
 FROZEN WALKER -- Go2 latent-TD-MPC2, Stage L omnidirectional (never retrained)
@@ -201,7 +260,8 @@ FROZEN WALKER -- Go2 latent-TD-MPC2, Stage L omnidirectional (never retrained)
 
   ./frozen_walker_run.sh play                         # watch it walk
   ./frozen_walker_run.sh eval [mismatch] [args...]    # headless diagnostics eval
-  ./frozen_walker_run.sh adapt                        # train the SIT adapter (~0.36 steps/s)
+  ./frozen_walker_run.sh adapt                        # SIT adapter v1: context in every head (record of sit-adapt-v1)
+  ./frozen_walker_run.sh adapt_v2                     # SIT adapter v2: context in the dynamics only (~15 h)
   CKPT=<ckpt> ./frozen_walker_run.sh eval ...         # evaluate an adapted checkpoint
 
 Curriculum and how the walker was trained: scripts/mbrl/omni_run.sh

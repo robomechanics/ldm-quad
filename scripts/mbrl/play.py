@@ -166,6 +166,17 @@ parser.add_argument(
 )
 parser.add_argument("--context_freeze_step", type=int, default=None, help="Global step at which --context_mode frozen freezes.")
 parser.add_argument("--context_truncate_step", type=int, default=None, help="Global step at which --context_mode truncated clears every window.")
+parser.add_argument(
+    "--context_mask",
+    choices=["none", "dynamics_only", "dynamics_strict"],
+    default="none",
+    help=(
+        "Eval-time ablation for history checkpoints: zero context projections at load. dynamics_only zeroes "
+        "reward/Q/policy (encoder + dynamics keep the context); dynamics_strict also zeroes the encoder, so "
+        "the context acts only inside the dynamics MLP. (Training-time structure is the checkpoint's own "
+        "context_components.)"
+    ),
+)
 parser.add_argument("--context_len", type=int, default=None, help="History window used at eval (<= the model's history_len; older slots padded).")
 parser.add_argument(
     "--showcase",
@@ -1041,6 +1052,7 @@ def main() -> None:
                 history_layers=checkpoint_args.get("history_layers", 1),
                 history_ff=checkpoint_args.get("history_ff", 256),
                 history_dropout=checkpoint_args.get("history_dropout", 0.1),
+                context_components=checkpoint_args.get("context_components", "all"),
             ).to(device)
         elif model_type == "state":
             model = StateWorldModel(
@@ -1079,6 +1091,13 @@ def main() -> None:
             preview = ", ".join(unexpected_keys[:4])
             suffix = "..." if len(unexpected_keys) > 4 else ""
             print(f"[INFO] Checkpoint has {len(unexpected_keys)} unused model keys: {preview}{suffix}")
+        if args_cli.context_mask != "none":
+            if getattr(model, "context_dim", 0) > 0:
+                _zeroed = model.restrict_context(args_cli.context_mask)
+                print(f"[CTX] context_mask={args_cli.context_mask}: zeroed {len(_zeroed)} context projections: "
+                      f"{sorted({n.split('.')[0] for n in _zeroed})}", flush=True)
+            else:
+                print("[CTX] checkpoint has no history encoder; --context_mask ignored.", flush=True)
         model.eval()
 
         planner = build_planner(
