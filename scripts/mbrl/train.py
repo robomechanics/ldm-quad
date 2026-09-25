@@ -339,7 +339,7 @@ parser.add_argument(
     default=1.0,
     help="Planner-only velocity objective weight using decoded latent or state velocity features. Disabled when 0.",
 )
-parser.add_argument("--planner_velocity_objective_form", type=str, default="quadratic", choices=["quadratic", "exp"],
+parser.add_argument("--planner_velocity_objective_form", type=str, default="quadratic", choices=["quadratic", "exp", "linear"],
                     help="quadratic (unbounded, exploitable) or exp (bounded, mirrors the env kernels).")
 parser.add_argument("--planner_velocity_objective_lin_weight", type=float, default=8.0)
 parser.add_argument("--planner_velocity_objective_lin_std", type=float, default=0.20)

@@ -296,7 +296,7 @@ parser.add_argument(
 )
 parser.add_argument("--planner_continue_threshold", type=float, default=None, help="Override hard continuation threshold.")
 parser.add_argument("--planner_velocity_objective_weight", type=float, default=None, help="Override planner-only velocity objective weight.")
-parser.add_argument("--planner_velocity_objective_form", type=str, default=None, choices=["quadratic", "exp"],
+parser.add_argument("--planner_velocity_objective_form", type=str, default=None, choices=["quadratic", "exp", "linear"],
                     help="quadratic (default, UNBOUNDED -- exploitable) or exp (bounded, mirrors the env kernels).")
 parser.add_argument("--planner_velocity_objective_lin_weight", type=float, default=None)
 parser.add_argument("--planner_velocity_objective_lin_std", type=float, default=None)

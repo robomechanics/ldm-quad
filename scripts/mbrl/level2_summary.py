@@ -29,8 +29,10 @@ from collections import defaultdict
 
 # nullctxA = checkpoint A with --context_mode null (must equal null); dynonlyA = checkpoint A, rolling,
 # --context_components dynamics_only (context in encoder + dynamics only; planner objective = stageL's).
-ARMS = ("null", "rollingA", "rollingB", "nullctxA", "dynonlyA", "dynstrictA")
-DELTA_ARMS = ("rollingA", "rollingB", "nullctxA", "dynonlyA", "dynstrictA")
+# rollingV2 = sit-adapt-v2 model_final (context in the dynamics only), rolling; nullctxV2 = the same
+# checkpoint with --context_mode null (must equal null).
+ARMS = ("null", "rollingA", "rollingB", "rollingV2", "nullctxA", "nullctxV2", "dynonlyA", "dynstrictA")
+DELTA_ARMS = ("rollingA", "rollingB", "rollingV2", "nullctxA", "nullctxV2", "dynonlyA", "dynstrictA")
 # ref_id (gain 1.0, friction 0.8) is the in-distribution no-regression reference. "nominal" is
 # gain 1.0 / friction 1.0, which is OUTSIDE the adapter's training friction range (0.25-0.8),
 # so it is reported as the extrapolation condition fric_extrap_1.0.
@@ -145,24 +147,28 @@ def main() -> None:
             for a in ARMS if a in arms)
         emit(f"   sanity  {san}")
 
-    # overview + pass rule
-    emit("\n=== overview: paired delta vs null (mean +- 95% CI over seeds) ===")
-    emit("   cond        dvx A              dvx B              dphys_mse A           dphys_mse B")
+    # overview: null | v1 A | v2 per condition, deltas vs null and v2 vs A (paired over seeds)
+    emit("\n=== overview: null | v1 A (rollingA) | v2 (rollingV2); paired deltas, mean +- 95% CI over seeds ===")
+    ov_metrics = (("vx", "{:+.3f}+-{:.3f}"), ("fell_envs", "{:+.1f}+-{:.1f}"), ("phys_mse", "{:+.5f}+-{:.5f}"))
+    emit("   cond         arm        " + "".join(f"{m:>12s}" for m, _ in ov_metrics)
+         + "   | delta vs null: " + "  ".join(f"d{m}" for m, _ in ov_metrics) + "   | v2 - A: " + "  ".join(f"d{m}" for m, _ in ov_metrics))
     for cond in CONDS:
-        if cond not in out_json or "null" not in data[cond]:
+        if cond not in data or "null" not in data[cond]:
             continue
-        o = out_json[cond]
-        cells = []
-        for m in ("vx", "phys_mse"):
-            for arm in ("rollingA", "rollingB"):
-                k = f"delta_{arm}"
-                if k in o:
-                    mu, hw, _ = o[k][m]
-                    f = "{:+.3f}+-{:.3f}" if m == "vx" else "{:+.5f}+-{:.5f}"
-                    cells.append(f.format(mu, hw).ljust(19))
-                else:
-                    cells.append("-".ljust(19))
-        emit(f"   {('fric_ext1.0' if cond == 'nominal' else cond):11s} " + "".join(cells))
+        arms = data[cond]
+        label = "fric_ext1.0" if cond == "nominal" else cond
+        for arm in ("null", "rollingA", "rollingV2"):
+            if arm not in arms:
+                continue
+            vals = "".join(f"{mean_std([v[m] for v in arms[arm].values()])[0]:>12.4f}" for m, _ in ov_metrics)
+            dnull = "" if arm == "null" else "  ".join(
+                f.format(*paired_delta(arms["null"], arms[arm], m)[:2]) for m, f in ov_metrics)
+            dva = ""
+            if arm == "rollingV2" and "rollingA" in arms:
+                dva = "  ".join(f.format(*paired_delta(arms["rollingA"], arms["rollingV2"], m)[:2]) for m, f in ov_metrics)
+                out_json[cond]["delta_rollingV2_vs_rollingA"] = {
+                    m: list(paired_delta(arms["rollingA"], arms["rollingV2"], m)) for m, _ in ov_metrics}
+            emit(f"   {label:12s} {arm:10s} {vals}   | {dnull:48s} | {dva}")
 
     emit("\n=== PASS RULE ===")
     verdict = {}

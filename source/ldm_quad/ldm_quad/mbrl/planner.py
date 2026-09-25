@@ -1043,6 +1043,13 @@ class LatentMPPIPlanner:
             if gate > 0.0:
                 yaw = yaw * (target[:, 2].abs() > gate).to(yaw.dtype)
             return float(self.planner_velocity_objective_weight) * (lin + yaw)
+        if getattr(self, "planner_velocity_objective_form", "quadratic") == "linear":
+            # ANALYTIC PROGRESS form: -W * |v_pred - v_cmd|_1. Its gradient toward the command
+            # is constant however far the prediction is, so a model that honestly predicts a weak
+            # response (e.g. reduced motor gain) is still paid for every bit of progress, instead
+            # of seeing a flat, saturated exp kernel.
+            error = (predicted[:, :3] - target).abs().sum(dim=-1)
+            return -float(self.planner_velocity_objective_weight) * error
         error = (predicted[:, :3] - target).square().sum(dim=-1)
         return -float(self.planner_velocity_objective_weight) * error
 
