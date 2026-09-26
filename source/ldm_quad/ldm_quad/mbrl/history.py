@@ -58,6 +58,12 @@ class ContextController:
               truncation coincides with a dynamics switch).
 
     ``context_len`` <= history_len keeps only the most recent K' slots; older ones are padded.
+
+    ``ema_tau`` < 1 smooths the context actually used: c_used_t = (1 - tau) c_used_(t-1) + tau c_raw_t,
+    per env, reset to c_raw when the env resets. Left unnormalised on purpose: every raw context is
+    in the unit ball and a convex combination stays there, while rescaling to norm 1 would inflate
+    the averaged direction exactly when successive contexts disagree (the jitter being damped).
+    tau = 1 (default) is the raw context, bit for bit.
     """
 
     def __init__(
@@ -71,6 +77,7 @@ class ContextController:
         context_len: int | None = None,
         freeze_step: int | None = None,
         truncate_step: int | None = None,
+        ema_tau: float = 1.0,
     ):
         if mode not in CONTEXT_MODES:
             raise ValueError(f"context_mode must be one of {CONTEXT_MODES}, got {mode!r}")
@@ -91,6 +98,11 @@ class ContextController:
         self._null_after_freeze = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self._prev: torch.Tensor | None = None
         self._last: torch.Tensor | None = None
+        if not 0.0 < float(ema_tau) <= 1.0:
+            raise ValueError(f"ema_tau must be in (0, 1], got {ema_tau}")
+        self.ema_tau = float(ema_tau)
+        self._ema: torch.Tensor | None = None
+        self._ema_reset = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
     def pad_mask(self) -> torch.Tensor:
         """``[N, K]`` True for padded slots: invalid, or older than the ``context_len`` newest."""
@@ -114,11 +126,22 @@ class ContextController:
             ctx = model.encode_context(self.history.actions, self.history.transitions, self.pad_mask())
             if self.mode == "frozen" and self.t >= self.freeze_step:
                 self._frozen = ctx.detach().clone()
+        if self.ema_tau < 1.0:
+            raw = ctx.detach()
+            if self._ema is None:
+                self._ema = raw.clone()
+            else:
+                smooth = (1.0 - self.ema_tau) * self._ema + self.ema_tau * raw
+                self._ema = torch.where(self._ema_reset.unsqueeze(-1), raw, smooth)
+            self._ema_reset.zero_()
+            ctx = self._ema.clone()
         self._prev, self._last = self._last, ctx.detach()
         return ctx
 
     def append(self, actions: torch.Tensor, transitions: torch.Tensor, done: torch.Tensor | None = None) -> None:
         self.history.append(actions, transitions, done)
+        if done is not None:
+            self._ema_reset |= done.view(-1).bool()
         if done is not None and self.mode == "frozen" and self._frozen is not None:
             self._null_after_freeze |= done.view(-1).bool()
         self.t += 1
@@ -136,4 +159,5 @@ class ContextController:
             "frozen": f" freeze_step={self.freeze_step} (global step; post-freeze resets -> null context)",
             "truncated": f" truncate_step={self.truncate_step} (every env's window cleared at that step)",
         }.get(self.mode, "")
-        return f"context_mode={self.mode} context_len={self.context_len}/{self.history.history_len}{extra}"
+        ema = f" ema_tau={self.ema_tau}" if self.ema_tau < 1.0 else ""
+        return f"context_mode={self.mode} context_len={self.context_len}/{self.history.history_len}{extra}{ema}"

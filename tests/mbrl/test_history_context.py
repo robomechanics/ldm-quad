@@ -8,6 +8,7 @@ Run: /home/rml2/anaconda3/envs/isaaclab/bin/python -m pytest tests/mbrl/test_his
 
 from __future__ import annotations
 
+import csv
 import importlib.util
 import os
 import sys
@@ -1077,3 +1078,208 @@ def test_dynamics_only_warm_start_and_adapter_real(baseline_ckpt):
     named = dict(m.named_parameters())
     assert [n for n, r in frozen_ref.items() if not torch.equal(named[n], r)] == []
     assert m.dynamics[0].context_weight.abs().sum() > 0
+
+
+# --------------------------------------------------------------------------- Level 3 passive predictor
+_pe = _load("predictor_eval")
+
+
+def _stream(steps, n=4, seed=0, done_at=None):
+    g = torch.Generator().manual_seed(seed)
+    obs = torch.randn(n, OBS_DIM, generator=g)
+    for t in range(steps):
+        a = torch.rand(n, ACTION_DIM, generator=g) * 2 - 1
+        nxt = obs + 0.1 * torch.randn(n, OBS_DIM, generator=g)
+        done = torch.zeros(n, dtype=torch.bool)
+        if done_at and t in done_at:
+            done[done_at[t]] = True
+        yield obs, a, nxt, done
+        obs = nxt
+
+
+def test_predictor_identical_context_arms_identical_numbers():
+    base = LatentWorldModel(obs_dim=OBS_DIM, action_dim=ACTION_DIM, latent_dim=32, hidden_dim=64, depth=2, num_bins=21,
+                            context_dim=CONTEXT_DIM, history_len=HISTORY_LEN, history_d_model=32, history_ff=64,
+                            physical_feature_indices=[0, 1, 5]).eval()
+    ev = _pe.PredictorEvaluator(base, ["rolling8", "truncated999", "frozen999"], 4, OBS_DIM, ACTION_DIM, torch.device("cpu"))
+    for obs, a, nxt, done in _stream(20):
+        out = ev.step(obs, a, nxt, done)
+        for m in _pe.METRICS:
+            v = [out[f"predictor_{arm}_{m}"] for arm in ("rolling8", "truncated999", "frozen999")]
+            assert all((x == v[0]) or (x != x and v[0] != v[0]) for x in v), (m, v)
+    assert ev.field_names()[0] == "predictor_rolling8_phys1"
+
+
+def test_predictor_null_arm_equals_context_free_model_and_kstep_rollout():
+    kw = dict(obs_dim=OBS_DIM, action_dim=ACTION_DIM, latent_dim=32, hidden_dim=64, depth=2, num_bins=21,
+              physical_feature_indices=[0, 1, 5])
+    torch.manual_seed(0)
+    free = LatentWorldModel(**kw).eval()
+    ctx = LatentWorldModel(**kw, context_dim=CONTEXT_DIM, history_len=HISTORY_LEN, history_d_model=32, history_ff=64,
+                           context_components="dynamics_only")
+    _ckpt.graft_context_free_state_dict(ctx, free.state_dict())
+    with torch.no_grad():
+        ctx.dynamics[0].context_weight.normal_()  # a TRAINED projection; the null context is still zero
+    ctx.eval()
+    ev_free = _pe.PredictorEvaluator(free, ["null"], 4, OBS_DIM, ACTION_DIM, torch.device("cpu"))
+    ev_ctx = _pe.PredictorEvaluator(ctx, ["null", "rolling8"], 4, OBS_DIM, ACTION_DIM, torch.device("cpu"))
+    hist = []
+    for t, (obs, a, nxt, done) in enumerate(_stream(14, done_at={10: [2]})):
+        hist.append((obs, a, nxt))
+        of, oc = ev_free.step(obs, a, nxt, done), ev_ctx.step(obs, a, nxt, done)
+        for m in ("phys1", "lat1", "phys4", "phys8"):
+            x, y = of[f"predictor_null_{m}"], oc[f"predictor_null_{m}"]
+            assert (x == y) or (x != x and y != y), (t, m, x, y)  # null arm == context-free model, exactly
+        # direct play.py formula for one-step physical MSE
+        with torch.no_grad():
+            z1 = free.next(free.encode(obs), a)
+            assert of["predictor_null_phys1"] == float((free.physical_features(z1) - nxt[:, [0, 1, 5]]).square().mean())
+        if t < 3:
+            assert of["predictor_null_phys4"] != of["predictor_null_phys4"]  # NaN until k transitions exist
+        if t == 6:  # manual 4-step open-loop rollout from obs_{t-3} on the executed actions
+            with torch.no_grad():
+                z = free.encode(hist[t - 3][0])
+                for j in range(4):
+                    z = free.next(z, hist[t - 3 + j][1])
+                ref = (free.physical_features(z) - nxt[:, [0, 1, 5]]).square().mean(-1).mean()
+            assert abs(of["predictor_null_phys4"] - float(ref)) < 1e-6
+        if t == 12:  # env 2 reset at t=10: only 2 transitions in its new episode -> excluded from k=4
+            with torch.no_grad():
+                z = free.encode(hist[t - 3][0])
+                for j in range(4):
+                    z = free.next(z, hist[t - 3 + j][1])
+                err = (free.physical_features(z) - nxt[:, [0, 1, 5]]).square().mean(-1)
+            keep = torch.tensor([True, True, False, True])
+            assert abs(of["predictor_null_phys4"] - float(err[keep].mean())) < 1e-6
+    assert oc["predictor_rolling8_phys1"] != oc["predictor_null_phys1"]  # a live context changes the prediction
+
+
+V2_FINAL = os.path.join(ROOT, "logs", "mbrl", "go2_walk_2026-09-24_00-07-35", "checkpoints", "model_final.pt")
+HELDOUT = os.path.join(ROOT, "logs", "mbrl", "heldout_dyn_stageL_s1234", "replay.pt")
+
+
+@pytest.mark.skipif(not all(os.path.exists(p) for p in (V2_FINAL, HELDOUT, BASELINE_CKPT)), reason="artifacts not present")
+def test_predictor_on_real_checkpoints_and_trajectory():
+    """Real v2 checkpoint + real stageL, rebuilt by build_predictor_model, scored on 30 consecutive
+    vectorised steps of the held-out buffer: v2's null arm must equal stageL exactly."""
+    sd = torch.load(HELDOUT, map_location="cpu", weights_only=False)["replay"]
+    n_env, obs_dim, act_dim = int(sd["last_batch_size"]), sd["obs"].shape[1], sd["actions"].shape[1]
+    v2 = _pe.build_predictor_model(V2_FINAL, obs_dim, act_dim, "cpu")
+    stage_l = _pe.build_predictor_model(BASELINE_CKPT, obs_dim, act_dim, "cpu")
+    assert v2.context_components == "dynamics_only" and v2.context_dim == 16 and stage_l.context_dim == 0
+    arms = ["null", "rolling48", "frozen10", "truncated20", "rolling24", "rolling96"]
+    ev = _pe.PredictorEvaluator(v2, arms, n_env, obs_dim, act_dim, torch.device("cpu"))
+    ev_l = _pe.PredictorEvaluator(stage_l, ["null"], n_env, obs_dim, act_dim, torch.device("cpu"))
+    torch.manual_seed(0)
+    prev_done = torch.zeros(n_env, dtype=torch.bool)
+    for t in range(30):
+        rows = slice(t * n_env, (t + 1) * n_env)  # row i + n_env is the next step of the same env
+        obs, act, nxt = sd["obs"][rows], sd["actions"][rows], sd["next_obs"][rows]
+        done = sd["continues"][rows].view(-1) <= 0
+        out, ref = ev.step(obs, act, nxt, done), ev_l.step(obs, act, nxt, done)
+        for m in ("phys1", "lat1", "phys4", "phys8"):
+            x, y = out[f"predictor_null_{m}"], ref[f"predictor_null_{m}"]
+            assert (x == y) or (x != x and y != y), (t, m, x, y)
+        for arm in arms:
+            assert out[f"predictor_{arm}_phys1"] == out[f"predictor_{arm}_phys1"], (t, arm)  # finite, no NaN
+            if t >= 7:
+                assert out[f"predictor_{arm}_phys8"] == out[f"predictor_{arm}_phys8"], (t, arm)
+        if 10 < t < 20:
+            # held after its freeze step; only an env that reset since switches to the null context
+            # (a jump of norm ~1 for that env, i.e. ~1/n_env in the mean)
+            assert out["predictor_frozen10_ctx_drift"] <= float(prev_done.sum()) / n_env + 1e-6, (t, prev_done.sum())
+        if t == 20:
+            assert out["predictor_truncated20_ctx_norm"] == 0.0  # window cleared at the truncation step
+        prev_done = done
+    assert out["predictor_rolling48_phys1"] != out["predictor_null_phys1"]
+
+
+def test_level3_summary_known_answer(tmp_path):
+    """Synthetic runs with known recovery: oracle ~50 steps, rolling ~125, null never."""
+    spec = importlib.util.spec_from_file_location("_l3s", os.path.join(ROOT, "scripts", "mbrl", "level3_summary.py"))
+    l3 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(l3)
+    import math as _m
+
+    def err(step, tau, floor=0.012, pre=0.010, jump=0.03):
+        if step < 250:
+            return pre
+        return floor + (jump - floor) * _m.exp(-(step - 250) / tau) if tau else jump
+
+    arms = {"truncated250": 10.0, "rolling48": 40.0, "null": 0.0}
+    for seed in range(3):
+        d = tmp_path / f"gain0.7__s{seed}"
+        d.mkdir()
+        (d / ".done").touch()
+        with open(d / "metrics.csv", "w", newline="") as f:
+            cols = ["step"] + [f"predictor_{a}_{m}" for a in arms for m in ("phys1", "lat1", "phys4", "phys8", "ctx_norm", "ctx_drift")]
+            w = csv.writer(f)
+            w.writerow(cols)
+            for step in range(600):
+                row = [step]
+                for a, tau in arms.items():
+                    e = err(step, tau) * (1 + 0.01 * seed)
+                    row += [e, e / 100, e * 1.5, e * 2, 0.99, 0.1]
+                w.writerow(row)
+    res = l3.analyse(str(tmp_path), switch=250, width=25, pre=100, peak=100, steady=150, tol=0.10)
+    r = res["gain0.7"]
+    assert r["oracle"] == "truncated250"
+    rec = {a: r["arms"][a]["k1"]["recovery"][0] for a in arms}
+    assert rec["truncated250"] < rec["rolling48"] < _m.inf and rec["null"] == _m.inf, rec
+    assert 25 <= rec["truncated250"] <= 50 and 100 <= rec["rolling48"] <= 150, rec
+    assert abs(r["arms"]["null"]["k1"]["pre"][0] - 0.0101) < 1e-3
+    assert abs(r["arms"]["null"]["k1"]["steady"][0] - 0.0303) < 1e-3
+
+
+class _ScriptedContextModel:
+    """encode_context returns a scripted raw context (same for every env); null() is zero."""
+
+    def __init__(self, dim=4):
+        self.value = torch.zeros(dim)
+
+        class _HE:
+            def null(_self):
+                return torch.zeros(dim)
+
+        self.history_encoder = _HE()
+
+    def encode_context(self, actions, transitions, pad_mask):
+        return self.value.unsqueeze(0).expand(actions.shape[0], -1).clone()
+
+
+def test_context_ema_tau1_is_rolling_exactly():
+    model = make_model()
+    a_ctrl, b_ctrl = _ctrl("rolling"), _ctrl("rolling", ema_tau=1.0)
+    g = torch.Generator().manual_seed(4)
+    with torch.no_grad():
+        for t in range(HISTORY_LEN + 5):
+            acts, trans = torch.randn(3, ACTION_DIM, generator=g), torch.randn(3, OBS_DIM, generator=g)
+            done = torch.tensor([False, t == 7, False])
+            assert torch.equal(a_ctrl.context(model), b_ctrl.context(model))
+            a_ctrl.append(acts, trans, done)
+            b_ctrl.append(acts, trans, done)
+
+
+def test_context_ema_step_response_and_reset():
+    tau, n = 0.05, 3
+    model = _ScriptedContextModel()
+    ctrl = _hist.ContextController(n, 8, ACTION_DIM, OBS_DIM, torch.device("cpu"), mode="rolling", ema_tau=tau)
+    z = torch.zeros(n, ACTION_DIM), torch.zeros(n, OBS_DIM)
+    for _ in range(5):  # raw context 0 -> EMA stays 0
+        assert torch.equal(ctrl.context(model), torch.zeros(n, 4))
+        ctrl.append(*z)
+    model.value = torch.tensor([1.0, 0.0, 0.0, 0.0])  # step change in the raw context
+    for k in range(1, 61):
+        c = ctrl.context(model)
+        expected = 1 - (1 - tau) ** k  # first-order response, time constant ~1/tau = 20 steps
+        smooth_envs = [0, 2] if k > 30 else [0, 1, 2]  # env 1 resets at k=30 and restarts from the raw value
+        assert torch.allclose(c[smooth_envs, 0], torch.full((len(smooth_envs),), expected), atol=1e-6), (k, c[:, 0], expected)
+        if k > 30:
+            assert torch.allclose(c[1], model.value), (k, c[1])
+        assert (c.norm(dim=-1) <= 1 + 1e-6).all()  # convex combination stays in the unit ball
+        ctrl.append(*z, torch.tensor([False, k == 30, False]))
+    c = ctrl.context(model)  # env 1 reset at k=30 -> it re-started from the raw context
+    assert torch.allclose(c[1], model.value)
+    assert c[0, 0] < 0.96 and torch.allclose(c[0, 0], torch.tensor(1 - (1 - tau) ** 61), atol=1e-6)
+    with pytest.raises(ValueError):
+        _hist.ContextController(n, 8, ACTION_DIM, OBS_DIM, torch.device("cpu"), ema_tau=0.0)

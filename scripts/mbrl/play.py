@@ -130,6 +130,23 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--predict_with_checkpoint",
+    type=str,
+    default=None,
+    help=(
+        "Level 3 passive prediction: score this world-model checkpoint as a PASSIVE predictor on the trajectory "
+        "driven by --checkpoint (the acting model is untouched). Every arm in --predict_arms gets its own context "
+        "history fed with the executed raw actions and observed transitions; predictor_<arm>_{phys1,lat1,phys4,"
+        "phys8,ctx_norm,ctx_drift} are appended last to the diagnostics rows (use --diagnostics_interval 1)."
+    ),
+)
+parser.add_argument(
+    "--predict_arms",
+    type=str,
+    default="null,rolling48",
+    help="Comma-separated predictor arms: null | rolling<K> | frozen<step> | truncated<step> (e.g. truncated250).",
+)
+parser.add_argument(
     "--dump_replay",
     type=str,
     default=None,
@@ -175,6 +192,15 @@ parser.add_argument(
         "reward/Q/policy (encoder + dynamics keep the context); dynamics_strict also zeroes the encoder, so "
         "the context acts only inside the dynamics MLP. (Training-time structure is the checkpoint's own "
         "context_components.)"
+    ),
+)
+parser.add_argument(
+    "--context_ema",
+    type=float,
+    default=1.0,
+    help=(
+        "EMA smoothing of the context used (history checkpoints): c_used = (1-tau) c_used + tau c_raw per env, "
+        "reset to c_raw on env reset, left unnormalised (stays in the unit ball). 1.0 (default) = raw context."
     ),
 )
 parser.add_argument("--context_len", type=int, default=None, help="History window used at eval (<= the model's history_len; older slots padded).")
@@ -374,6 +400,7 @@ import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 import ldm_quad.tasks  # noqa: F401
 from ldm_quad.mbrl.dynamics_rand import DynamicsRandomizer
 from ldm_quad.mbrl.history import ContextController
+from ldm_quad.mbrl.predictor_eval import PredictorEvaluator, build_predictor_model
 from ldm_quad.eval.terrain_mismatch import apply_terrain_mismatch
 from ldm_quad.mbrl import DynamicsEnsemble, LatentWorldModel, ReplayBuffer, StateWorldModel, build_planner, load_policy_prior
 
@@ -1260,6 +1287,14 @@ def main() -> None:
             ),
         )
 
+    predictor = None
+    if args_cli.predict_with_checkpoint:
+        _pmodel = build_predictor_model(args_cli.predict_with_checkpoint, obs.shape[-1], action_dim, device)
+        _arms = [a.strip() for a in args_cli.predict_arms.split(",") if a.strip()]
+        predictor = PredictorEvaluator(_pmodel, _arms, obs.shape[0], obs.shape[-1], action_dim, device)
+        DIAGNOSTIC_FIELDS.extend(f for f in predictor.field_names() if f not in DIAGNOSTIC_FIELDS)
+        print(f"[PRED] passive predictor {args_cli.predict_with_checkpoint} "
+              f"(context_dim={_pmodel.context_dim}, components={_pmodel.context_components}) arms={_arms}", flush=True)
     diagnostics = DiagnosticsLogger(make_diagnostics_dir(checkpoint_path)) if args_cli.diagnostics else None
     if diagnostics is not None:
         print(f"[INFO] Writing mismatch diagnostics to: {diagnostics.output_dir}")
@@ -1281,7 +1316,7 @@ def main() -> None:
     adapt_gradient_updates = 0
     history = None
     _context_flags = (
-        args_cli.context_mode != "rolling" or args_cli.context_len is not None
+        args_cli.context_mode != "rolling" or args_cli.context_len is not None or args_cli.context_ema != 1.0
         or args_cli.context_freeze_step is not None or args_cli.context_truncate_step is not None
     )
     if model is not None and getattr(model, "context_dim", 0) > 0:
@@ -1291,6 +1326,7 @@ def main() -> None:
             context_len=args_cli.context_len,
             freeze_step=args_cli.context_freeze_step,
             truncate_step=args_cli.context_truncate_step,
+            ema_tau=args_cli.context_ema,
         )
         print(f"[CTX] {history.describe()}", flush=True)
     elif _context_flags:
@@ -1614,6 +1650,7 @@ def main() -> None:
         adapt_gradient_updates += updates
         if history is not None:
             history.append(actions, next_obs - obs, done)
+        pred_metrics = predictor.step(obs, actions, next_obs, done) if predictor is not None else {}
 
         if diagnostics is not None and (steps % max(1, args_cli.diagnostics_interval) == 0):
             diag_metrics.update(adapt_metrics)
@@ -1624,6 +1661,7 @@ def main() -> None:
                 diag_metrics["dyn_switch_active"] = float(steps >= args_cli.dyn_switch_step)
             if history is not None:
                 diag_metrics.update(history.metrics())
+            diag_metrics.update(pred_metrics)  # passive predictor columns (appended last)
             diagnostics.write(steps, diag_metrics)
 
         episode_returns += rewards

@@ -31,8 +31,8 @@ from collections import defaultdict
 # --context_components dynamics_only (context in encoder + dynamics only; planner objective = stageL's).
 # rollingV2 = sit-adapt-v2 model_final (context in the dynamics only), rolling; nullctxV2 = the same
 # checkpoint with --context_mode null (must equal null).
-ARMS = ("null", "rollingA", "rollingB", "rollingV2", "nullctxA", "nullctxV2", "dynonlyA", "dynstrictA")
-DELTA_ARMS = ("rollingA", "rollingB", "rollingV2", "nullctxA", "nullctxV2", "dynonlyA", "dynstrictA")
+ARMS = ("null", "rollingA", "rollingB", "rollingV2", "ema05V2", "ema20V2", "nullctxA", "nullctxV2", "dynonlyA", "dynstrictA")
+DELTA_ARMS = ("rollingA", "rollingB", "rollingV2", "ema05V2", "ema20V2", "nullctxA", "nullctxV2", "dynonlyA", "dynstrictA")
 # ref_id (gain 1.0, friction 0.8) is the in-distribution no-regression reference. "nominal" is
 # gain 1.0 / friction 1.0, which is OUTSIDE the adapter's training friction range (0.25-0.8),
 # so it is reported as the extrapolation condition fric_extrap_1.0.
