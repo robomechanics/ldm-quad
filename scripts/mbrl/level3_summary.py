@@ -10,9 +10,14 @@ Per condition and arm, over seeds (mean +- 95% CI, t distribution):
   pre         mean error over the last `pre` steps before the switch
   peak        max window error in the first `peak` steps after the switch
   steady      mean error over the last `steady` steps of the run
-  recovery    steps from the switch to the first window whose error is within `tol` (10%) of the
-              ORACLE arm's steady level (oracle = truncated<switch>: window cleared at the switch);
-              '>run' if never
+  recovery    SETTLING TIME: steps from the switch until the arm's windowed error stays within
+              `tol` (10%) above the ORACLE's steady level for the rest of the run (oracle =
+              truncated<switch>: window cleared at the switch). The final `steady` span is judged by
+              its MEAN (one noisy last window must not read as non-recovery): '>run' if that mean is
+              outside the band, else the end of the last window outside the band before the span
+              (0 = never left the band). (Not "first window inside the band": after a
+              gain switch the error RISES over the first 25-50 steps as the gait changes, so the
+              first post-switch window is trivially inside.)
 Overview: arm x condition -> recovery (k=1) and steady error, with the gap to the oracle.
 Also the context-drift time course per arm around the switch.
 
@@ -109,9 +114,12 @@ def analyse(root: str, switch: int, width: int, pre: int, peak: int, steady: int
                     rec = []
                     for s, (st, v) in per.items():
                         thr = steady_oracle[k][s] * (1 + tol)
-                        post = window_means(st, v, switch, end, width)
-                        hit = next((i for i, x in enumerate(post) if not math.isnan(x) and x <= thr), None)
-                        rec.append((hit + 1) * width if hit is not None else math.inf)  # window END = steps needed
+                        if span_mean(st, v, end - steady, end) > thr:
+                            rec.append(math.inf)  # the steady span itself is outside the band
+                            continue
+                        post = window_means(st, v, switch, end - steady, width)
+                        above = [i for i, x in enumerate(post) if not math.isnan(x) and x > thr]
+                        rec.append(float((above[-1] + 1) * width) if above else 0.0)
                     finite = [r for r in rec if math.isfinite(r)]
                     entry[f"k{k}"]["recovery_steps_per_seed"] = rec
                     entry[f"k{k}"]["recovery"] = (list(mean_ci(finite)) + [len(finite), len(rec)]) if finite else \
