@@ -34,8 +34,17 @@ from summary_stats import t975  # noqa: E402
 # --context_components dynamics_only (context in encoder + dynamics only; planner objective = stageL's).
 # rollingV2 = sit-adapt-v2 model_final (context in the dynamics only), rolling; nullctxV2 = the same
 # checkpoint with --context_mode null (must equal null).
-ARMS = ("null", "rollingA", "rollingB", "rollingV2", "ema05V2", "ema20V2", "nullctxA", "nullctxV2", "dynonlyA", "dynstrictA")
-DELTA_ARMS = ("rollingA", "rollingB", "rollingV2", "ema05V2", "ema20V2", "nullctxA", "nullctxV2", "dynonlyA", "dynstrictA")
+# rollingV3 = sit-adapt-v3 model_final (5-member context ensemble, risk-aware two-stage MPPI at the
+# lambda chosen by scripts/mbrl/v3_lambda_select.py), EMA 0.05 context; nullctxV3 = the same
+# checkpoint with --context_mode null (statistically equal to null; not bit-exact: the ensemble
+# planner draws its terminal-policy noise in a different pattern).
+ARMS = ("null", "rollingA", "rollingB", "rollingV2", "ema05V2", "ema20V2", "rollingV3", "nullctxA", "nullctxV2",
+        "nullctxV3", "dynonlyA", "dynstrictA")
+DELTA_ARMS = ("rollingA", "rollingB", "rollingV2", "ema05V2", "ema20V2", "rollingV3", "nullctxA", "nullctxV2",
+              "nullctxV3", "dynonlyA", "dynstrictA")
+# overview rows and the arm each is compared with in its last column (paired over seeds)
+OVERVIEW = (("null", None), ("rollingA", None), ("rollingV2", "rollingA"), ("ema05V2", "rollingV2"),
+            ("rollingV3", "rollingV2"), ("rollingV3", "ema05V2"))
 # ref_id (gain 1.0, friction 0.8) is the in-distribution no-regression reference. "nominal" is
 # gain 1.0 / friction 1.0, which is OUTSIDE the adapter's training friction range (0.25-0.8),
 # so it is reported as the extrapolation condition fric_extrap_1.0.
@@ -150,26 +159,26 @@ def main() -> None:
         emit(f"   sanity  {san}")
 
     # overview: null | v1 A | v2 per condition, deltas vs null and v2 vs A (paired over seeds)
-    emit("\n=== overview: null | v1 A (rollingA) | v2 (rollingV2); paired deltas, mean +- 95% CI over seeds ===")
+    emit("\n=== overview: null | v1 A (rollingA) | v2 (rollingV2) | v2+EMA (ema05V2) | v3 (rollingV3); "
+         "paired deltas, mean +- 95% CI over seeds ===")
     ov_metrics = (("vx", "{:+.3f}+-{:.3f}"), ("fell_envs", "{:+.1f}+-{:.1f}"), ("phys_mse", "{:+.5f}+-{:.5f}"))
     emit("   cond         arm        " + "".join(f"{m:>12s}" for m, _ in ov_metrics)
-         + "   | delta vs null: " + "  ".join(f"d{m}" for m, _ in ov_metrics) + "   | v2 - A: " + "  ".join(f"d{m}" for m, _ in ov_metrics))
+         + "   | delta vs null: " + "  ".join(f"d{m}" for m, _ in ov_metrics) + "   | vs <arm>: " + "  ".join(f"d{m}" for m, _ in ov_metrics))
     for cond in CONDS:
         if cond not in data or "null" not in data[cond]:
             continue
         arms = data[cond]
         label = "fric_ext1.0" if cond == "nominal" else cond
-        for arm in ("null", "rollingA", "rollingV2"):
-            if arm not in arms:
+        for arm, ref in OVERVIEW:
+            if arm not in arms or (ref is not None and ref not in arms):
                 continue
             vals = "".join(f"{mean_std([v[m] for v in arms[arm].values()])[0]:>12.4f}" for m, _ in ov_metrics)
             dnull = "" if arm == "null" else "  ".join(
                 f.format(*paired_delta(arms["null"], arms[arm], m)[:2]) for m, f in ov_metrics)
             dva = ""
-            if arm == "rollingV2" and "rollingA" in arms:
-                dva = "  ".join(f.format(*paired_delta(arms["rollingA"], arms["rollingV2"], m)[:2]) for m, f in ov_metrics)
-                out_json[cond]["delta_rollingV2_vs_rollingA"] = {
-                    m: list(paired_delta(arms["rollingA"], arms["rollingV2"], m)) for m, _ in ov_metrics}
+            if ref is not None:
+                dva = f"vs {ref}: " + "  ".join(f.format(*paired_delta(arms[ref], arms[arm], m)[:2]) for m, f in ov_metrics)
+                out_json[cond][f"delta_{arm}_vs_{ref}"] = {m: list(paired_delta(arms[ref], arms[arm], m)) for m, _ in ov_metrics}
             emit(f"   {label:12s} {arm:10s} {vals}   | {dnull:48s} | {dva}")
 
     emit("\n=== PASS RULE ===")

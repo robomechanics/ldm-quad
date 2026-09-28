@@ -721,6 +721,9 @@ DIAGNOSTIC_FIELDS = [
     # context-ensemble two-stage planner: risk scores of the re-scored top-k
     "planner_rescored_return_mean",
     "planner_rescored_return_std",
+    # context ensemble: std over members of the (re-scored) candidates' returns, mean over envs and
+    # candidates -- lambda x this is the size of the risk penalty
+    "planner_ensemble_return_std",
 ]
 
 
@@ -1610,6 +1613,8 @@ def main() -> None:
                                                          context=history_context, done=done))
             if planner is not None:
                 diag_metrics.update({name: float(value) for name, value in planner.last_diagnostics.items()})
+                if getattr(planner, "_last_disagreement", None) is not None:
+                    diag_metrics["planner_ensemble_return_std"] = float(planner._last_disagreement.mean())
 
         if dump_replay is not None:
             dump_replay.add_batch(
