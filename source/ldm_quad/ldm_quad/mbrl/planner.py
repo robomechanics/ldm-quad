@@ -755,6 +755,8 @@ class LatentMPPIPlanner:
         max_std: float = 2.0,
         num_pi_trajs: int = 24,
         action_spline_knots: int = 0,
+        planner_risk_lambda: float = 0.0,
+        planner_two_stage_k: int = 0,
         action_prior: Callable[[torch.Tensor], torch.Tensor] | None = None,
         prior_candidate_fraction: float = 0.1,
         prior_candidate_noise: float = 0.02,
@@ -816,6 +818,20 @@ class LatentMPPIPlanner:
         self.planner_velocity_target_yaw = planner_velocity_target_yaw
         self.prior_command_start = prior_command_start
         self.prior_command_dim = prior_command_dim
+        # Context ensemble (v3): candidate score = mean_m(return_m) - lambda * std_m(return_m).
+        # two_stage_k > 0: score every candidate on the member-MEAN latent rollout first, then
+        # re-score only the top-k with the full ensemble and the penalty.
+        self.planner_risk_lambda = float(planner_risk_lambda)
+        self.planner_two_stage_k = int(planner_two_stage_k)
+        self._ensemble = int(getattr(model, "context_ensemble", 1) or 1)
+        if self._ensemble > 1 and 0 < self.planner_two_stage_k < elites:
+            # elites would include never-rescored candidates sharing the floor score, and the
+            # Gumbel selection could execute a plan no member rolled out
+            raise ValueError(f"planner_two_stage_k={self.planner_two_stage_k} must be >= elites={elites} "
+                             "(or 0 for full-ensemble scoring)")
+        self._last_stage1: torch.Tensor | None = None    # two-stage: mean-field scores of ALL candidates
+        self._last_rescored: torch.Tensor | None = None  # two-stage: risk scores of the re-scored top-k
+        self._last_disagreement: torch.Tensor | None = None  # member return std of the last scored set
         self._prev_mean: torch.Tensor | None = None
         self._context: torch.Tensor | None = None
         self.last_diagnostics: dict[str, float] = {}
@@ -839,7 +855,20 @@ class LatentMPPIPlanner:
         if self._context is None:
             return None
         ctx = self._context
+        if ctx.dim() == 3:  # ensemble [M, B, C] -> [M, B * num_repeat, C]
+            return ctx.unsqueeze(2).expand(-1, -1, num_repeat, -1).reshape(ctx.shape[0], -1, ctx.shape[-1])
         return ctx.unsqueeze(1).expand(-1, num_repeat, -1).reshape(-1, ctx.shape[-1])
+
+    def _next_mean(self, z: torch.Tensor, action: torch.Tensor, ctx: torch.Tensor | None) -> torch.Tensor:
+        """Proposal rollouts: one latent per candidate. For an ensemble this is the MEAN-FIELD
+        surrogate (members' context terms averaged at the dynamics' first layer, one pass) -- the
+        same 1x rollout stage-1 scoring uses -- not an average of M member latents (an average of
+        SimNorm latents is off the latent manifold and costs M passes)."""
+        if self._ensemble <= 1:
+            return self.model.next(z, action, context=ctx)
+        if ctx is None:
+            ctx = self.model.null_context_batch(z.shape[0]).to(z)
+        return self.model.next_mean_field(z, action, ctx)
 
     def reset(self, done: torch.Tensor | None = None) -> None:
         if self._prev_mean is None:
@@ -922,7 +951,7 @@ class LatentMPPIPlanner:
         for _ in range(self.horizon):
             action = self._clip_actions(self.model.pi(z, deterministic=deterministic, context=self._context))
             actions.append(action)
-            z = self.model.next(z, action, context=self._context)
+            z = self._next_mean(z, action, self._context)
         return torch.stack(actions, dim=1)
 
     def _policy_candidate_controls(self, obs: torch.Tensor, z0: torch.Tensor | None = None) -> torch.Tensor:
@@ -951,7 +980,7 @@ class LatentMPPIPlanner:
             for _ in range(self.horizon):
                 action = self._clip_actions(self.model.pi(z, deterministic=False, context=ctx))
                 actions.append(action.view(obs.shape[0], stochastic_count, self.action_dim))
-                z = self.model.next(z, action, context=ctx)
+                z = self._next_mean(z, action, ctx)
             action_sequences = torch.stack(actions, dim=2)
             controls[:, next_index:] = self._controls_from_actions(action_sequences)
         return controls
@@ -984,13 +1013,13 @@ class LatentMPPIPlanner:
         candidates: int,
     ) -> torch.Tensor:
         if self.planner_velocity_objective_weight <= 0.0 or not hasattr(self.model, "physical_features"):
-            return torch.zeros(z.shape[0], device=z.device, dtype=z.dtype)
+            return torch.zeros(z.shape[:-1], device=z.device, dtype=z.dtype)
         try:
             predicted = self.model.physical_features(z)
         except RuntimeError:
-            return torch.zeros(z.shape[0], device=z.device, dtype=z.dtype)
+            return torch.zeros(z.shape[:-1], device=z.device, dtype=z.dtype)
         if predicted.shape[-1] < 3:
-            return torch.zeros(z.shape[0], device=z.device, dtype=z.dtype)
+            return torch.zeros(z.shape[:-1], device=z.device, dtype=z.dtype)
 
         command_slice = self._command_slice(obs.shape[-1])
         if command_slice is not None:
@@ -1015,14 +1044,14 @@ class LatentMPPIPlanner:
             # so it cannot outweigh the terminating/continue heads however optimistic the
             # physical head becomes. Deliberately double-counts tracking with the reward head;
             # the head's tracking component is the noisy part (RMSE 0.73 vs 0.084).
-            lin_err = (predicted[:, :2] - target[:, :2]).square().sum(dim=-1)
+            lin_err = (predicted[..., :2] - target[..., :2]).square().sum(dim=-1)
             # DEADBAND: strafing on this robot carries yaw wobble (|wz| 0.12-0.42 measured
             # while strafing, vs |vy| 0.00-0.04 while turning -- the tax is one-directional).
             # The bare kernel forfeits 5.5 of 8.0 per step at a 0.3 rad/s wobble (std 0.28),
             # so scoring yaw hard makes strafing expensive and turning cheap. A deadband
             # forgives wobble below d while leaving real turning (0.8 rad/s) fully scored:
             # at d=0.2 a 0.3 wobble costs ~1.0/step instead of 5.5.
-            yaw_raw = (predicted[:, 2] - target[:, 2]).abs()
+            yaw_raw = (predicted[..., 2] - target[..., 2]).abs()
             dead = float(getattr(self, "planner_velocity_objective_yaw_deadband", 0.0))
             if dead > 0.0:
                 yaw_raw = (yaw_raw - dead).clamp_min(0.0)
@@ -1041,17 +1070,63 @@ class LatentMPPIPlanner:
             # (|cmd_yaw| 0.8) keeps the full benefit.
             gate = float(getattr(self, "planner_velocity_objective_yaw_gate", 0.0))
             if gate > 0.0:
-                yaw = yaw * (target[:, 2].abs() > gate).to(yaw.dtype)
+                yaw = yaw * (target[..., 2].abs() > gate).to(yaw.dtype)
             return float(self.planner_velocity_objective_weight) * (lin + yaw)
         if getattr(self, "planner_velocity_objective_form", "quadratic") == "linear":
             # ANALYTIC PROGRESS form: -W * |v_pred - v_cmd|_1. Its gradient toward the command
             # is constant however far the prediction is, so a model that honestly predicts a weak
             # response (e.g. reduced motor gain) is still paid for every bit of progress, instead
             # of seeing a flat, saturated exp kernel.
-            error = (predicted[:, :3] - target).abs().sum(dim=-1)
+            error = (predicted[..., :3] - target).abs().sum(dim=-1)
             return -float(self.planner_velocity_objective_weight) * error
-        error = (predicted[:, :3] - target).square().sum(dim=-1)
+        error = (predicted[..., :3] - target).square().sum(dim=-1)
         return -float(self.planner_velocity_objective_weight) * error
+
+    def _member_returns(self, obs, action_sequences, z0=None, mean_latent: bool = False) -> torch.Tensor:
+        """Ensemble rollout: returns [M, B, candidates] (mean_latent=True: one MEAN-FIELD rollout
+        -- members' context terms averaged at the first dynamics layer, 1x cost -- returning
+        [1, B, candidates]). Reward/Q/continue/physical heads are the shared
+        context-free heads evaluated on each member's latent."""
+        batch_size, candidates, _, action_dim = action_sequences.shape
+        n = batch_size * candidates
+        z = self._encode(obs) if z0 is None else z0
+        z = z.unsqueeze(1).expand(-1, candidates, -1).reshape(n, -1)
+        ctx = self._ctx(candidates)
+        lead = (1,) if mean_latent else (self._ensemble,)
+        if not mean_latent:
+            z = z.unsqueeze(0).expand(self._ensemble, -1, -1)
+        else:
+            z = z.unsqueeze(0)
+        returns = torch.zeros(*lead, n, device=obs.device, dtype=obs.dtype)
+        discounts = torch.ones_like(returns)
+        alive = torch.ones_like(returns)
+        for t in range(self.horizon):
+            actions_t = action_sequences[:, :, t, :].reshape(n, action_dim).unsqueeze(0).expand(lead[0], -1, -1)
+            reward = self.model.reward(z, actions_t).squeeze(-1)
+            if mean_latent:  # mean-field surrogate: one dynamics pass, context terms averaged
+                z_next = self._next_mean(z[0], actions_t[0], ctx).unsqueeze(0)
+            else:
+                z_next = self.model.next(z, actions_t, context=ctx)
+            reward = reward + self._latent_velocity_objective_reward(z_next, obs, batch_size, candidates)
+            z = z_next
+            returns = returns + discounts * alive * reward
+            if self.use_continue_model:
+                continue_prob = self.model.continue_logits(z).sigmoid().squeeze(-1)
+                if self.hard_continue_model:
+                    alive = alive * (continue_prob > self.continue_threshold).to(alive.dtype)
+                else:
+                    alive = alive * continue_prob
+            discounts = discounts * self.discount
+        terminal_action = self.model.pi(z, deterministic=False)
+        terminal_value = self.model.Q(z, terminal_action, return_type="min").squeeze(-1)
+        returns = returns + discounts * alive * terminal_value
+        return returns.view(lead[0], batch_size, candidates)
+
+    def _risk_score(self, member_returns: torch.Tensor) -> torch.Tensor:
+        mean = member_returns.mean(0)
+        if self.planner_risk_lambda == 0.0:
+            return mean
+        return mean - self.planner_risk_lambda * member_returns.std(0, unbiased=False)
 
     @torch.no_grad()
     def evaluate_sequences(
@@ -1061,6 +1136,8 @@ class LatentMPPIPlanner:
         z0: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, candidates, _, action_dim = action_sequences.shape
+        if self._ensemble > 1:
+            return self._evaluate_ensemble(obs, action_sequences, z0)
         z = self._encode(obs) if z0 is None else z0
         z = z.unsqueeze(1).expand(-1, candidates, -1).reshape(batch_size * candidates, -1)
         ctx = self._ctx(candidates)
@@ -1092,12 +1169,42 @@ class LatentMPPIPlanner:
         returns = returns + discounts * alive * terminal_value
         return returns.view(batch_size, candidates)
 
+    def _evaluate_ensemble(self, obs, action_sequences, z0=None) -> torch.Tensor:
+        """Risk-aware scores [B, candidates]. Full: every candidate through every member.
+        Two-stage (planner_two_stage_k = k > 0): mean-field (1x cost) scores for all candidates,
+        then the top-k re-scored with the full ensemble and penalty; the others keep their
+        stage-1 score minus a margin so they cannot outrank a re-scored candidate."""
+        k = self.planner_two_stage_k
+        candidates = action_sequences.shape[1]
+        self._last_stage1 = self._last_rescored = None
+        if k <= 0 or k >= candidates:
+            member = self._member_returns(obs, action_sequences, z0)
+            self._last_disagreement = member.std(0, unbiased=False)
+            return self._risk_score(member)
+        stage1 = self._member_returns(obs, action_sequences, z0, mean_latent=True)[0]  # [B, cand]
+        top = stage1.topk(k, dim=1).indices
+        top_seq = action_sequences.gather(1, top.view(*top.shape, 1, 1).expand(-1, -1, *action_sequences.shape[2:]))
+        member = self._member_returns(obs, top_seq, z0)
+        rescored = self._risk_score(member)
+        # the non-re-scored candidates share one floor below every score, so they rank last
+        floor = torch.minimum(rescored.min(dim=1, keepdim=True).values, stage1.min(dim=1, keepdim=True).values) - 1.0
+        scores = floor.expand_as(stage1).clone()
+        scores.scatter_(1, top, rescored)
+        self._last_disagreement = member.std(0, unbiased=False)
+        self._last_stage1, self._last_rescored = stage1, rescored
+        return scores
+
     def _record_diagnostics(self, returns: torch.Tensor, action: torch.Tensor) -> None:
         returns = returns.detach()
+        # Two-stage scoring: the candidate scores hold a synthetic floor for the non-re-scored
+        # candidates, so mean/std come from the stage-1 (mean-field) scores of ALL candidates and
+        # the re-scored top-k are reported separately; best = the best final score.
+        spread = self._last_stage1 if self._last_stage1 is not None else returns
+        rescored = self._last_rescored if self._last_rescored is not None else returns
         self.last_diagnostics = {
-            "planner_candidate_return_mean": float(returns.mean().item()),
+            "planner_candidate_return_mean": float(spread.mean().item()),
             "planner_candidate_return_best": float(returns.max(dim=1).values.mean().item()),
-            "planner_candidate_return_std": float(returns.std(unbiased=False).item()),
+            "planner_candidate_return_std": float(spread.std(unbiased=False).item()),
             "planner_prior_candidate_fraction": float(self.num_pi_trajs / self.candidates),
             "planner_prior_command_candidate_fraction": 0.0,
             "planner_full_action_mode": 1.0,
@@ -1116,6 +1223,8 @@ class LatentMPPIPlanner:
             "planner_predicted_return_margin_mean": 0.0,
             "planner_predicted_return_margin_min": 0.0,
             "planner_prior_fallback_fraction": 0.0,
+            "planner_rescored_return_mean": float(rescored.mean().item()),
+            "planner_rescored_return_std": float(rescored.std(unbiased=False).item()),
         }
 
     def policy_action(self, obs: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
@@ -1244,6 +1353,8 @@ def build_planner(
     terminal_value: bool = False,
     disagreement_penalty: float = 0.0,
     model_policy_candidate_count: int = 0,
+    planner_risk_lambda: float = 0.0,
+    planner_two_stage_k: int = 0,
 ) -> TrajectoryPlanner | LatentMPPIPlanner:
     if getattr(model, "is_latent_world_model", False):
         if planner_name != "mppi":
@@ -1263,6 +1374,8 @@ def build_planner(
             max_std=max_std,
             num_pi_trajs=num_pi_trajs,
             action_spline_knots=action_spline_knots,
+            planner_risk_lambda=planner_risk_lambda,
+            planner_two_stage_k=planner_two_stage_k,
             action_prior=action_prior,
             prior_candidate_fraction=prior_candidate_fraction,
             prior_candidate_noise=prior_candidate_noise,

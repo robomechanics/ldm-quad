@@ -85,7 +85,7 @@ def _indices(text) -> list[int]:
 
 
 def build_model(path: str, device: str, graft_context_dim: int = 0, history_len: int = 48,
-                graft_components: str = "all"):
+                graft_components: str = "all", graft_ensemble: int = 1):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     a, sd = ckpt["args"], ckpt["model"]
     latent = a.get("latent_dim", 128)
@@ -106,6 +106,7 @@ def build_model(path: str, device: str, graft_context_dim: int = 0, history_len:
             history_layers=a.get("history_layers", 1), history_ff=a.get("history_ff", 256),
             history_dropout=a.get("history_dropout", 0.1),
             context_components=a.get("context_components") or graft_components,
+            context_ensemble=int(a.get("context_ensemble") or graft_ensemble),
         )
     model = wm.LatentWorldModel(**kwargs)
     if ck.is_context_free_state_dict(sd) and ctx_dim:
@@ -177,35 +178,49 @@ def open_loop(model, d, contexts: dict[str, torch.Tensor], horizon: int, chunk: 
     lat = model.latent_dim
     n = d["obs"].shape[1]
     out = {arm: {"phys": torch.zeros(n, horizon), "floor": torch.zeros(n, horizon),
-                 "latent": torch.zeros(n, horizon), "reward1": torch.zeros(n)} for arm in contexts}
+                 "latent": torch.zeros(n, horizon), "reward1": torch.zeros(n),
+                 "phys_member": torch.zeros(n, horizon), "disagree": torch.zeros(n, horizon)} for arm in contexts}
+    ens = getattr(model, "context_ensemble", 1) > 1
     for s in range(0, n, chunk):
         sl = slice(s, min(s + chunk, n))
         obs, act, rew = d["obs"][:, sl], d["actions"][:, sl], d["rewards"][:, sl]
         for arm, ctx_all in contexts.items():
-            c = ctx_all[sl]
+            c = ctx_all[:, sl] if ens else ctx_all[sl]
             z = model.encode(obs[0], context=c)
             out[arm]["reward1"][sl] = (model.reward(z, act[0], context=c).view(-1) - rew[0].view(-1)).abs()
             for k in range(1, horizon + 1):
                 z = model.next(z, act[k - 1], context=c)
                 tgt = obs[k].index_select(-1, phys_idx)
                 zk = model.encode(obs[k], context=c)
-                out[arm]["phys"][sl, k - 1] = (model.physical_features(z) - tgt).abs().mean(-1)
+                pred = model.physical_features(z)  # [n, 3], or [M, n, 3] for a context ensemble
+                if ens:
+                    # primary = the ENSEMBLE-MEAN prediction; also each member's own error and the
+                    # member disagreement (std of the predictions across members)
+                    out[arm]["phys"][sl, k - 1] = (model.member_mean(pred) - tgt).abs().mean(-1)
+                    out[arm]["phys_member"][sl, k - 1] = model.member_mean((pred - tgt).abs().mean(-1))
+                    out[arm]["disagree"][sl, k - 1] = pred.std(0, unbiased=False).mean(-1)
+                    out[arm]["latent"][sl, k - 1] = model.member_mean(((z[..., :lat] - zk[..., :lat]) ** 2).mean(-1))
+                else:
+                    out[arm]["phys"][sl, k - 1] = (pred - tgt).abs().mean(-1)
+                    out[arm]["phys_member"][sl, k - 1] = out[arm]["phys"][sl, k - 1]
+                    out[arm]["latent"][sl, k - 1] = ((z[..., :lat] - zk[..., :lat]) ** 2).mean(-1)
                 out[arm]["floor"][sl, k - 1] = (model.physical_features(zk) - tgt).abs().mean(-1)
-                out[arm]["latent"][sl, k - 1] = ((z[..., :lat] - zk[..., :lat]) ** 2).mean(-1)
     return out
 
 
 def shuffled_contexts(c, env, seed):
-    """Each sequence gets the context of a random sequence from a DIFFERENT env."""
+    """Each sequence gets the context of a random sequence from a DIFFERENT env
+    (c is [N, C], or [M, N, C] for a context ensemble -- shuffled along N)."""
     g = torch.Generator().manual_seed(seed + 2)
-    src = torch.randint(0, c.shape[0], (c.shape[0],), generator=g)
+    n = c.shape[-2]
+    src = torch.randint(0, n, (n,), generator=g)
     for _ in range(100):
         clash = env[src] == env
         if not clash.any():
             break
-        src[clash] = torch.randint(0, c.shape[0], (int(clash.sum()),), generator=g)
+        src[clash] = torch.randint(0, n, (int(clash.sum()),), generator=g)
     assert not (env[src] == env).any(), "could not find a cross-env context"
-    return c[src]
+    return c[:, src] if c.dim() == 3 else c[src]
 
 
 # ----------------------------------------------------------------------------- main
@@ -246,14 +261,17 @@ def evaluate_buffer(model, args, path: str, k_len: int) -> dict:
     n_valid = n_valid[keep]
     n = d["env"].numel()
     gain, fric = d["dyn"][:, 0], d["dyn"][:, 1]
+    ens = getattr(model, "context_ensemble", 1) > 1
     with torch.no_grad():
         c = torch.cat([
             model.encode_context(d["history_actions"][s:s + 1024], d["history_transitions"][s:s + 1024],
                                  d["history_pad_mask"][s:s + 1024])
             for s in range(0, n, 1024)
-        ])
-    null = model.history_encoder.null().expand(n, -1).clone()
+        ], dim=1 if ens else 0)  # [N, C], or [M, N, C]
+    null = model.null_context_batch(n).clone()
     c_shuf = shuffled_contexts(c, d["env"], args.seed)
+    # probe features: the members' contexts CONCATENATED (members live in different coordinates)
+    c_feat = c.permute(1, 0, 2).reshape(n, -1) if ens else c
 
     # ---- A: probe, split by env id within this buffer
     g = torch.Generator().manual_seed(args.seed)
@@ -270,7 +288,7 @@ def evaluate_buffer(model, args, path: str, k_len: int) -> dict:
     y_perm = y.clone()
     y_perm[train] = y[train][torch.randperm(int(train.sum()), generator=g)]
     probe = {}
-    for name, x, yy in (("context", c.double(), y), ("raw_history_mean", raw, y), ("shuffled_labels", c.double(), y_perm)):
+    for name, x, yy in (("context", c_feat.double(), y), ("raw_history_mean", raw, y), ("shuffled_labels", c_feat.double(), y_perm)):
         pred, alpha = ridge_r2(x, yy, train, test, d["env"], args.seed)
         entry = {"alpha": alpha, "overall": dict(zip(("motor_gain", "foot_friction"), _r2(pred, y[test]).tolist()))}
         for lo, hi in HIST_BINS:
@@ -278,6 +296,10 @@ def evaluate_buffer(model, args, path: str, k_len: int) -> dict:
             if m.sum() > 10:
                 entry[f"hist_{lo}-{hi}"] = dict(zip(("motor_gain", "foot_friction"), _r2(pred[m], y[test][m]).tolist()))
         probe[name] = entry
+    member_r2 = None
+    if ens:  # each member's own context alone
+        member_r2 = [
+            float(_r2(ridge_r2(c[i].double(), y, train, test, d["env"], args.seed)[0], y[test])[0]) for i in range(c.shape[0])]
 
     # ---- B: open loop, three arms on identical sequences
     ol = open_loop(model, d, {"true": c, "null": null, "shuffled": c_shuf}, args.horizon)
@@ -286,6 +308,8 @@ def evaluate_buffer(model, args, path: str, k_len: int) -> dict:
         per_group[gname] = {
             "n": int(m.sum()),
             **{arm: {"phys_per_k": ol[arm]["phys"][m].mean(0).tolist(),
+                     "phys_member_per_k": ol[arm]["phys_member"][m].mean(0).tolist(),
+                     "disagreement_per_k": ol[arm]["disagree"][m].mean(0).tolist(),
                      "floor_per_k": ol[arm]["floor"][m].mean(0).tolist(),
                      "latent_per_k": ol[arm]["latent"][m].mean(0).tolist(),
                      "reward_abs_err_k1": float(ol[arm]["reward1"][m].mean())} for arm in ARMS},
@@ -293,7 +317,7 @@ def evaluate_buffer(model, args, path: str, k_len: int) -> dict:
 
     # ---- C2: context statistics
     sub = torch.arange(min(n, 2048))
-    cn = torch.nn.functional.normalize(c[sub], dim=-1)
+    cn = torch.nn.functional.normalize((c[0] if ens else c)[sub], dim=-1)  # member 0 for an ensemble
     cos = cn @ cn.T
     same = (d["env"][sub].unsqueeze(0) == d["env"][sub].unsqueeze(1)) & (d["episode"][sub].unsqueeze(0) == d["episode"][sub].unsqueeze(1))
     same.fill_diagonal_(False)
@@ -302,7 +326,7 @@ def evaluate_buffer(model, args, path: str, k_len: int) -> dict:
         "norm_mean": float(c.norm(dim=-1).mean()),
         "cos_same_env_episode": float(cos[same].mean()) if same.any() else float("nan"),
         "cos_different_env": float(cos[diff_env].mean()),
-        "null_norm": float(model.history_encoder.null().norm()),
+        "null_norm": float(model.null_context_batch(1).norm()),
     }
 
     allp = per_group["all"]
@@ -315,12 +339,14 @@ def evaluate_buffer(model, args, path: str, k_len: int) -> dict:
         "replay": path, "sequences": n, "dropped_fully_padded_or_nan": dropped,
         "dyn_range": {"motor_gain": [float(gain.min()), float(gain.max())], "foot_friction": [float(fric.min()), float(fric.max())]},
         "test_envs": test_envs.tolist(), "probe_r2": probe, "open_loop": per_group, "context_stats": ctx_stats,
+        "ensemble": int(getattr(model, "context_ensemble", 1)), "probe_gain_r2_per_member": member_r2,
         "pass": {"true_lt_null_all_k": beats_null, "true_lt_shuffled_all_k": beats_shuf, "r2_gain": r2_gain,
                  "r2_gain_raw_baseline": r2_gain_raw,
                  "passed": beats_null and beats_shuf and r2_gain > 0.1 and r2_gain > r2_gain_raw},
     }
     # kept for the cross-buffer probe and the control; stripped before writing JSON
-    result["_features"] = {"c": c.double(), "raw": raw, "y": y, "gain": gain, "fric": fric, "n_valid": n_valid, "d": d}
+    result["_features"] = {"c": c_feat.double(), "c_raw": c, "raw": raw, "y": y, "gain": gain, "fric": fric,
+                           "n_valid": n_valid, "d": d}
     return result
 
 
@@ -350,6 +376,9 @@ def print_buffer(tag: str, r: dict, horizon: int) -> None:
     for name, e in probe.items():
         bins = " / ".join(f"{e[f'hist_{lo}-{hi}']['motor_gain']:+.2f}" if f"hist_{lo}-{hi}" in e else "  -  " for lo, hi in HIST_BINS)
         print(f"   {name:18s}      {e['overall']['motor_gain']:+.3f}      {e['overall']['foot_friction']:+.3f}      ({bins})")
+    if r.get("probe_gain_r2_per_member"):
+        print("   per-member gain R^2 (each member's context alone): "
+              + "  ".join(f"{x:+.3f}" for x in r["probe_gain_r2_per_member"]))
     ks = [1, 2, 4, 8, 12, 16] if horizon >= 16 else list(range(1, horizon + 1))
     print("B. open-loop physical |err| (vx,vy,wz)   " + "  ".join(f"k={k:<3d}" for k in ks))
     for gname, gv in per_group.items():
@@ -357,6 +386,11 @@ def print_buffer(tag: str, r: dict, horizon: int) -> None:
         for arm in ARMS:
             print(f"     {arm:9s}" + " " * 26 + "  ".join(f"{gv[arm]['phys_per_k'][k - 1]:.4f}" for k in ks))
     allp = per_group["all"]
+    if r.get("ensemble", 1) > 1:
+        print(f"   ensemble of {r['ensemble']}: rows above are the ENSEMBLE-MEAN prediction; all sequences:")
+        for arm in ARMS:
+            print(f"     {arm:9s} member-avg err" + " " * 12 + "  ".join(f"{allp[arm]['phys_member_per_k'][k - 1]:.4f}" for k in ks))
+            print(f"     {arm:9s} disagreement std" + " " * 9 + "  ".join(f"{allp[arm]['disagreement_per_k'][k - 1]:.4f}" for k in ks))
     print("   encoder floor (true)" + " " * 16 + "  ".join(f"{allp['true']['floor_per_k'][k - 1]:.4f}" for k in ks))
     print("   latent consistency MSE, all")
     for arm in ARMS:
@@ -391,14 +425,15 @@ def main() -> None:
     if args.control_checkpoint and os.path.exists(args.control_checkpoint):
         # same context structure as the evaluated model (dynamics_only checkpoints have fewer projections)
         cm, _ = build_model(args.control_checkpoint, args.device, graft_context_dim=model.context_dim, history_len=k_len,
-                            graft_components=model.context_components)
+                            graft_components=model.context_components,
+                            graft_ensemble=getattr(model, "context_ensemble", 1))
         d = ref["_features"]["d"]
         n = d["env"].numel()
         m = torch.arange(n) < min(n, 2048)
         dsub = filter_rows(d, m)
         with torch.no_grad():
             csub = cm.encode_context(dsub["history_actions"], dsub["history_transitions"], dsub["history_pad_mask"])
-        olc = open_loop(cm, dsub, {"true": csub, "null": cm.history_encoder.null().expand(int(m.sum()), -1).clone(),
+        olc = open_loop(cm, dsub, {"true": csub, "null": cm.null_context_batch(int(m.sum())).clone(),
                                    "shuffled": shuffled_contexts(csub, dsub["env"], args.seed)}, args.horizon)
         maxdiff = max(float((olc[a]["phys"] - olc["true"]["phys"]).abs().max()) for a in ARMS)
         control = {"checkpoint": args.control_checkpoint, "buffer": tags[0], "n": int(m.sum()),
@@ -409,7 +444,9 @@ def main() -> None:
         d = ref["_features"]["d"]
         n = d["env"].numel()
         m2 = torch.arange(n) < min(n, 2048)
-        obs0, a0, c2 = d["obs"][0][m2], d["actions"][0][m2], ref["_features"]["c"][m2].float()
+        craw = ref["_features"]["c_raw"]
+        c2 = (craw[:, m2] if craw.dim() == 3 else craw[m2]).float()
+        obs0, a0 = d["obs"][0][m2], d["actions"][0][m2]
         z = model.encode(obs0, context=c2)
         za = torch.cat([z, a0], -1)
         term_ratio = {}
@@ -420,12 +457,15 @@ def main() -> None:
             if inner.context_weight is None:
                 continue  # not conditioned in this checkpoint (context_components=dynamics_only)
             base = inner[0](x).norm(dim=-1).mean()
-            term = torch.nn.functional.linear(c2, inner.context_weight).norm(dim=-1).mean()
+            if inner.context_weight.ndim == 3:  # ensemble: each member's own term, averaged over members
+                term = torch.einsum("mnc,mhc->mnh", c2, inner.context_weight).norm(dim=-1).mean()
+            else:
+                term = torch.nn.functional.linear(c2, inner.context_weight).norm(dim=-1).mean()
             term_ratio[name] = float(term / base)
     sdm = ckpt["model"]
     weights = {k: float(v.norm()) for k, v in sdm.items() if k.endswith("context_weight") and not k.startswith(("target_", "detach_"))}
-    weights["history_encoder.null_context_abs_max"] = float(sdm["history_encoder.null_context"].abs().max()) \
-        if "history_encoder.null_context" in sdm else float("nan")
+    _nulls = [v for k, v in sdm.items() if k.startswith("history_encoder.") and k.endswith("null_context")]
+    weights["history_encoder.null_context_abs_max"] = max(float(v.abs().max()) for v in _nulls) if _nulls else float("nan")
     total_w = sum(v ** 2 for k, v in weights.items() if k.endswith("context_weight")) ** 0.5
 
     for r in buffers.values():

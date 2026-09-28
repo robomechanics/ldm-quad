@@ -104,6 +104,14 @@ class ContextController:
         self._ema: torch.Tensor | None = None
         self._ema_reset = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
+    def clear(self) -> None:
+        """Every env starts a new episode (e.g. after a full env.reset())."""
+        self.history.clear()
+        self._frozen, self._ema, self._prev, self._last = None, None, None, None
+        self._null_after_freeze.zero_()
+        self._ema_reset.zero_()
+        self.t = 0
+
     def pad_mask(self) -> torch.Tensor:
         """``[N, K]`` True for padded slots: invalid, or older than the ``context_len`` newest."""
         k = self.history.history_len
@@ -112,6 +120,8 @@ class ContextController:
         return ~self.history.valid | (age >= self.context_len).unsqueeze(0)
 
     def _null(self, model: torch.nn.Module, n: int) -> torch.Tensor:
+        if hasattr(model, "null_context_batch"):
+            return model.null_context_batch(n)  # [n, C], or [M, n, C] for a context ensemble
         return model.history_encoder.null().unsqueeze(0).expand(n, -1)
 
     def context(self, model: torch.nn.Module) -> torch.Tensor | None:
@@ -121,11 +131,12 @@ class ContextController:
         if self.mode == "null":
             ctx = self._null(model, n).clone()
         elif self.mode == "frozen" and self._frozen is not None:
+            # held exactly (no EMA on top); envs reset since the freeze get the null context
             ctx = torch.where(self._null_after_freeze.unsqueeze(-1), self._null(model, n), self._frozen)
+            self._prev, self._last = self._last, ctx.detach()
+            return ctx
         else:
             ctx = model.encode_context(self.history.actions, self.history.transitions, self.pad_mask())
-            if self.mode == "frozen" and self.t >= self.freeze_step:
-                self._frozen = ctx.detach().clone()
         if self.ema_tau < 1.0:
             raw = ctx.detach()
             if self._ema is None:
@@ -135,6 +146,8 @@ class ContextController:
                 self._ema = torch.where(self._ema_reset.unsqueeze(-1), raw, smooth)
             self._ema_reset.zero_()
             ctx = self._ema.clone()
+        if self.mode == "frozen" and self.t >= self.freeze_step:
+            self._frozen = ctx.detach().clone()  # the context in USE (smoothed when EMA is on), not the raw one
         self._prev, self._last = self._last, ctx.detach()
         return ctx
 
@@ -147,6 +160,7 @@ class ContextController:
         self.t += 1
         if self.mode == "truncated" and self.t == self.truncate_step:
             self.history.valid.zero_()  # the NEXT context sees post-truncation transitions only
+            self._ema_reset.fill_(True)  # ...and the EMA restarts from it instead of blending in the old context
 
     def metrics(self) -> dict[str, float]:
         if self._last is None:

@@ -91,6 +91,7 @@
 #                                               # headless diagnostics eval, 16 envs x 500 steps
 #   ./frozen_walker_run.sh adapt                # SIT adapter v1 (context in every head; the sit-adapt-v1 record)
 #   ./frozen_walker_run.sh adapt_v2             # SIT adapter v2 (context in the dynamics only)
+#   ./frozen_walker_run.sh adapt_v3             # SIT adapter v3 (5-member context ensemble, risk-aware MPPI)
 #   Overrides (env): CKPT= (eval/play another checkpoint, e.g. an adapted one)
 #                    OUT= ENVS= STEPS= SEED= TRAIN_STEPS= CTX_DIM= HIST_LEN= WARMUP= WANDB_NAME=
 #                    GAIN_LO= GAIN_HI= FRIC_LO= FRIC_HI= ADAPTER_LR= ADAPTER_WD=
@@ -248,6 +249,63 @@ case "$ACTION" in
       --train_steps "$TRAIN_STEPS" "${CMD[@]}"
     ;;
 
+  adapt_v3)
+    # SIT adapter v3 = v2's structure (context in the dynamics MLP only) with an ENSEMBLE of
+    # M=5 context pathways and Sean's risk-aware planner:
+    #   - M pairs (history_encoder_m, dynamics.0.context_weight[m]) over the frozen stageL trunk,
+    #     each zero-init, so the warm start is exact under any context. Member m trains on its own
+    #     per-sample Bernoulli(0.5) bootstrap of every batch (fresh mask per update).
+    #     Trainable 5 x (55,056 + 8,192) = 316,240 params; q_scale frozen; wd 0.013 on the
+    #     projection only (the history encoders are not decayed).
+    #   - Planner: every candidate scored as mean_m(return_m) - lambda * std_m(return_m) with the
+    #     frozen stageL reward/Q/continue heads on each member's latent. Collection uses
+    #     lambda = 1 (on-policy for the risk-aware planner).
+    #   - TWO-STAGE scoring (planner cost): all 512 candidates on a 1x MEAN-FIELD rollout (the
+    #     members' context terms averaged at the dynamics' first layer), then the top K=128
+    #     re-scored with the full ensemble + penalty. Measured on the GPU (64 envs, 512 x 6 iter,
+    #     H=8): v2 1.54 s/plan, v3 full ensemble 7.67 s (5.0x), two-stage 3.25 s. The policy
+    #     proposal rollouts use the same 1x mean-field surrogate. two_stage_k must be >= elites.
+    #     Whole collection step: 5.96 s (v2 2.5 s) -> the 20k steps take ~31 h.
+    #   - Context used at deployment/collection: EMA tau 0.05 per member (never worse than raw
+    #     rolling in the v2 closed-loop tests, better on friction). Training windows are raw.
+    # Differences from adapt_v2: --context_ensemble 5, --planner_risk_lambda 1.0,
+    # --planner_two_stage_k 128, --context_ema 0.05. Everything else identical.
+    SEED="${SEED:-43}"
+    CTX_DIM="${CTX_DIM:-16}"; HIST_LEN="${HIST_LEN:-48}"
+    WARMUP="${WARMUP:-1000}"
+    TRAIN_STEPS="${TRAIN_STEPS:-340300}"      # 20k adapter steps; checkpoint every 2500 (8 kept)
+    GAIN_LO="${GAIN_LO:-0.6}"; GAIN_HI="${GAIN_HI:-1.0}"
+    FRIC_LO="${FRIC_LO:-0.25}"; FRIC_HI="${FRIC_HI:-1.0}"
+    ADAPTER_WD="${ADAPTER_WD:-0.013}"
+    ENSEMBLE="${ENSEMBLE:-5}"; RISK="${RISK:-1.0}"; TWO_STAGE_K="${TWO_STAGE_K:-128}"; EMA="${EMA:-0.05}"
+    ADAPTER_LR_FLAG=(); [[ -n "${ADAPTER_LR:-}" ]] && ADAPTER_LR_FLAG=(--sit_adapter_lr "$ADAPTER_LR")
+    WANDB_NAME="${WANDB_NAME:-sit_adapter_v3_ens${ENSEMBLE}_risk${RISK}_c${CTX_DIM}_k${HIST_LEN}_s${SEED}}"
+    [[ -f "$FROZEN" ]] || { echo "[frozen] ERROR: missing $FROZEN"; exit 1; }
+    echo "[frozen] SIT adapter v3 (dynamics_only, ensemble $ENSEMBLE, risk $RISK, two-stage k=$TWO_STAGE_K, ema $EMA): $FROZEN -> train_steps=$TRAIN_STEPS gain=[$GAIN_LO,$GAIN_HI] friction=[$FRIC_LO,$FRIC_HI] wd=$ADAPTER_WD"
+    exec "$PY" -u scripts/mbrl/train.py \
+      --headless --task Flat-Unitree-Go2-train-v0 --num_envs 64 --seed "$SEED" \
+      --buffer_capacity 1000000 --replay_device auto \
+      --model_type latent --latent_dim 256 --num_q 5 --horizon 8 --batch_size 1024 \
+      --utd 0.25 --candidates 512 --elites 64 \
+      --planner mppi --planner_iterations 6 --discount 0.99 \
+      --planner_start_steps 2000 --planner_min_length_fraction 0.0 --planner_recovery_steps 2000 \
+      --planner_recent_episodes 200 --planner_temperature 0.5 \
+      --planner_use_continue_model --planner_continue_threshold 0.5 \
+      --planner_velocity_objective_weight 0.0 --num_pi_trajs 24 \
+      --q_dropout 0.1 --entropy_coef 0.0003 --tdmpc2_bc_coef 0.1 \
+      --reward_yaw_weight 4.0 --reward_yaw_std 0.5 --reward_track_std 0.2 \
+      --eval_tracking_yaw_weight 0.5 \
+      --history_context_dim "$CTX_DIM" --history_len "$HIST_LEN" --sit_train_mode adapter \
+      --context_components dynamics_only --context_ensemble "$ENSEMBLE" \
+      --planner_risk_lambda "$RISK" --planner_two_stage_k "$TWO_STAGE_K" --context_ema "$EMA" \
+      --sit_adapter_weight_decay "$ADAPTER_WD" "${ADAPTER_LR_FLAG[@]}" \
+      --dyn_motor_gain_range "$GAIN_LO" "$GAIN_HI" --dyn_friction_range "$FRIC_LO" "$FRIC_HI" \
+      --resume_checkpoint "$FROZEN" --no-auto_resume_replay --resume_warmup_steps "$WARMUP" \
+      --save_interval 2500 --max_checkpoints 50 --save_replay --eval_interval 50 \
+      --wandb --wandb_project "$PROJECT" --wandb_name "$WANDB_NAME" \
+      --train_steps "$TRAIN_STEPS" "${CMD[@]}"
+    ;;
+
   manifest|*)
     cat <<'EOF'
 FROZEN WALKER -- Go2 latent-TD-MPC2, Stage L omnidirectional (never retrained)
@@ -262,6 +320,7 @@ FROZEN WALKER -- Go2 latent-TD-MPC2, Stage L omnidirectional (never retrained)
   ./frozen_walker_run.sh eval [mismatch] [args...]    # headless diagnostics eval
   ./frozen_walker_run.sh adapt                        # SIT adapter v1: context in every head (record of sit-adapt-v1)
   ./frozen_walker_run.sh adapt_v2                     # SIT adapter v2: context in the dynamics only (~15 h)
+  ./frozen_walker_run.sh adapt_v3                     # SIT adapter v3: 5-member context ensemble + risk-aware MPPI
   CKPT=<ckpt> ./frozen_walker_run.sh eval ...         # evaluate an adapted checkpoint
 
 Curriculum and how the walker was trained: scripts/mbrl/omni_run.sh

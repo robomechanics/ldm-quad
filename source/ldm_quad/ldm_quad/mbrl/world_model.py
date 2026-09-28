@@ -31,30 +31,40 @@ class ContextSequential(nn.Sequential):
     child is itself a ContextSequential (latent_mlp) the context is forwarded to it.
     """
 
-    def __init__(self, *layers: nn.Module, context_dim: int = 0):
+    def __init__(self, *layers: nn.Module, context_dim: int = 0, ensemble: int = 1):
         super().__init__(*layers)
         first = self[0]
         if context_dim > 0 and not isinstance(first, ContextSequential):
-            self.context_weight = nn.Parameter(torch.zeros(first.out_features, context_dim))
+            # ensemble > 1: one zero-init projection per member, stacked [M, H, C]; the input x
+            # and context then carry a leading member dim [M, ...] (see forward).
+            shape = (first.out_features, context_dim) if ensemble <= 1 else (ensemble, first.out_features, context_dim)
+            self.context_weight = nn.Parameter(torch.zeros(*shape))
         else:
             self.register_parameter("context_weight", None)
 
-    def forward(self, x: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, context: torch.Tensor | None = None, member_mean: bool = False) -> torch.Tensor:
         layers = iter(self)
         first = next(layers)
         if isinstance(first, ContextSequential):
-            h = first(x, context)
+            h = first(x, context, member_mean)
         else:
             h = first(x)
             if self.context_weight is not None and context is not None:
-                h = h + F.linear(context, self.context_weight)
+                if self.context_weight.ndim == 3:  # member m's context through member m's projection
+                    term = torch.einsum("m...c,mhc->m...h", context, self.context_weight)
+                    # member_mean: ONE pass with the members' context terms averaged at the
+                    # first-layer pre-activation (mean-field; x carries no member dim)
+                    h = h + (term.mean(0) if member_mean else term)
+                else:
+                    h = h + F.linear(context, self.context_weight)
         for layer in layers:
             h = layer(h)
         return h
 
 
 def mlp(
-    input_dim: int, hidden_dim: int, output_dim: int, depth: int, dropout: float = 0.0, context_dim: int = 0
+    input_dim: int, hidden_dim: int, output_dim: int, depth: int, dropout: float = 0.0, context_dim: int = 0,
+    ensemble: int = 1,
 ) -> nn.Sequential:
     layers: list[nn.Module] = []
     dim = input_dim
@@ -66,7 +76,7 @@ def mlp(
             layers.append(nn.Dropout(dropout))
         dim = hidden_dim
     layers.append(nn.Linear(dim, output_dim))
-    return ContextSequential(*layers, context_dim=context_dim)
+    return ContextSequential(*layers, context_dim=context_dim, ensemble=ensemble)
 
 
 class SimNorm(nn.Module):
@@ -88,9 +98,10 @@ class SimNorm(nn.Module):
 
 
 def latent_mlp(
-    input_dim: int, hidden_dim: int, latent_dim: int, depth: int, simnorm_dim: int, context_dim: int = 0
+    input_dim: int, hidden_dim: int, latent_dim: int, depth: int, simnorm_dim: int, context_dim: int = 0,
+    ensemble: int = 1,
 ) -> nn.Sequential:
-    layers: list[nn.Module] = [mlp(input_dim, hidden_dim, latent_dim, depth, context_dim=context_dim)]
+    layers: list[nn.Module] = [mlp(input_dim, hidden_dim, latent_dim, depth, context_dim=context_dim, ensemble=ensemble)]
     if simnorm_dim > 1:
         layers.append(SimNorm(simnorm_dim))
     return ContextSequential(*layers)
@@ -371,6 +382,7 @@ class LatentWorldModel(nn.Module):
         history_ff: int = 256,
         history_dropout: float = 0.1,
         context_components: str = "all",
+        context_ensemble: int = 1,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -417,8 +429,16 @@ class LatentWorldModel(nn.Module):
         head_dim = max(num_bins, 1)
         self.q_scale = RunningScale(tau)
 
-        self.history_encoder = (
-            HistoryEncoder(
+        # context_ensemble M > 1 (v3): M independent context pathways -- a history encoder and a
+        # dynamics context projection each -- over the shared frozen trunk. Only with
+        # context_components="dynamics_only", so every other head stays context-free and the
+        # members differ only in d(z, a, c_m). M = 1 is the single-pathway model, unchanged.
+        self.context_ensemble = max(1, int(context_ensemble))
+        if self.context_ensemble > 1 and (self.context_dim == 0 or context_components != "dynamics_only"):
+            raise ValueError("context_ensemble > 1 needs context_dim > 0 and context_components='dynamics_only'")
+
+        def _history_encoder() -> "HistoryEncoder":
+            return HistoryEncoder(
                 action_dim=action_dim,
                 transition_dim=obs_dim,
                 context_dim=self.context_dim,
@@ -428,9 +448,13 @@ class LatentWorldModel(nn.Module):
                 num_layers=history_layers,
                 dropout=history_dropout,
             )
-            if self.context_dim > 0
-            else None
-        )
+
+        if self.context_dim == 0:
+            self.history_encoder = None
+        elif self.context_ensemble == 1:
+            self.history_encoder = _history_encoder()
+        else:
+            self.history_encoder = nn.ModuleList(_history_encoder() for _ in range(self.context_ensemble))
         # The system-id context conditions every component TD-MPC2 conditions on its task
         # embedding e: h(s,e), d(z,a,e), R(z,a,e), Q(z,a,e), p(z,e). It is ADDED at each first
         # layer through a zero-initialised projection (ContextSequential) rather than
@@ -447,7 +471,8 @@ class LatentWorldModel(nn.Module):
         ctx_heads = ctx if context_components == "all" else 0
         z_dim = self.z_dim
         self.encoder = latent_mlp(obs_dim, hidden_dim, latent_dim, depth, simnorm_dim, context_dim=ctx_heads)
-        self.dynamics = latent_mlp(z_dim + action_dim, hidden_dim, latent_dim, depth, simnorm_dim, context_dim=ctx)
+        self.dynamics = latent_mlp(z_dim + action_dim, hidden_dim, latent_dim, depth, simnorm_dim, context_dim=ctx,
+                                   ensemble=self.context_ensemble)
         self.reward_head = mlp(z_dim + action_dim, hidden_dim, head_dim, depth, context_dim=ctx_heads)
         self.continue_head = mlp(z_dim, hidden_dim, 1, depth)
         self.policy_head = mlp(z_dim, hidden_dim, 2 * action_dim, depth, context_dim=ctx_heads)
@@ -503,6 +528,12 @@ class LatentWorldModel(nn.Module):
         for detach_param, param in zip(self.detach_q_heads.parameters(), self.q_heads.parameters(), strict=True):
             detach_param.copy_(param)
 
+    def null_context_batch(self, n: int) -> torch.Tensor:
+        """The empty-history context for n envs: [n, C], or [M, n, C] for a context ensemble."""
+        if self.context_ensemble == 1:
+            return self.history_encoder.null().unsqueeze(0).expand(n, -1)
+        return torch.stack([enc.null() for enc in self.history_encoder]).unsqueeze(1).expand(-1, n, -1)
+
     def _resolve_context(self, x: torch.Tensor, context: torch.Tensor | None) -> torch.Tensor | None:
         """System-id context for a component whose input is ``x``.
 
@@ -513,6 +544,10 @@ class LatentWorldModel(nn.Module):
         enters each conditioned MLP additively at its first layer (ContextSequential)."""
         if self.context_dim == 0:
             return None
+        if self.context_ensemble > 1:
+            # only the dynamics is conditioned (dynamics_only) and it resolves its own member-wise
+            # context in _next_ensemble; every other head has no projection and ignores this
+            return context
         if context is None:
             assert self.history_encoder is not None
             null = self.history_encoder.null().to(dtype=x.dtype, device=x.device)
@@ -537,13 +572,55 @@ class LatentWorldModel(nn.Module):
         Returns ``None`` when the history encoder is disabled (``context_dim == 0``)."""
         if self.history_encoder is None:
             return None
+        if self.context_ensemble > 1:  # [M, B, C]: every member encodes the same history
+            return torch.stack([enc(history_actions, history_transitions, history_pad_mask) for enc in self.history_encoder])
         return self.history_encoder(history_actions, history_transitions, history_pad_mask)
 
-    def next(self, z: torch.Tensor, actions: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
+    def next(self, z: torch.Tensor, actions: torch.Tensor, context: torch.Tensor | None = None,
+             z_has_members: bool | None = None) -> torch.Tensor:
+        if self.context_ensemble > 1:
+            return self._next_ensemble(z, actions, context, z_has_members)
         inputs = torch.cat([z, actions], dim=-1)
         z_next = self.dynamics(inputs, self._resolve_context(inputs, context))
         if self.command_dim:
             # The command is exogenous; keep it fixed during a model rollout.
+            z_next = torch.cat([z_next, z[..., -self.command_dim:]], dim=-1)
+        return z_next
+
+    def _next_ensemble(self, z: torch.Tensor, actions: torch.Tensor, context: torch.Tensor | None,
+                       z_has_members: bool | None = None) -> torch.Tensor:
+        """Member-wise dynamics, returns [M, ..., D].
+
+        Convention: an ensemble context is always [M, ..., C], so ``z`` carries the member dim
+        iff it has as many dims as the context; otherwise ``z`` ([..., D]) is broadcast to every
+        member. ``actions`` without the member dim are broadcast the same way. ``context=None``
+        means every member's null context; then ``z`` carries the member dim iff
+        ``z_has_members`` (default: inferred as z.dim() >= 3 and z.shape[0] == M -- pass it
+        explicitly for a memberless z whose leading dim happens to equal M)."""
+        m = self.context_ensemble
+        if context is None:
+            members = z_has_members if z_has_members is not None else (z.dim() >= 3 and z.shape[0] == m)
+            batch = z.shape[1:-1] if members else z.shape[:-1]
+            null = self.null_context_batch(1)[:, 0].to(z)  # [M, C]
+            context = null.view(m, *([1] * len(batch)), self.context_dim).expand(m, *batch, self.context_dim)
+        if z.dim() != context.dim():
+            z = z.unsqueeze(0).expand(m, *z.shape)
+        if actions.dim() == z.dim() - 1:
+            actions = actions.unsqueeze(0).expand(m, *actions.shape)
+        inputs = torch.cat([z, actions], dim=-1)
+        z_next = self.dynamics(inputs, context)
+        if self.command_dim:
+            z_next = torch.cat([z_next, z[..., -self.command_dim:]], dim=-1)
+        return z_next
+
+    def next_mean_field(self, z: torch.Tensor, actions: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """Cheap single-pass ensemble surrogate: the members' additive context terms are averaged
+        at the dynamics' first-layer pre-activation and the rest of the MLP runs once. ``z`` and
+        ``actions`` are memberless [N, .], ``context`` is [M, N, C]; returns [N, D]. Equals every
+        member's next() exactly when all members' context terms coincide."""
+        inputs = torch.cat([z, actions], dim=-1)
+        z_next = self.dynamics(inputs, context, member_mean=True)
+        if self.command_dim:
             z_next = torch.cat([z_next, z[..., -self.command_dim:]], dim=-1)
         return z_next
 
@@ -557,6 +634,12 @@ class LatentWorldModel(nn.Module):
 
     def continue_logits(self, z: torch.Tensor) -> torch.Tensor:
         return self.continue_head(z)
+
+    def member_mean(self, x: torch.Tensor) -> torch.Tensor:
+        """Collapse the member dim of a quantity derived from next() (which always returns
+        [M, ..., D] for a context ensemble): the ensemble mean. Identity for M = 1. The one place
+        evaluation code (play.py, predictor_eval.py, eval_context_offline.py) reduces members."""
+        return x.mean(0) if self.context_ensemble > 1 else x
 
     def physical_features(self, z: torch.Tensor) -> torch.Tensor:
         if self.physical_head is None:
@@ -797,6 +880,8 @@ class LatentWorldModel(nn.Module):
         return loss, metrics
 
     def loss(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, float], torch.Tensor]:
+        if self.context_ensemble > 1:
+            return self._loss_ensemble(batch)
         obs = batch["obs"]
         actions = batch["actions"]
         rewards = batch["rewards"]
@@ -914,3 +999,126 @@ class LatentWorldModel(nn.Module):
         # on the same segment context (the training update runs loss -> policy_loss serially).
         self._last_context = context.detach() if context is not None else None
         return total, metrics, torch.stack(rollout_zs, dim=0).detach()
+
+    def _loss_ensemble(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, float], torch.Tensor]:
+        """World-model loss for a context ensemble (M > 1, dynamics_only).
+
+        Every member rolls the shared latent forward with its own context and dynamics
+        projection; the same terms as loss() are computed per member and per sample, and each
+        member is trained on its own BOOTSTRAP of the batch: a fresh per-sample Bernoulli(0.5)
+        mask per member on every call (at least one sample each). The encoder, reward, Q and
+        continue/physical heads are context-free, so TD targets are shared by all members.
+        Returns member-mean rollout latents [H+1, B, D] (for policy-loss metrics)."""
+        obs, actions, rewards, continues = batch["obs"], batch["actions"], batch["rewards"], batch["continues"]
+        if obs.ndim != 3:
+            raise ValueError("LatentWorldModel.loss expects sequence batches shaped [H+1, B, dim].")
+        m = self.context_ensemble
+        horizon, batch_dim = actions.shape[0], obs.shape[1]
+        context = self.encode_context(batch["history_actions"], batch["history_transitions"], batch.get("history_pad_mask"))
+        mask = torch.rand(m, batch_dim, device=obs.device) < 0.5
+        empty = ~mask.any(dim=1)
+        if empty.any():  # guarantee every member sees at least one sample
+            mask[empty, torch.randint(0, batch_dim, (int(empty.sum()),), device=obs.device)] = True
+        w = mask.float() / mask.float().sum(dim=1, keepdim=True)  # [M, B], rows sum to 1
+
+        def reduce(per_sample: torch.Tensor) -> torch.Tensor:  # [M, B] -> mean over members of member-wise means
+            return (per_sample * w).sum(dim=1).mean()
+
+        with torch.no_grad():
+            target_zs = self.encode(obs[1:].reshape(-1, self.obs_dim), target=False).view(horizon, batch_dim, -1)
+        z = self.encode(obs[0]).unsqueeze(0).expand(m, -1, -1)
+        zero = torch.zeros((), device=obs.device)
+        consistency_loss = reward_loss = value_loss = continue_loss = physical_loss = zero
+        rollout_zs = [z]
+        physical_indices = None
+        if self.physical_head is not None and self.loss_weights.physical > 0.0:
+            physical_indices = torch.as_tensor(self.physical_feature_indices, device=obs.device, dtype=torch.long)
+        for t in range(horizon):
+            weight = self.rho**t
+            action_t = actions[t].unsqueeze(0).expand(m, -1, -1)
+            reward_t, continue_t, z_target = rewards[t], continues[t], target_zs[t]
+            q_logits = self.Q_logits(z, action_t)                      # [Q, M, B, bins]
+            reward_logits = self.reward_logits(z, action_t)            # [M, B, bins]
+            z_next = self.next(z, action_t, context=context)           # [M, B, D]
+            continue_pred = self.continue_logits(z_next)               # [M, B, 1]
+            with torch.no_grad():
+                target_action = self.pi(z_target, deterministic=False)
+                target_q = reward_t + self.discount * continue_t * self.Q(
+                    z_target, target_action, target=True, return_type="min")  # [B, 1], shared
+            consistency_loss = consistency_loss + weight * reduce(
+                (z_next[..., : self.latent_dim] - z_target[..., : self.latent_dim]).square().mean(-1))
+            reward_loss = reward_loss + weight * reduce(soft_ce(reward_logits, reward_t, self.dreg).squeeze(-1))
+            value_loss = value_loss + weight * reduce(soft_ce(q_logits, target_q, self.dreg).squeeze(-1).mean(0))
+            bce_w = torch.where(continue_t < 0.5, continue_t.new_tensor(10.0), continue_t.new_tensor(1.0))
+            continue_loss = continue_loss + weight * reduce(F.binary_cross_entropy_with_logits(
+                continue_pred, continue_t.expand_as(continue_pred), weight=bce_w.expand_as(continue_pred),
+                reduction="none").squeeze(-1))
+            if physical_indices is not None:
+                physical_target = obs[t + 1].index_select(-1, physical_indices)
+                physical_loss = physical_loss + weight * reduce(
+                    (self.physical_features(z_next) - physical_target).square().mean(-1))
+            z = z_next
+            rollout_zs.append(z)
+        normalizer = sum(self.rho**t for t in range(horizon))
+        consistency_loss, reward_loss, value_loss, continue_loss, physical_loss = (
+            x / normalizer for x in (consistency_loss, reward_loss, value_loss, continue_loss, physical_loss))
+        wts = self.loss_weights
+        total = (wts.consistency * consistency_loss + wts.reward * reward_loss + wts.value * value_loss
+                 + wts.continue_ * continue_loss + wts.physical * physical_loss)
+        metrics = {
+            "loss": float(total.detach().item()),
+            "consistency_loss": float(consistency_loss.detach().item()),
+            "reward_loss": float(reward_loss.detach().item()),
+            "value_loss": float(value_loss.detach().item()),
+            "continue_loss": float(continue_loss.detach().item()),
+            "physical_loss": float(physical_loss.detach().item()),
+        }
+        self._last_context = None  # the policy is context-free in dynamics_only
+        zs = torch.stack(rollout_zs, dim=0)  # [H+1, M, B, D]
+        # member-mean latents [H+1, B, D]: lines up with the batch for policy_loss (metrics only
+        # in adapter mode, where the policy has nothing to train)
+        return total, metrics, zs.mean(dim=1).detach()
+
+
+def parse_index_list(value: object) -> list[int]:
+    """'0,1,5' / [0, 1, 5] / None / '' -> list of ints (checkpoint args store index lists either way)."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [int(item) for item in value]
+    return [int(item.strip()) for item in str(value).split(",") if item.strip()]
+
+
+def latent_model_from_args(a: dict, obs_dim: int, action_dim: int) -> LatentWorldModel:
+    """Rebuild a LatentWorldModel with EXACTLY the structure recorded in a checkpoint's args
+    (latent/hidden/depth, physical head, command skip, history context, context components and
+    context ensemble). Every structural field comes from the checkpoint, never a CLI default --
+    a mismatch fails load_state_dict(strict=True) or, worse, silently changes the model."""
+    return LatentWorldModel(
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        latent_dim=a.get("latent_dim", 128),
+        hidden_dim=a["hidden_dim"],
+        depth=a["model_depth"],
+        num_q=a.get("num_q", 5),
+        discount=a["discount"],
+        tau=a.get("target_tau", 0.01),
+        rho=a.get("rho", 0.5),
+        entropy_coef=a.get("entropy_coef", 1e-4),
+        num_bins=a.get("num_bins", 101),
+        vmin=a.get("vmin", -10.0),
+        vmax=a.get("vmax", 10.0),
+        simnorm_dim=a.get("simnorm_dim", 8),
+        q_dropout=a.get("q_dropout", 0.01),
+        physical_feature_indices=parse_index_list(a.get("latent_physical_indices")),
+        command_indices=parse_index_list(a.get("command_skip_indices")),
+        context_dim=int(a.get("history_context_dim") or 0),
+        history_len=int(a.get("history_len") or 48),
+        history_d_model=a.get("history_d_model", 64),
+        history_nhead=a.get("history_nhead", 4),
+        history_layers=a.get("history_layers", 1),
+        history_ff=a.get("history_ff", 256),
+        history_dropout=a.get("history_dropout", 0.1),
+        context_components=a.get("context_components") or "all",
+        context_ensemble=int(a.get("context_ensemble") or 1),
+    )

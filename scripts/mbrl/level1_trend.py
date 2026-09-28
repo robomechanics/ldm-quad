@@ -7,6 +7,9 @@ Alert when ||W c|| / ||base pre-act|| > 0.5 in any conditioned module among enco
 across the last two consecutive checkpoints. Gain = relative open-loop improvement of
 the true context over null at k=16 on the held-out buffer (train buffer if no held-out); a
 checkpoint counts as "no progress" if it improves on the previous one by < 0.005.
+Context ensemble (v3): the alert ratio is the ensemble's (each member's ||W_m c_m|| averaged over
+members), and the gain is the ENSEMBLE-MEAN prediction's; extra columns give the member-average
+improvement, the member disagreement (std of predictions) at k=1/16 and each member's probe R^2.
 """
 import csv, glob, json, os, re, sys
 
@@ -30,6 +33,12 @@ for _steps, name, r in sorted(results, key=lambda t: (t[0], t[1] == "model_final
         row[f"{tag}_r2_gain"] = b["probe_r2"]["context"]["overall"]["motor_gain"]
         row[f"{tag}_r2_friction"] = b["probe_r2"]["context"]["overall"]["foot_friction"]
         row[f"{tag}_pass"] = int(b["pass"]["passed"])
+        if b.get("ensemble", 1) > 1:
+            for k in (1, 16):
+                row[f"{tag}_member_improve_k{k}"] = 1 - a["true"]["phys_member_per_k"][k - 1] / a["null"]["phys_member_per_k"][k - 1]
+                row[f"{tag}_disagree_k{k}"] = a["true"]["disagreement_per_k"][k - 1]
+            for i, x in enumerate(b.get("probe_gain_r2_per_member") or []):
+                row[f"{tag}_r2_gain_m{i}"] = x
     for tag, cb in r.get("cross_buffer_probe", {}).items():
         row[f"xprobe_{tag}_r2_gain"] = cb["context"]["overall_r2"]["motor_gain"]
     rows.append(row)

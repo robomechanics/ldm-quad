@@ -27,6 +27,9 @@ import statistics
 import sys
 from collections import defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from summary_stats import t975  # noqa: E402
+
 # nullctxA = checkpoint A with --context_mode null (must equal null); dynonlyA = checkpoint A, rolling,
 # --context_components dynamics_only (context in encoder + dynamics only; planner objective = stageL's).
 # rollingV2 = sit-adapt-v2 model_final (context in the dynamics only), rolling; nullctxV2 = the same
@@ -39,7 +42,6 @@ DELTA_ARMS = ("rollingA", "rollingB", "rollingV2", "ema05V2", "ema20V2", "nullct
 CONDS = ("ref_id", "nominal", "gain0.8", "gain0.7", "gain0.6", "gain0.5", "fric0.6", "fric0.4", "fric0.3", "fric0.25")
 LABEL = {"nominal": "fric_extrap_1.0 (gain 1.0, friction 1.0)", "ref_id": "ref_id (gain 1.0, friction 0.8)"}
 METRICS = ("vx", "track_x", "fell_envs", "ep_len", "n_eps", "phys_mse", "latent_mse")
-T975 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571}
 
 
 def _f(v):
@@ -91,7 +93,7 @@ def paired_delta(a: dict, b: dict, metric: str):
     if not d:
         return math.nan, math.nan, 0
     m = statistics.fmean(d)
-    hw = T975.get(len(d) - 1, 1.96) * statistics.stdev(d) / math.sqrt(len(d)) if len(d) > 1 else math.inf
+    hw = t975(len(d) - 1) * statistics.stdev(d) / math.sqrt(len(d)) if len(d) > 1 else math.inf
     return m, hw, len(d)
 
 

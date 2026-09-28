@@ -9,6 +9,7 @@
 
 import argparse
 import csv
+import math
 from copy import deepcopy
 from datetime import datetime
 import os
@@ -325,6 +326,10 @@ parser.add_argument("--planner_velocity_objective_weight", type=float, default=N
 parser.add_argument("--planner_velocity_objective_form", type=str, default=None, choices=["quadratic", "exp", "linear"],
                     help="quadratic (default, UNBOUNDED -- exploitable) or exp (bounded, mirrors the env kernels).")
 parser.add_argument("--planner_velocity_objective_lin_weight", type=float, default=None)
+parser.add_argument("--planner_risk_lambda", type=float, default=None,
+                    help="Context-ensemble risk penalty: candidates scored mean - lambda*std over members. Default: checkpoint value.")
+parser.add_argument("--planner_two_stage_k", type=int, default=None,
+                    help="Context-ensemble two-stage scoring (mean-field pass, top-k re-scored by all members; 0 = full). Default: checkpoint value.")
 parser.add_argument("--planner_velocity_objective_lin_std", type=float, default=None)
 parser.add_argument("--planner_velocity_objective_yaw_weight", type=float, default=None)
 parser.add_argument("--planner_velocity_objective_yaw_std", type=float, default=None)
@@ -403,6 +408,7 @@ from ldm_quad.mbrl.history import ContextController
 from ldm_quad.mbrl.predictor_eval import PredictorEvaluator, build_predictor_model
 from ldm_quad.eval.terrain_mismatch import apply_terrain_mismatch
 from ldm_quad.mbrl import DynamicsEnsemble, LatentWorldModel, ReplayBuffer, StateWorldModel, build_planner, load_policy_prior
+from ldm_quad.mbrl.world_model import latent_model_from_args
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -429,17 +435,6 @@ def flatten_obs(obs: object, device: torch.device) -> torch.Tensor:
     if not isinstance(obs, torch.Tensor):
         obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
     return obs.float().view(obs.shape[0], -1)
-
-
-def parse_index_list(value: object) -> list[int]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple)):
-        return [int(item) for item in value]
-    value = str(value)
-    if not value.strip():
-        return []
-    return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
 def to_tensor(x: object, device: torch.device) -> torch.Tensor:
@@ -723,6 +718,9 @@ DIAGNOSTIC_FIELDS = [
     "dyn_switch_active",
     "context_norm_mean",
     "context_drift_mean",
+    # context-ensemble two-stage planner: risk scores of the re-scored top-k
+    "planner_rescored_return_mean",
+    "planner_rescored_return_std",
 ]
 
 
@@ -814,6 +812,7 @@ def prediction_error_metrics(
     next_obs: torch.Tensor,
     continues: torch.Tensor,
     context: torch.Tensor | None = None,
+    done: torch.Tensor | None = None,
 ) -> dict[str, float]:
     # model_obs_mse / model_obs_rmse / model_velocity_mse are deliberately ABSENT here, not 0.0.
     # The latent world model is decoder-free, so there is no predicted observation to score; only
@@ -830,8 +829,18 @@ def prediction_error_metrics(
     }
     if model is None or model_type is None:
         return metrics
+    # Metrics whose TARGET is next_obs skip done rows: on a done step next_obs is the post-reset
+    # observation, so a fall would inject a reset spike. (Reward/continue keep every row -- their
+    # targets are the true terminal reward and continue flag.) NaN when every row is done.
+    keep = None if done is None else ~done.view(-1).bool()
+
+    def _mean_kept(err_rows: torch.Tensor) -> float:
+        if keep is None:
+            return float(err_rows.mean().item())
+        return float(err_rows[keep].mean().item()) if bool(keep.any()) else float("nan")
 
     if model_type == "latent":
+        _member_mean = getattr(model, "member_mean", lambda x: x)
         z = model.encode(obs, context=context)
         z_next = model.next(z, actions, context=context)
         z_target = model.encode(next_obs, context=context)
@@ -840,22 +849,24 @@ def prediction_error_metrics(
         # command at t+1, so including those columns would charge the dynamics for an exogenous
         # command change. Slicing is a no-op when the skip-connection is off.
         _lat = int(getattr(model, "latent_dim", z_next.shape[-1]))
-        latent_error = (z_next[..., :_lat] - z_target[..., :_lat]).square().mean()
+        # a context ensemble's next() is [M, N, D]: per-member error, then the member mean
+        latent_error = _member_mean((z_next[..., :_lat] - z_target[..., :_lat]).square().mean(-1))
         reward_pred = model.reward(z, actions, context=context)
-        continue_logits = model.continue_logits(z_next)
-        metrics["model_latent_consistency_mse"] = float(latent_error.item())
+        continue_logits = _member_mean(model.continue_logits(z_next))
+        metrics["model_latent_consistency_mse"] = _mean_kept(latent_error)
         if getattr(model, "physical_head", None) is not None and getattr(model, "physical_feature_indices", None):
             physical_indices = torch.as_tensor(model.physical_feature_indices, dtype=torch.long, device=obs.device)
             physical_target = next_obs.index_select(-1, physical_indices)
-            metrics["model_physical_mse"] = float((model.physical_features(z_next) - physical_target).square().mean().item())
+            physical_pred = _member_mean(model.physical_features(z_next))  # ensemble-mean prediction
+            metrics["model_physical_mse"] = _mean_kept((physical_pred - physical_target).square().mean(-1))
     else:
         preds = model.predict(obs, actions)
         pred_next_obs = obs + preds.delta_obs
         obs_error = (pred_next_obs - next_obs).square()
-        metrics["model_obs_mse"] = float(obs_error.mean().item())
-        metrics["model_obs_rmse"] = float(obs_error.mean().sqrt().item())
+        metrics["model_obs_mse"] = _mean_kept(obs_error.mean(-1))
+        metrics["model_obs_rmse"] = math.sqrt(metrics["model_obs_mse"])
         if obs.shape[-1] >= 6:
-            metrics["model_velocity_mse"] = float(obs_error[:, [0, 1, 5]].mean().item())
+            metrics["model_velocity_mse"] = _mean_kept(obs_error[:, [0, 1, 5]].mean(-1))
         reward_pred = preds.rewards
         continue_logits = preds.continue_logits
 
@@ -1051,36 +1062,9 @@ def main() -> None:
     if not args_cli.prior_only:
         model_type = checkpoint_args.get("model_type", "dynamics")
         if model_type == "latent":
-            model = LatentWorldModel(
-                obs_dim=obs.shape[-1],
-                action_dim=action_dim,
-                latent_dim=checkpoint_args.get("latent_dim", 128),
-                hidden_dim=checkpoint_args["hidden_dim"],
-                depth=checkpoint_args["model_depth"],
-                num_q=checkpoint_args.get("num_q", 5),
-                discount=checkpoint_args["discount"],
-                tau=checkpoint_args.get("target_tau", 0.01),
-                rho=checkpoint_args.get("rho", 0.5),
-                entropy_coef=checkpoint_args.get("entropy_coef", 1e-4),
-                num_bins=checkpoint_args.get("num_bins", 101),
-                vmin=checkpoint_args.get("vmin", -10.0),
-                vmax=checkpoint_args.get("vmax", 10.0),
-                simnorm_dim=checkpoint_args.get("simnorm_dim", 8),
-                q_dropout=checkpoint_args.get("q_dropout", 0.01),
-                physical_feature_indices=parse_index_list(checkpoint_args.get("latent_physical_indices", "")),
-                # #6a: inherited from the CHECKPOINT, never a CLI default -- a skip-trained model
-                # built without it mismatches the first Linear of every head. (Same class of bug
-                # as the objective-inheritance asymmetry that silently contaminated Phase A/A2.)
-                command_indices=parse_index_list(checkpoint_args.get("command_skip_indices", "")),
-                context_dim=checkpoint_args.get("history_context_dim", 0),
-                history_len=checkpoint_args.get("history_len", 48),
-                history_d_model=checkpoint_args.get("history_d_model", 64),
-                history_nhead=checkpoint_args.get("history_nhead", 4),
-                history_layers=checkpoint_args.get("history_layers", 1),
-                history_ff=checkpoint_args.get("history_ff", 256),
-                history_dropout=checkpoint_args.get("history_dropout", 0.1),
-                context_components=checkpoint_args.get("context_components", "all"),
-            ).to(device)
+            # structure from the CHECKPOINT's args, never CLI defaults (#6a command skip, history
+            # context, context components/ensemble) -- shared with the passive predictor
+            model = latent_model_from_args(checkpoint_args, obs.shape[-1], action_dim).to(device)
         elif model_type == "state":
             model = StateWorldModel(
                 obs_dim=obs.shape[-1],
@@ -1161,6 +1145,10 @@ def main() -> None:
                 else checkpoint_args.get("planner_continue_threshold", 0.5)
             ),
             action_spline_knots=checkpoint_args.get("action_spline_knots", 0),
+            planner_risk_lambda=(args_cli.planner_risk_lambda if args_cli.planner_risk_lambda is not None
+                                 else checkpoint_args.get("planner_risk_lambda", 0.0)),
+            planner_two_stage_k=(args_cli.planner_two_stage_k if args_cli.planner_two_stage_k is not None
+                                 else checkpoint_args.get("planner_two_stage_k", 0)),
             action_prior=action_prior,
             prior_residual_scale=(
                 args_cli.prior_residual_scale
@@ -1289,6 +1277,11 @@ def main() -> None:
 
     predictor = None
     if args_cli.predict_with_checkpoint:
+        if not args_cli.diagnostics:
+            raise SystemExit("--predict_with_checkpoint writes its scores only into the diagnostics rows: add --diagnostics")
+        if args_cli.diagnostics_interval != 1:
+            print(f"[PRED] --diagnostics_interval {args_cli.diagnostics_interval}: the passive predictor advances "
+                  "every step but is scored only on written rows (Level 3 windows expect interval 1)", flush=True)
         _pmodel = build_predictor_model(args_cli.predict_with_checkpoint, obs.shape[-1], action_dim, device)
         _arms = [a.strip() for a in args_cli.predict_arms.split(",") if a.strip()]
         predictor = PredictorEvaluator(_pmodel, _arms, obs.shape[0], obs.shape[-1], action_dim, device)
@@ -1613,7 +1606,8 @@ def main() -> None:
             except Exception:
                 pass
             diag_metrics.update(tracking_metrics(obs))
-            diag_metrics.update(prediction_error_metrics(model, model_type, obs, actions, rewards, next_obs, continues, context=history_context))
+            diag_metrics.update(prediction_error_metrics(model, model_type, obs, actions, rewards, next_obs, continues,
+                                                         context=history_context, done=done))
             if planner is not None:
                 diag_metrics.update({name: float(value) for name, value in planner.last_diagnostics.items()})
 
@@ -1650,9 +1644,10 @@ def main() -> None:
         adapt_gradient_updates += updates
         if history is not None:
             history.append(actions, next_obs - obs, done)
-        pred_metrics = predictor.step(obs, actions, next_obs, done) if predictor is not None else {}
+        _write_row = diagnostics is not None and (steps % max(1, args_cli.diagnostics_interval) == 0)
+        pred_metrics = predictor.step(obs, actions, next_obs, done, score=_write_row) if predictor is not None else {}
 
-        if diagnostics is not None and (steps % max(1, args_cli.diagnostics_interval) == 0):
+        if _write_row:
             diag_metrics.update(adapt_metrics)
             diag_metrics["adapt_gradient_updates"] = float(adapt_gradient_updates)
             diag_metrics["adapt_buffer_size"] = float(len(adapt_replay) if adapt_replay is not None else 0)

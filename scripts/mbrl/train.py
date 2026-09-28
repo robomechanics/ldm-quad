@@ -222,6 +222,35 @@ parser.add_argument("--history_layers", type=int, default=1, help="History trans
 parser.add_argument("--history_ff", type=int, default=256, help="History transformer feedforward dimension.")
 parser.add_argument("--history_dropout", type=float, default=0.1, help="History transformer dropout probability.")
 parser.add_argument(
+    "--context_ensemble",
+    type=int,
+    default=1,
+    help=(
+        "Number M of context pathways (history encoder + dynamics context projection each) over the shared "
+        "trunk; needs --context_components dynamics_only when M > 1. Each member trains on its own per-sample "
+        "Bernoulli(0.5) bootstrap of every batch. 1 = the single-pathway model."
+    ),
+)
+parser.add_argument(
+    "--context_ema",
+    type=float,
+    default=1.0,
+    help="EMA smoothing tau of the context used for collection and heldout eval (1.0 = raw rolling context).",
+)
+parser.add_argument(
+    "--planner_risk_lambda",
+    type=float,
+    default=0.0,
+    help="Context ensemble: candidate score = mean_m(return) - lambda * std_m(return). 0 = member mean.",
+)
+parser.add_argument(
+    "--planner_two_stage_k",
+    type=int,
+    default=0,
+    help="Context ensemble: score all candidates with a 1x mean-field rollout, re-score the top k with the full "
+         "ensemble and penalty (0 = full ensemble for every candidate).",
+)
+parser.add_argument(
     "--context_components",
     choices=["all", "dynamics_only"],
     default="all",
@@ -604,7 +633,7 @@ from ldm_quad.mbrl.checkpoint import (
     remap_optimizer_state,
 )
 from ldm_quad.mbrl.dynamics_rand import PARAM_NAMES as DYN_PARAM_NAMES, DynamicsRandomizer
-from ldm_quad.mbrl.history import RollingHistory
+from ldm_quad.mbrl.history import ContextController
 from ldm_quad.mbrl import (
     DynamicsEnsemble,
     LatentWorldModel,
@@ -1273,8 +1302,9 @@ def run_heldout_eval(
 
     eval_history = None
     if model is not None and getattr(model, "context_dim", 0) > 0:
-        eval_history = RollingHistory(
-            obs.shape[0], int(model.history_len), int(model.action_dim), obs.shape[-1], device
+        eval_history = ContextController(
+            obs.shape[0], int(model.history_len), int(model.action_dim), obs.shape[-1], device,
+            mode="rolling", ema_tau=args_cli.context_ema,
         )
 
     episode_returns = torch.zeros(obs.shape[0], dtype=torch.float32, device=device)
@@ -1506,6 +1536,7 @@ def main() -> None:
             history_ff=args_cli.history_ff,
             history_dropout=args_cli.history_dropout,
             context_components=args_cli.context_components,
+            context_ensemble=args_cli.context_ensemble,
             loss_weights=WorldModelLossWeights(
                 consistency=args_cli.consistency_coef,
                 reward=args_cli.reward_coef,
@@ -1810,6 +1841,8 @@ def main() -> None:
         terminal_value=args_cli.model_type == "state" and args_cli.state_terminal_value,
         disagreement_penalty=args_cli.state_disagreement_penalty if args_cli.model_type == "state" else 0.0,
         model_policy_candidate_count=args_cli.num_pi_trajs if args_cli.model_type in {"state", "latent"} else 0,
+        planner_risk_lambda=args_cli.planner_risk_lambda,
+        planner_two_stage_k=args_cli.planner_two_stage_k,
     )
     print("[MBRL] Planner built", flush=True)
     eval_dyn: DynamicsRandomizer | None = None
@@ -1916,6 +1949,8 @@ def main() -> None:
                 if args_cli.model_type in {"state", "latent"}
                 else 0
             ),
+            planner_risk_lambda=args_cli.planner_risk_lambda,
+            planner_two_stage_k=args_cli.planner_two_stage_k,
         )
         print(
             "[MBRL] Online eval enabled: "
@@ -1939,7 +1974,8 @@ def main() -> None:
     use_history = args_cli.model_type == "latent" and args_cli.history_context_dim > 0
     history_sampling_len = args_cli.history_len if use_history else 0
     history = (
-        RollingHistory(num_envs, args_cli.history_len, action_dim, obs_dim, device) if use_history else None
+        ContextController(num_envs, args_cli.history_len, action_dim, obs_dim, device, mode="rolling",
+                          ema_tau=args_cli.context_ema) if use_history else None
     )
     if use_history:
         print(
@@ -1995,6 +2031,8 @@ def main() -> None:
                 {"policy_bc_logmu": 0.0, "history_encoder_grad_norm": 0.0, "context_weight_norm": 0.0,
                  "base_weight_drift": 0.0}
             )
+            if args_cli.context_ensemble > 1:
+                latest_losses.update({f"history_encoder_grad_norm_m{i}": 0.0 for i in range(args_cli.context_ensemble)})
     elif args_cli.model_type == "state":
         latest_losses = {
             "loss": 0.0,
@@ -2032,6 +2070,10 @@ def main() -> None:
         "planner_predicted_return_margin_mean": 0.0,
         "planner_predicted_return_margin_min": 0.0,
         "planner_prior_fallback_fraction": 0.0,
+        # context-ensemble two-stage scoring: risk scores of the re-scored top-k (= the candidate
+        # scores otherwise); seeded here so the metrics.csv columns exist from the first row
+        "planner_rescored_return_mean": 0.0,
+        "planner_rescored_return_std": 0.0,
     }
     train_start_time = time.monotonic()
     start_env_steps = int(train_state.env_steps)
@@ -2291,6 +2333,7 @@ def main() -> None:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 sit_metrics: dict[str, float] = {}
+                member_grads: dict[str, float] = {}
                 if getattr(model, "history_encoder", None) is not None:
                     # SIT: the context path only learns once the zero-init projections move, so
                     # watch that gradient actually reaches the history encoder and projections.
@@ -2300,6 +2343,11 @@ def main() -> None:
                         ] or [torch.zeros((), device=loss.device)])).item())
                         _ctx_w = [p for n, p in model.named_parameters() if n.endswith("context_weight") and p.requires_grad]
                         sit_metrics["context_weight_norm"] = float(torch.norm(torch.stack([p.norm() for p in _ctx_w])).item())
+                        if getattr(model, "context_ensemble", 1) > 1:
+                            for _i, _enc in enumerate(model.history_encoder):
+                                _g = [p.grad.norm() for p in _enc.parameters() if p.grad is not None]
+                                member_grads[f"history_encoder_grad_norm_m{_i}"] = float(
+                                    torch.norm(torch.stack(_g)).item()) if _g else 0.0
                 model_params = model.model_parameters() if hasattr(model, "model_parameters") else model.parameters()
                 torch.nn.utils.clip_grad_norm_(
                     model_params,
@@ -2342,6 +2390,7 @@ def main() -> None:
                         sit_metrics["base_weight_drift"] = max(
                             float((_named_now[name] - ref).abs().max()) for name, ref in drift_reference.items()
                         )
+                    sit_metrics.update(member_grads)  # per-member encoder grads, last (seeded in this order)
                 # Appended LAST: metrics.csv writes each row in dict order against the first
                 # row's header, so these must follow the policy metrics (see latest_losses init).
                 metrics.update(sit_metrics)
@@ -2478,6 +2527,10 @@ def main() -> None:
                 **latest_losses,
                 # Appended last and only when enabled, so metrics.csv is unchanged with dyn off.
                 **dyn.metrics(),
+                # context ensemble: mean member disagreement (std of member returns) of the last plan
+                **({"planner_ensemble_return_std": float(planner._last_disagreement.mean())
+                    if getattr(planner, "_last_disagreement", None) is not None else 0.0}
+                   if args_cli.context_ensemble > 1 else {}),
             }
             append_metrics(metrics_path, row)
             writer.add_scalar("Reward / total_reward_mean", estimated_return_100, train_state.env_steps)
