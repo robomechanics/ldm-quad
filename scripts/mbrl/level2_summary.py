@@ -28,7 +28,7 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from summary_stats import t975  # noqa: E402
+from summary_stats import mean_ci, t975  # noqa: E402
 
 # nullctxA = checkpoint A with --context_mode null (must equal null); dynonlyA = checkpoint A, rolling,
 # --context_components dynamics_only (context in encoder + dynamics only; planner objective = stageL's).
@@ -38,10 +38,18 @@ from summary_stats import t975  # noqa: E402
 # lambda chosen by scripts/mbrl/v3_lambda_select.py), EMA 0.05 context; nullctxV3 = the same
 # checkpoint with --context_mode null (statistically equal to null; not bit-exact: the ensemble
 # planner draws its terminal-policy noise in a different pattern).
-ARMS = ("null", "rollingA", "rollingB", "rollingV2", "ema05V2", "ema20V2", "rollingV3", "nullctxA", "nullctxV2",
-        "nullctxV3", "dynonlyA", "dynstrictA")
-DELTA_ARMS = ("rollingA", "rollingB", "rollingV2", "ema05V2", "ema20V2", "rollingV3", "nullctxA", "nullctxV2",
-              "nullctxV3", "dynonlyA", "dynstrictA")
+ARMS = ("null", "rollingA", "rollingB", "rollingV2", "ema05V2", "ema20V2", "rollingV3", "k24V3", "k24emaV3",
+        "k48rawV3", "nullctxA", "nullctxV2", "nullctxV3", "dynonlyA", "dynstrictA")
+DELTA_ARMS = ("rollingA", "rollingB", "rollingV2", "ema05V2", "ema20V2", "rollingV3", "k24V3", "k24emaV3", "k48rawV3",
+              "nullctxA", "nullctxV2", "nullctxV3", "dynonlyA", "dynstrictA")
+# closed-loop window test (2026-10-03), v3 model_final at lambda 0.5: context window K x EMA.
+# rollingV3 is K=48 + EMA 0.05. All four arms log the reset-masked phys_mse, so it is like-for-like here.
+WINDOW_ARMS = (("k24V3", "K24 raw"), ("k24emaV3", "K24+EMA"), ("k48rawV3", "K48 raw"), ("rollingV3", "K48+EMA"))
+WINDOW_DELTAS = (("k24V3", "k48rawV3", "K24-K48 raw"), ("k24emaV3", "rollingV3", "K24-K48 EMA"),
+                 ("k24emaV3", "k24V3", "EMA-raw K24"), ("rollingV3", "k48rawV3", "EMA-raw K48"))
+WINDOW_METRICS = (("vx", "{:.3f}"), ("track_x", "{:.3f}"), ("track_yaw", "{:.3f}"), ("fell_envs", "{:.1f}"),
+                  ("falls", "{:.1f}"), ("ctx_drift", "{:.4f}"), ("ctx_norm", "{:.3f}"), ("plan_best", "{:.2f}"),
+                  ("phys_mse", "{:.5f}"))
 # overview rows and the arm each is compared with in its last column (paired over seeds)
 OVERVIEW = (("null", None), ("rollingA", None), ("rollingV2", "rollingA"), ("ema05V2", "rollingV2"),
             ("rollingV3", "rollingV2"), ("rollingV3", "ema05V2"))
@@ -79,6 +87,9 @@ def run_metrics(path: str) -> dict | None:
         "vx": _mean([_f(r["velocity_x_mean"]) for r in late]),
         "track_x": _mean([_f(r["tracking_x_abs_error"]) for r in late]),
         "fell_envs": float(len(fell)),
+        "falls": float(sum(int(e["terminated"]) for e in eps)),
+        "track_yaw": _mean([_f(r.get("tracking_yaw_abs_error")) for r in late]),
+        "ctx_drift": _mean([_f(r.get("context_drift_mean")) for r in rows]),
         "ep_len": _mean([_f(e["length"]) for e in eps]) if eps else math.nan,
         "n_eps": float(len(eps)),
         "phys_mse": _mean([_f(r["model_physical_mse"]) for r in rows]),
@@ -180,6 +191,36 @@ def main() -> None:
                 dva = f"vs {ref}: " + "  ".join(f.format(*paired_delta(arms[ref], arms[arm], m)[:2]) for m, f in ov_metrics)
                 out_json[cond][f"delta_{arm}_vs_{ref}"] = {m: list(paired_delta(arms[ref], arms[arm], m)) for m, _ in ov_metrics}
             emit(f"   {label:12s} {arm:10s} {vals}   | {dnull:48s} | {dva}")
+
+    if any(a in data.get(c, {}) for c in CONDS for a, _ in WINDOW_ARMS[:3]):
+        emit("\n=== window test (v3 model_final, lambda 0.5): mean +- 95% CI over seeds; paired deltas (95% CI) ===")
+        for cond in ("gain0.8", "fric0.3", "ref_id"):
+            arms = data.get(cond, {})
+            if not any(a in arms for a, _ in WINDOW_ARMS):
+                continue
+            emit(f"  {LABEL.get(cond, cond)}")
+            emit("    arm        n " + "".join(f"{m:>18s}" for m, _ in WINDOW_METRICS))
+            js = out_json.setdefault(cond, {}).setdefault("window", {})
+            for arm, label in WINDOW_ARMS:
+                if arm not in arms:
+                    continue
+                cells, row = [], {}
+                for m, f in WINDOW_METRICS:
+                    mu, hw = mean_ci([v[m] for v in arms[arm].values()])
+                    row[m] = [mu, hw]
+                    cells.append((f.format(mu) + "+-" + ("inf" if math.isinf(hw) else f.format(hw))).rjust(18))
+                js[label] = row
+                emit(f"    {label:9s} {len(arms[arm])} " + "".join(cells))
+            for a, b, label in WINDOW_DELTAS:
+                if a not in arms or b not in arms:
+                    continue
+                cells, row = [], {}
+                for m, f in WINDOW_METRICS:
+                    mu, hw, n = paired_delta(arms[b], arms[a], m)
+                    row[m] = [mu, hw, n]
+                    cells.append((("+" if mu >= 0 else "") + f.format(mu) + "+-" + ("inf" if math.isinf(hw) else f.format(hw))).rjust(18))
+                js[f"delta {label}"] = row
+                emit(f"    d {label:11s}" + "".join(cells) + f"   (n={row['vx'][2]})")
 
     emit("\n=== PASS RULE ===")
     verdict = {}
